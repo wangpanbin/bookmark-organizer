@@ -246,6 +246,47 @@ export async function pauseExecution() {
 }
 
 /**
+ * 写完回读：确认这条书签**真的**落在目标文件夹里。
+ *
+ * 为什么要多这一次调用：见 run() 里的注释。`move()` resolve 不等于改动留下来了。
+ * 不回读的话，「被别的扩展/同步改回去」和「move 根本没生效」会长得一模一样，
+ * 而这两种都需要用户知道。
+ *
+ * 抛出的错误文案要能直接指导下一步排查，所以必须带上
+ * 「实际落在哪」和「应该落在哪」两个可读名字。
+ *
+ * @param {string} id       书签节点 id
+ * @param {string} parentId 期望的目标文件夹 id
+ * @param {string[]} toPath 期望的类目路径（不含根名），只用于文案
+ */
+async function assertMoved(id, parentId, toPath) {
+  const nameOf = async (pid) => {
+    try {
+      const [n] = await chrome.bookmarks.get(String(pid));
+      return n ? (n.title || String(pid)) : String(pid);
+    } catch {
+      return String(pid);
+    }
+  };
+
+  // get() 对已不存在的 id 是 reject，不是 resolve 空数组 —— 要包 catch
+  const node = await chrome.bookmarks.get(String(id)).catch(() => null);
+  if (!node || !node.length) {
+    throw new Error('移动后回读：这条书签已经不在书签树里了（可能被其他扩展删掉，或同步覆盖）');
+  }
+  const actual = String(node[0].parentId);
+  if (actual === String(parentId)) return;
+
+  throw new Error(
+    `移动后回读：实际在「${await nameOf(actual)}」而不是「${await nameOf(parentId)}」`
+    + `（目标 ${(toPath || []).join(' / ')}）—— 改动没有留住。`
+    + '常见原因：另一个扩展（广告拦截器 / 书签整理类插件）在书签变更时自动重排，'
+    + '或 Chrome 同步把改动覆盖了。可先到 chrome://extensions 临时关掉其他'
+    + '有「书签」权限的扩展，再重跑一次。',
+  );
+}
+
+/**
  * 主执行循环。每条 move 成功后立刻落盘。
  * 用 while(true) + 找下一个 pending，而不是 for 遍历 —— 这样被暂停/中断后
  * 重新进来能自然地从断点继续。
@@ -281,6 +322,18 @@ async function run() {
       try {
         const parentId = await ensureTargetFolder(task, rootId, [rootName, ...next.toPath]);
         await chrome.bookmarks.move(next.id, { parentId });
+        // ⚠️ 写完必须回读校验 —— 这是本次踩坑的直接教训。
+        //
+        //    chrome.bookmarks.move() **resolve 只代表请求被受理，不代表改动留下来了**。
+        //    真实环境里有好几股力量会改写书签树：另一个扩展（广告拦截器、书签整理类
+        //    插件在变更时自动重排，且不提示不留痕）、Chrome 同步落地、用户自己拖动。
+        //    早先不校验，于是「move 成功 → 立刻被改回 → 面板报 100% 成功」，
+        //    从用户眼里就是「点了执行整理，书签栏一点没变，也没有任何报错」——
+        //    这类故障对用户完全不可见，是最难查的一类。
+        //
+        //    MV3 扩展开发指南在讲书签写入时也是这条：guard every write with a re-read
+        //    （「树会在你读和写之间变化：用户拖了文件夹、另一个扩展重排了、同步落下来了」）。
+        await assertMoved(next.id, parentId, next.toPath);
         await persistItem(next.id, { status: 'done' }, {
           lastDoneIndex: items.indexOf(next),
           createdFolders: task.createdFolders,

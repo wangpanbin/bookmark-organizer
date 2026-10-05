@@ -834,8 +834,11 @@ function renderFailures(items, task) {
   const more = (task.failed || []).length > 10 ? `<li>…共 ${task.failed.length} 条</li>` : '';
   host.innerHTML =
     `<b>有 ${items.filter((i) => i.status === 'failed').length} 条没能移动</b>`
-    + '<p>这些书签还留在原处。常见原因：目标位置不可写、书签已被删除、'
-    + '或「归入位置」指向了只读目录（如移动设备书签）。</p>'
+    + '<p>这些书签还留在原处。常见原因：① 移动被<b>其他扩展或 Chrome 同步改回</b>'
+    + '（有「书签」权限的广告拦截器 / 书签整理类插件会在变更时自动重排）；'
+    + '② 目标位置不可写；③ 书签已被删除；'
+    + '④「归入位置」指向了只读目录（如移动设备书签）。</p>'
+    + '可先到 chrome://extensions 临时关掉其他有「书签」权限的扩展，再点「读取并预览」重跑一次。'
     + `<ul>${rows}${more}</ul>`;
   host.hidden = false;
 }
