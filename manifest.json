@@ -18,7 +18,19 @@
     "service_worker": "src/background.js",
     "type": "module"
   },
+  "icons": {
+    "16": "ui/icons/icon-16.png",
+    "32": "ui/icons/icon-32.png",
+    "48": "ui/icons/icon-48.png",
+    "128": "ui/icons/icon-128.png"
+  },
   "action": {
+    "default_icon": {
+      "16": "ui/icons/icon-16.png",
+      "32": "ui/icons/icon-32.png",
+      "48": "ui/icons/icon-48.png",
+      "128": "ui/icons/icon-128.png"
+    },
     "default_popup": "ui/popup.html",
     "default_title": "书签整理助手"
   },

@@ -31,6 +31,11 @@ const MAX_ROWS = 300;
 
 const $ = (id) => document.getElementById(id);
 
+/** 执行进度条的重置标记。
+ *  「新的预览」和「新的执行」会把它翻回去 —— 用户已经拿到一份新计划，
+ *  上一次的完成凭据留着只会误导。只活在内存里，刷新即回初始值。 */
+let execBarReset = false;
+
 /** 页面状态 */
 const state = {
   entries: [],
@@ -254,6 +259,25 @@ function renderStats() {
   $('stFolders').textContent = plan ? plan.newFolders.length : '—';
   $('tabPlanCount').textContent = plan ? plan.items.length : 0;
   $('tabDupCount').textContent = state.groups.length;
+
+  // 语义配色只给真实数字。还没数据时那些卡里是「—」占位符，
+  // 涂成琥珀/红会看着像报错（「重复项」是红的，最误导），
+  // 实际上只是「还没数据」。所以给占位符打个标记，让 CSS 收成中性。
+  for (const b of document.querySelectorAll('.stats .card > b')) {
+    b.parentElement.dataset.empty = b.textContent === '—' ? '1' : '0';
+  }
+
+  // 展示管线：把「整理完成度」发布给 hero 环。
+  // 不参与任何状态机 / 消息协议 / 持久化，删掉它只影响一个圆环。
+  const ring = $('heroRing');
+  if (ring) {
+    const inPlace = plan ? (plan.stats.byReason[REASON.IN_PLACE] || 0) : null;
+    const pct = (inPlace === null || !urls.length) ? null : Math.round((inPlace / urls.length) * 100);
+    ring.style.setProperty('--pct', String(pct ?? 0));
+    // 没预览过就显示「未预览」而不是 0% —— 0% 会被读成「一条都没整理好」。
+    ring.dataset.state = pct === null ? 'unknown' : 'ready';
+    $('heroRingVal').textContent = pct === null ? '未预览' : `${pct}%`;
+  }
 }
 
 function syncExecuteButton() {
@@ -485,12 +509,43 @@ async function renderReport() {
     box.append(p);
     $('btnPause').hidden = true;
     $('btnResume').hidden = true;
+    $('execBar').hidden = true;
     return;
   }
   const items = task.plan.items || [];
   const done = items.filter((i) => i.status === 'done').length;
   const failed = items.filter((i) => i.status === 'failed').length;
   const pending = items.filter((i) => i.status === 'pending').length;
+
+  // 执行进度条：只反映「本次执行推进」，与 hero 环（整理完成度）语义分离。
+  // ⚠️ 文案刻意只报数字、不下结论：「成功还是失败」由 pollProgress() 的 toast
+  //    和计划页顶部的失败横幅说（那边已经修过一次「无条件弹整理完成」的 bug）。
+  //    也刻意不用「已完成/失败/已暂停」这三个词 —— E2E 的终态判定只读
+  //    #reportStatus，但报告全文里永远有一行标签就叫「失败」，
+  //    历史上就是全文匹配导致的假绿（见 tests/e2e/harness.js:280-283）。
+  //    这里再加一遍同义词，等于给后人留一个同样的坑。
+  // ⚠️ 执行循环抛异常时状态是 FAILED 而不是 DONE（src/apply.js:223），
+  //    所以「中断」必须单独认，否则崩溃执行会被显示成「暂停中」。
+  const bar = $('execBar');
+  if (bar) {
+    const total = items.length;
+    const running = task.status === TASK_STATUS.RUNNING;
+    const paused = task.status === TASK_STATUS.PAUSED;
+    const broke = task.status === TASK_STATUS.FAILED;
+    const missed = (task.failed || []).length;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    bar.hidden = execBarReset || (!total && !running && !paused && !broke);
+    bar.dataset.state = running ? 'running'
+      : paused ? 'paused'
+      : broke ? 'failed'
+      : missed ? 'partial' : 'done';
+    $('execBarFill').style.width = `${pct}%`;
+    $('execBarText').textContent = running ? `整理中 · ${done}/${total}`
+      : paused ? `暂停中 · ${done}/${total}`
+      : broke ? `中断 · ${done}/${total} · 点「继续」接着跑`
+      : missed ? `${done}/${total} · ${missed} 条未成功`
+      : `${done}/${total}`;
+  }
 
   box.textContent = '';
   const tbl = document.createElement('table');
@@ -514,16 +569,6 @@ async function renderReport() {
     tr.append(a, b); tbl.append(tr);
   }
   box.append(tbl);
-
-  if (task.status === TASK_STATUS.RUNNING) {
-    const bar = document.createElement('div');
-    bar.className = 'progress-bar';
-    const fill = document.createElement('i');
-    const pct = items.length ? Math.round((done / items.length) * 100) : 0;
-    fill.style.width = `${pct}%`;
-    bar.append(fill);
-    box.append(bar);
-  }
 
   if (task.failed && task.failed.length) {
     const h = document.createElement('div');
@@ -715,6 +760,7 @@ async function doExecute() {
   if (!confirm(msg)) return;
 
   $('btnExecute').disabled = true;
+  execBarReset = false;   // 新任务从 0 开始，撤掉上一轮的完成凭据
   const res = await send('startExecution', {
     plan,
     duplicates: dups,
@@ -978,6 +1024,9 @@ async function init() {
   }
 
   $('btnPreview').addEventListener('click', async () => {
+    // 新计划出来了，上一次的执行凭据就作废了 —— 否则用户会盯着一条满格进度条
+    // 以为已经整理过，其实那是上一轮的结果。
+    execBarReset = true;
     $('btnPreview').disabled = true;
     try {
       await loadAndClassify({ backup: true });

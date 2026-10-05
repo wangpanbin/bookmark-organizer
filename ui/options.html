@@ -8,9 +8,18 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <h1>书签整理助手</h1>
-      <span class="sub" id="subTitle">按功能智能分类 · 预览确认后再写入</span>
+      <img class="brand-logo" src="logo.webp" alt="">
+      <div class="brand-text">
+        <h1>书签整理助手 <span class="ver">v1.0.0</span></h1>
+        <span class="sub" id="subTitle">按功能智能分类 · 预览确认后再写入</span>
+      </div>
     </div>
+    <nav class="tabs" id="tabs">
+      <button data-tab="plan" class="active">计划明细 <em id="tabPlanCount">0</em></button>
+      <button data-tab="dup">重复项 <em id="tabDupCount">0</em></button>
+      <button data-tab="snap">备份快照 <em id="tabSnapCount">0</em></button>
+      <button data-tab="settings">设置</button>
+    </nav>
     <div class="topbar-right">
       <label class="field compact">
         <span>归入位置</span>
@@ -22,33 +31,44 @@
     </div>
   </header>
 
-  <div class="toolbar">
-    <button id="btnPreview" class="primary">读取并预览</button>
-    <span class="sep"></span>
-    <button id="btnExecute" disabled>执行整理</button>
-    <button id="btnPause" hidden>暂停</button>
-    <button id="btnResume" hidden>继续</button>
-    <span class="sep"></span>
-    <button id="btnRestore" class="danger-ghost">恢复备份</button>
-    <span class="spacer"></span>
-    <span id="busy" class="busy" hidden></span>
-  </div>
+  <section class="hero" id="hero">
+    <div class="hero-main">
+      <div class="hero-gauge">
+        <div class="hero-ring" id="heroRing" data-state="unknown">
+          <span class="hero-ring-val" id="heroRingVal">未预览</span>
+        </div>
+        <span class="hero-ring-cap">整理完成度</span>
+      </div>
 
-  <section class="stats" id="stats">
-    <div class="card"><b id="stTotal">—</b><span>书签总数</span></div>
-    <div class="card"><b id="stMove">—</b><span>本次将移动</span></div>
-    <div class="card"><b id="stInPlace">—</b><span>已在位</span></div>
-    <div class="card warn"><b id="stUnclassified">—</b><span>未分类</span></div>
-    <div class="card"><b id="stDup">—</b><span>重复项</span></div>
-    <div class="card"><b id="stFolders">—</b><span>将新建文件夹</span></div>
+      <div class="hero-side">
+        <div class="stats" id="stats">
+          <div class="card c-total"><span>书签总数</span><b id="stTotal">—</b></div>
+          <div class="card c-move"><span>本次将移动</span><b id="stMove">—</b></div>
+          <div class="card c-inplace"><span>已在位</span><b id="stInPlace">—</b></div>
+          <div class="card warn c-uncat"><span>未分类</span><b id="stUnclassified">—</b></div>
+          <div class="card c-dup"><span>重复项</span><b id="stDup">—</b></div>
+          <div class="card c-folders"><span>将新建文件夹</span><b id="stFolders">—</b></div>
+        </div>
+
+        <div class="hero-actions">
+          <button id="btnPreview" class="primary">读取并预览</button>
+          <button id="btnExecute" disabled>执行整理</button>
+          <button id="btnPause" hidden>暂停</button>
+          <button id="btnResume" hidden>继续</button>
+          <button id="btnRestore" class="danger-ghost">恢复备份</button>
+          <span id="busy" class="busy" hidden></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 执行进度条：贴在 hero 卡底边，所有标签页都可见。
+         刻意不放在 #report 里 —— E2E 的终态判定只读那个单元格。 -->
+    <div class="exec-bar" id="execBar" data-state="idle" hidden>
+      <span class="exec-bar-label">本次整理</span>
+      <span class="exec-bar-text" id="execBarText">整理中 · 0/0</span>
+      <div class="exec-bar-track"><i class="exec-bar-fill" id="execBarFill"></i></div>
+    </div>
   </section>
-
-  <nav class="tabs" id="tabs">
-    <button data-tab="plan" class="active">计划明细 <em id="tabPlanCount">0</em></button>
-    <button data-tab="dup">重复项 <em id="tabDupCount">0</em></button>
-    <button data-tab="snap">备份快照 <em id="tabSnapCount">0</em></button>
-    <button data-tab="settings">设置</button>
-  </nav>
 
   <!-- ── 计划明细 ── -->
   <section class="panel active" data-panel="plan">
