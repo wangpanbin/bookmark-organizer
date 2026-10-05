@@ -9,11 +9,25 @@
  * 这就是为什么备份在 dry-run 阶段就落盘，而不是等到点「执行」前才存。
  */
 
-import { get, set, mutate, remove, K, getSettings, serialize } from './storage.js';
+import { get, mutate, mutateMany, remove, K, getSettings } from './storage.js';
 import { flattenTree, readTree } from './tree.js';
 import { dedupeKey } from './normalize.js';
 
 const snapKey = (ts) => `snapshot:${ts}`;
+
+/**
+ * Chrome 三个根的 **id** 是固定契约：1=书签栏 2=其他书签 3=移动设备书签。
+ * 随界面语言变的只是它们的**标题**。
+ *
+ * 所以规矩是：找根必须「标题 → id」反查（标题本地化，不能写死），
+ * 而「指向某个根」可以用固定 id —— 但必须走常量，不写裸字面量。
+ */
+const ROOT_ID = Object.freeze({ BAR: '1', OTHER: '2', MOBILE: '3' });
+
+/** 路径第 0 段是不是已经是一个根 id（而不是根名） */
+function isRootId(seg) {
+  return Object.values(ROOT_ID).includes(String(seg));
+}
 
 /**
  * 把根文件夹**名**换成根文件夹 **id**。
@@ -28,11 +42,13 @@ const snapKey = (ts) => `snapshot:${ts}`;
  * @returns {string} 根 id
  */
 function rootIdFromName(rootName, tops) {
-  const hit = (tops || []).find((t) => t.title === rootName);
+  const hit = (tops || []).find((t) => !t.url && t.title === rootName);
   if (hit) return String(hit.id);
-  // 兜底：Chrome 里 1=书签栏 2=其他书签 3=移动设备书签
-  if (rootName === '其他书签') return '2';
-  return '1';
+  // 兜底：路径里的根名在树上找不到（根被删或被改名）。
+  // 这里只按 id 契约回落，**不再比对中文字面量** —— 根标题是本地化的，
+  // 拿「其他书签」四个字去比，在非中文 Chrome 上必然匹配不上，
+  // 而匹配不上时静默回落到书签栏，正是上面那个「不报错只是没归位」的坑。
+  return ROOT_ID.BAR;
 }
 
 /** 某段路径相对根之下的层级，用于建目录时逐级下降 */
@@ -54,20 +70,28 @@ async function ensureFolder(parentId, title) {
 
 /**
  * 按路径逐级确保文件夹存在。
- * @param {string[]} pathArr 完整路径，第 0 段是根**名**
+ *
+ * ⚠️ 路径第 0 段允许是根**名**（正常情况），也允许直接是根 **id**。
+ *    去重清单里的 path 在取不到源条目时会退化成 ['2']（见 ui/options.js 的 dupPayload），
+ *    把它当根名丢给 rootIdFromName 会一路回落到书签栏，
+ *    症状是**恢复出来的重复项静默落进书签栏**，不报错、清单上还看不出来。
+ *    所以这里先判一次是不是根 id，是就直接拿它当起点。
+ *
+ * @param {string[]} pathArr 完整路径，第 0 段是根名（或根 id）
  * @param {Array} tops getTree()[0].children，用于把根名换成根 id
  * @param {string[]} [createdOut] 新建的文件夹 [{id, path}]
  * @returns {Promise<string>} 最深层文件夹 id
  */
 async function ensurePath(pathArr, tops, createdOut) {
-  const rootId = rootIdFromName(pathArr[0], tops);
+  const head = pathArr[0];
+  const rootId = isRootId(head) ? String(head) : rootIdFromName(head, tops);
   const segs = segmentsBelowRoot(pathArr);
   let parentId = String(rootId);
   const acc = [];
   for (const seg of segs) {
     acc.push(seg);
     const r = await ensureFolder(parentId, seg);
-    if (r.created && createdOut) createdOut.push({ id: r.id, path: [pathArr[0], ...acc] });
+    if (r.created && createdOut) createdOut.push({ id: r.id, path: [head, ...acc] });
     parentId = r.id;
   }
   return parentId;
@@ -83,39 +107,54 @@ async function ensurePath(pathArr, tops, createdOut) {
 export async function createSnapshot(opts = {}) {
   const trees = await readTree();
   const flat = flattenTree(trees);
-  const ts = Number(new Date().toString().replace(/\D/g, '').slice(0, 17)) || Date.now();
-  const payload = { ts, note: opts.note || '', trees, flat };
-
-  const text = JSON.stringify(payload);
-  const bytes = new TextEncoder().encode(text).length;
+  const note = opts.note || '';
 
   const settings = await getSettings();
   const keep = Math.max(1, Number(settings.keepSnapshots) || 10);
 
-  await set(snapKey(ts), payload);
+  // ⚠️ 快照数据与索引必须在**同一个临界区**里一起写。
+  //    分开写会留下两种半状态：索引里有、数据没有（回滚当场失败），
+  //    或者数据有、索引没有（备份静默消失，用户以为存上了）。
+  //    索引自身的读-改-写也必须整段待在临界区内 ——
+  //    旧写法是 get → 算 → set 三次独立进出锁，两次并发备份会互相覆盖索引。
+  let entry = null;
+  let droppedKeys = [];
+  await mutateMany([K.SNAPSHOT_INDEX], (cur) => {
+    const index = Array.isArray(cur[K.SNAPSHOT_INDEX]) ? cur[K.SNAPSHOT_INDEX] : [];
 
-  const index = (await get(K.SNAPSHOT_INDEX, [])) || [];
-  const entry = {
-    ts,
-    note: opts.note || '',
-    count: flat.length,
-    urlCount: flat.filter((e) => e.type === 'url').length,
-    bytes,
-    at: Date.now(),
-  };
-  const next = [entry, ...index.filter((e) => e.ts !== ts)].sort((a, b) => b.ts - a.ts);
+    // ts 用毫秒并在临界区内去重。旧写法从 `new Date().toString()` 里抽数字，
+    // 只有**秒级**精度且是本地化字符串 —— 同一秒内做两次备份，
+    // 后一次会整个覆盖前一份（索引里同 ts 的旧条目被 filter 掉、数据被同名键覆盖），
+    // 症状是「明明点了两次备份，列表里只有一条」。
+    let ts = Date.now();
+    while (index.some((e) => e.ts === ts)) ts += 1;
 
-  // 超出保留份数：把最旧的连同其数据一起删掉
-  const drop = next.slice(keep);
-  const keepList = next.slice(0, keep);
-  for (const d of drop) {
+    const payload = { ts, note, trees, flat };
+    entry = {
+      ts,
+      note,
+      count: flat.length,
+      urlCount: flat.filter((e) => e.type === 'url').length,
+      bytes: new TextEncoder().encode(JSON.stringify(payload)).length,
+      at: Date.now(),
+    };
+
+    const next = [entry, ...index.filter((e) => e.ts !== ts)].sort((a, b) => b.ts - a.ts);
+    const keepList = next.slice(0, keep);
+    droppedKeys = next.slice(keep).map((d) => snapKey(d.ts));
+
+    return { [snapKey(ts)]: payload, [K.SNAPSHOT_INDEX]: keepList };
+  }, { [K.SNAPSHOT_INDEX]: [] });
+
+  // 淘汰旧快照的数据放在临界区**之外**：索引已经不含它们，
+  // 删不掉只是留下没人看得见的孤儿数据，不会让用户回滚到错的东西。
+  for (const k of droppedKeys) {
     try {
-      await remove(snapKey(d.ts));
+      await remove(k);
     } catch {
       /* 删不掉就留着，不影响主流程 */
     }
   }
-  await set(K.SNAPSHOT_INDEX, keepList);
 
   return entry;
 }
@@ -223,10 +262,12 @@ export async function restoreSnapshot(ts) {
           report.failures.push({ step: 'moveBack', detail: e.url, error: String(err) });
         }
       } else {
-        // 快照之后新增的：放回「其他书签」根
+        // 快照之后新增的：放回「其他书签」根。
+        // 走 ROOT_ID.OTHER 而不是裸写 '2' —— 同文件里就有 rootIdFromName
+        // 这套「根名↔根 id」的解析，绕开它等于把规则又破一次。
         if (e.path.length <= 1) continue;
         try {
-          await chrome.bookmarks.move(e.id, { parentId: '2' });
+          await chrome.bookmarks.move(e.id, { parentId: ROOT_ID.OTHER });
           report.movedNew += 1;
         } catch (err) {
           report.failures.push({ step: 'moveNew', detail: e.url, error: String(err) });
