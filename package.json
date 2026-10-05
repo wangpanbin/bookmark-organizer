@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Chrome MV3 书签智能分类扩展（零构建：原生 ES Module）",
   "scripts": {
-    "test": "node --test \"tests/unit/*.test.js\"",
+    "test": "python tools/precommit.py --tests-only",
     "test:falsify": "python tests/product_falsification.py",
     "test:falsify:llm": "python tests/falsify_inject_path.py",
     "test:e2e": "node --test tests/e2e/run.js",

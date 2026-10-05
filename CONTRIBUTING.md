@@ -10,11 +10,12 @@
 **不需要 `npm install` 才能跑单测** —— 用的是 Node 内置 test runner，零依赖。
 
 ```bash
-node --version    # 需要能跑 --test 的版本（18+ / 20+ / 24 都可）
-python --version
+node --version    # CI 跑 Node 20，本机开发跑 Node 24
+python --version  # 3.8+，单测的文件枚举和两个闸门都用它
 ```
 
 E2E 需要 Playwright 的 chromium；不装也不影响单测与证伪。
+**不需要 `npm install` 才能跑单测** —— 用的是 Node 内置 test runner，零三方依赖。
 
 ## 提交前必过
 

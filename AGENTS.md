@@ -9,11 +9,17 @@ Chrome MV3 书签整理扩展。原生 ES Module，零构建，`load unpacked` �
 
 | 命令 | 作用 |
 |---|---|
-| `npm test` | 单元测试（Node 内置 test runner，零依赖） |
+| `npm test` | 单元测试（Node 内置 test runner；需 Python 做文件枚举） |
 | `npm run test:falsify` | 产品级证伪：备份源码、打坏补丁、跑整套、断言变红、再还原 |
 | `npm run test:e2e` | E2E（需要完整 chromium + 有头模式） |
 | `npm run test:all` | 全套验证 |
 | `npm run package` | 打包产物 |
+| `npm run gate:privacy` | 隐私闸门：扫所有将推送的 blob，查真 key / 真实书签数据 |
+
+单测由 `tools/precommit.py` 枚举 `tests/unit/*.test.js` 后**显式**交给 node。两条别踩：
+- **别把 glob 当单个参数传给 `node --test`**（`node --test "tests/unit/*.test.js"`）——
+  只有 Node 22+ 认，Node 20 上会静默地什么都不跑，退出码还可能是 0。CI 首次实跑就是这么红的。
+- **别传目录**（`node --test tests/unit`）—— 本机会报 `MODULE_NOT_FOUND`。
 
 `python tools/precommit.py` 是**提交前闸门**：暂存区的 `.js`/`.mjs` 过 `node --check`、`.json` 过 parse，再跑一遍单测（2 秒、零浏览器）。已接成本机 `.git/hooks/pre-commit`，每次 `git commit` 自动跑。
 ⚠️ `.git/` 不进版本库，所以**每台机器要装一次**：把下面这行写成 `.git/hooks/pre-commit` 并 `chmod +x`（Windows 用 Git 自带的 bash）——

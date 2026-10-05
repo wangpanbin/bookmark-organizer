@@ -21,6 +21,7 @@
 
 退出码：0 放行；非 0 拦下提交。
 """
+import glob
 import json
 import os
 import re
@@ -102,11 +103,22 @@ def check_syntax(files):
 
 
 def run_unit_tests():
-    print("[precommit] → node --test tests/unit/*.test.js")
-    # 直接调 node，不走 npm：Windows 上 npm 是 .cmd shim，subprocess 找不到它
-    # （FileNotFoundError [WinError 2]）；顺带省掉每次提交的 npm 启动开销。
-    # 参数与 package.json 的 test 脚本一致，glob 由 node 自己展开。
-    p = run(["node", "--test", "--test-reporter=tap", "tests/unit/*.test.js"])
+    # ⚠️ 不要把 glob 当**单个参数**交给 node，指望它自己展开 ——
+    #    `node --test "tests/unit/*.test.js"` 只有 Node 22+ 认，
+    #    Node 20 上它会当成一个字面文件名，然后在别处静默失败
+    #    （CI 首次实跑就是这么红的：失败条目一片空白）。
+    #    `node --test <目录>` 也不行 —— 本机会报 MODULE_NOT_FOUND。
+    #    所以这里用 Python 枚举出**显式文件列表**，对所有 Node 版本都成立。
+    #    直接调 node 而不走 npm：Windows 上 npm 是 .cmd shim，
+    #    subprocess 找不到它（FileNotFoundError [WinError 2]），
+    #    顺带也省掉每次提交的 npm 启动开销。
+    files = sorted(glob.glob(os.path.join(ROOT, "tests", "unit", "*.test.js")))
+    if not files:
+        print("[precommit] ✗ 一个 tests/unit/*.test.js 都没找到，单测无法运行")
+        return 1
+    rel = [os.path.relpath(f, ROOT).replace("\\", "/") for f in files]
+    print(f"[precommit] → node --test（{len(rel)} 个单测文件）")
+    p = run(["node", "--test", "--test-reporter=tap", *rel])
     out = (p.stdout or b"").decode("utf-8", "replace") + (p.stderr or b"").decode("utf-8", "replace")
     if p.returncode == 0:
         # 只摘 TAP 的汇总行。⚠️ 别用「包含 pass/fail 就打印」那种宽过滤：
@@ -116,6 +128,10 @@ def run_unit_tests():
                    if re.match(r"^#\s+(tests|suites|pass|fail|cancelled|skipped|todo)\s+\d+\s*$", l)]
         for l in summary:
             print(f"    {l.strip()}")
+        if not summary:
+            # 没汇总行却 rc=0 = 什么都没跑。绿灯必须是真的跑过了。
+            print("[precommit] ✗ 没有 TAP 汇总行，怀疑单测根本没执行，按失败处理")
+            return 1
         print("[precommit] ✓ 单测通过")
         return 0
     print("[precommit] ✗ 单测未通过，提交已被拦下。失败条目：\n")
@@ -123,6 +139,11 @@ def run_unit_tests():
     for line in out.split("\n"):
         if line.startswith("not ok"):
             print(f"    {line}")
+    if not any(l.startswith("not ok") for l in out.split("\n")):
+        # 一条 not ok 都没有却失败了 —— 那不是测试红，是根本没跑起来。
+        # 原来这里会打印一个空列表，看起来像「测试跑了但没列出失败项」。
+        print("    （没有 not ok 行，说明不是测试红，而是测试进程本身没跑起来）")
+        print("    " + "\n    ".join(out.strip().split("\n")[-12:]))
     return 1
 
 
