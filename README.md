@@ -252,11 +252,17 @@ storage.js 是全项目最容易**静默**损坏数据的模块，之前只能�
 故意造坏实现，确认对应闸门**确实会红**。
 
 `npm run test:falsify` 会备份真实源码、打上坏补丁、跑整套测试、断言变红、再还原。
-当前覆盖 9 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
+当前覆盖 10 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
 注入**跨行**写操作 import、注入**动态** import 写操作模块、字典位置参数错位、
-给 `plan.js` 注入**日志模块**、发送成功后整条清空缓冲、`recordFailure` 不再兜底。
+给 `plan.js` 注入**日志模块**、发送成功后整条清空缓冲、`recordFailure` 不再兜底、
+把「归入位置」又写死成根 id。
 
 > 绿灯本身不算证据。一道从来没红过的闸门，和没有闸门是一样的。
+
+> 这些闸门**没有任何东西会自动调用**（本仓库没有 CI，也没有默认接线的钩子）。
+> 最便宜的一段已经接成本机 `.git/hooks/pre-commit`：`python tools/precommit.py`
+> 跑语法检查 + 整套单测，2 秒、零浏览器。E2E 与证伪仍需手动 `npm run test:all` ——
+> 它们要开浏览器，分钟级，塞进每次提交会变成没人愿意等的门。
 
 ### E2E 闸门（9 条）
 
@@ -321,6 +327,7 @@ tests/
   product_falsification.py
 tools/
   verify_all.py       全套验证（单测 + 证伪 + E2E）
+  precommit.py        提交前闸门（语法/JSON + 单测），已接成 .git/hooks/pre-commit
   package.py          打包产物
   inject_key.py       从本机环境变量把 API key 注入 src/llm-key.local.js（已 gitignore）
   fail_log_sink.py    失败日志接收器：接住扩展 POST，写 F:\logs\bookmark-organizer\<日期>.jsonl

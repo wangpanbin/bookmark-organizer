@@ -105,6 +105,14 @@ CASES = [
         ["storage 整个炸了", "不 reject", "recordFailure"],
         None,
     ),
+    (
+        "「归入位置」又写死成根 id（Chrome 154 的根是 279/280/281，'1' 查无此节点）",
+        os.path.join("src", "storage.js"),
+        "  targetRoot: 'bar',",
+        "  targetRoot: '1',   // ← 证伪补丁：把根 id 又当成常量",
+        ["归入位置", "根 id"],
+        None,
+    ),
 ]
 
 

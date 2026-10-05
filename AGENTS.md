@@ -15,6 +15,12 @@ Chrome MV3 书签整理扩展。原生 ES Module，零构建，`load unpacked` �
 | `npm run test:all` | 全套验证 |
 | `npm run package` | 打包产物 |
 
+`python tools/precommit.py` 是**提交前闸门**：暂存区的 `.js`/`.mjs` 过 `node --check`、`.json` 过 parse，再跑一遍单测（2 秒、零浏览器）。已接成本机 `.git/hooks/pre-commit`，每次 `git commit` 自动跑。
+⚠️ `.git/` 不进版本库，所以**每台机器要装一次**：把下面这行写成 `.git/hooks/pre-commit` 并 `chmod +x`（Windows 用 Git 自带的 bash）——
+`exec python "$(git rev-parse --show-toplevel)/tools/precommit.py"`
+不接线的代价是实测过的：170 条单测与 10 处证伪点从来没被要求跑过，于是「全绿」和「没跑」长得一模一样。
+E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞进每次提交会变成没人愿意等的门。
+
 本机 `node --test <目录>` 会把目录当模块解析报 `MODULE_NOT_FOUND`，脚本里已改用 glob。
 
 ## 三条不可破的约束

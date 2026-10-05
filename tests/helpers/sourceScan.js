@@ -115,6 +115,72 @@ export function usesChromeApi(sourceText) {
   return /chrome\.(bookmarks|storage)\b/.test(stripComments(sourceText));
 }
 
+/**
+ * 去掉 HTML 注释。JS 那份 stripComments 不认 `<!-- -->`。
+ */
+export function stripHtmlComments(text) {
+  return text.replace(/<!--[\s\S]*?-->/g, ' ');
+}
+
+/**
+ * ═══ 「归入位置」不许存根 id ═══
+ *
+ * 事故（2026-10-05）：`targetRoot` 被当成常量写死成 `'1'`，写在三个文件里
+ * （storage.js 默认值、options.html 的 `<option value="1">`、apply.js 的兜底）。
+ * 而**根 id 根本不是常量** —— Chrome 154 的账号书签模型实测是
+ * 书签栏=279 / 其他书签=280 / 移动设备=281。于是那一次 45 条书签全军覆没，
+ * 17 个分类文件夹一个都没建成。
+ *
+ * 规则本身：设置里只存**语义键**（bar / other），真实 id 每次由
+ * src/roots.js 从活着的书签树按位置解析。旧值 '1'/'2' 只有 roots.js
+ * 的 pickRootKey 认，其余任何地方出现数字就是 bug。
+ *
+ * ⚠️ 为什么只判「数字字面量」而不做更宽的白名单：
+ *    判据要窄而准。写成 `targetRoot: SOME_CONST` 时值不是字面量，
+ *    而那条路径一定会过 pickRootKey；把非字面量也拦下只会制造误报，
+ *    而误报是闸门失去可信度的最快方式。
+ *
+ * ⚠️ HTML 必须一起扫：事故里三处有一处是 `<option value="1">`，
+ *    纯 JS 的闸门天然看不见它。
+ */
+
+/** `targetRoot` 被赋成数字（带引号或不带） */
+const TARGET_ROOT_NUMERIC_JS = /\btargetRoot\s*:\s*(['"`]?)(\d+)\1/g;
+
+/** `<select id="targetRoot"> … </select>` 整块 */
+const TARGET_ROOT_SELECT = /<select[^>]*\bid\s*=\s*["']targetRoot["'][^>]*>([\s\S]*?)<\/select>/gi;
+
+/** 块内每个 `<option value="…">` */
+const OPTION_VALUE = /<option[^>]*\bvalue\s*=\s*["']([^"']*)["']/gi;
+
+/**
+ * 找出所有把「归入位置」写成根 id 的地方。
+ *
+ * @param {Array<{rel:string, text:string}>} sources
+ * @returns {string[]} 形如 `src/storage.js → targetRoot: '1'`
+ */
+export function findNonSemanticTargetRoot(sources) {
+  const bad = [];
+  for (const { rel, text } of sources || []) {
+    if (/\.html$/i.test(rel)) {
+      const html = stripHtmlComments(text);
+      for (const sel of html.matchAll(TARGET_ROOT_SELECT)) {
+        for (const opt of sel[1].matchAll(OPTION_VALUE)) {
+          if (/^\d+$/.test(opt[1].trim())) {
+            bad.push(`${rel} → <select id="targetRoot"> 里有 <option value="${opt[1]}">`);
+          }
+        }
+      }
+      continue;
+    }
+    const src = stripComments(text);
+    for (const m of src.matchAll(TARGET_ROOT_NUMERIC_JS)) {
+      bad.push(`${rel} → targetRoot: '${m[2]}'`);
+    }
+  }
+  return bad;
+}
+
 export function readSource(absPath) {
   return readFileSync(absPath, 'utf8');
 }
