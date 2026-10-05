@@ -180,10 +180,10 @@ test('证伪：若执行后没有真正搬动 → 幂等闸门必须红', () => 
   const first = buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY });
   assert.ok(first.items.length > 0, '第一条就该有变更');
 
-  // 正确执行：条目被搬到目标路径 → 第二轮 0 变更
+  // 正确执行：条目被搬到目标路径（注意要补上根名，因为 toPath 不含根）
   const goodAfter = entries.map((e) => {
     const t = first.items.find((i) => i.id === e.id);
-    return t ? { ...e, path: t.toPath } : e;
+    return t ? { ...e, path: [e.path[0], ...t.toPath] } : e;
   });
   assert.equal(buildPlan({ entries: goodAfter, taxonomy: DEFAULT_TAXONOMY }).items.length, 0);
 
@@ -195,13 +195,27 @@ test('证伪：若执行后没有真正搬动 → 幂等闸门必须红', () => 
   );
 });
 
-test('证伪：幂等必须依赖路径比较而不是 id 比较', () => {
+test('证伪：若「已在位」判断不剥根名 → 幂等闸门必须红', () => {
   setRules(DEFAULT_RULES);
-  // 同一条书签，id 变了但 URL 与目标路径没变 → 仍应判为已在位
   const entries = [
-    { id: '999', type: 'url', url: 'https://github.com/a', title: '', path: ['开发与技术', '代码托管'], dateAdded: 1 },
+    { id: '1', type: 'url', url: 'https://github.com/a', title: '', path: ['书签栏'], dateAdded: 1 },
   ];
-  assert.equal(buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY }).items.length, 0);
+  const plan = buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY });
+  assert.ok(plan.items.length > 0);
+
+  // 正确实现：执行后路径是 [根名, ...toPath] → 剥根后与 toStr 相等 → 0 变更
+  const good = entries.map((e) => ({ ...e, path: ['书签栏', ...plan.items[0].toPath] }));
+  assert.equal(buildPlan({ entries: good, taxonomy: DEFAULT_TAXONOMY }).items.length, 0);
+
+  // 坏实现：把 fromPath 原样拿去比 toStr（根名没剥）→ 永远不等 → 每次都有变更
+  const toStr = plan.items[0].toStr;
+  const fromStrNoStrip = good[0].path.join('/');
+  assert.notEqual(
+    fromStrNoStrip,
+    toStr,
+    '剥根与不剥根竟得到同一个串，说明闸门分不清这两种实现',
+  );
+  assert.ok(fromStrNoStrip.endsWith(toStr), '不剥根的结果应仍以目标路径结尾，只是多了根名');
 });
 
 // ───────────────── 5. 锁闸门能红吗 ─────────────────

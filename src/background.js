@@ -9,7 +9,9 @@
  */
 
 import { installListeners } from './listener.js';
-import { startExecution, resumeExecution, pauseExecution, getProgress, clearTask } from './apply.js';
+import {
+  startExecution, resumeExecution, pauseExecution, getProgress, clearTask, isRunnerActive, currentRunToken,
+} from './apply.js';
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot } from './backup.js';
 import { getSettings, updateSettings, getTask, K, get } from './storage.js';
 import { getTaxonomy } from './classify/taxonomy.js';
@@ -67,6 +69,12 @@ async function getState() {
 
 const HANDLERS = {
   getState,
+  /**
+   * 探针：这个 SW 实例里此刻有没有执行循环在跑。
+   * 面板靠它区分「正在执行」与「上次被回收打断」——
+   * 消息会唤醒 SW，唤醒后的新实例模块状态重置，答案必然是否，这比时间戳可靠。
+   */
+  probeRunner: async () => ({ active: isRunnerActive(), token: currentRunToken() }),
   openPanel: () => openPanel().then(() => ({ ok: true })),
   startExecution: (p) => startExecution(p),
   resumeExecution: () => resumeExecution(),

@@ -46,7 +46,7 @@ CASES = [
         os.path.join("src", "plan.js"),
         "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';",
         "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';\n"
-        "import { applyPlan } from './apply.js';   // ← 证伪补丁：混入了写操作模块",
+        "import { isRunnerActive } from './apply.js';   // ← 证伪补丁：混入了写操作模块",
         ["写操作", "零写入", "plan.js", "闸门"],
         # 注入的模块必须真实存在，否则 Node 解析失败会让整个测试文件加载失败，
         # 具名断言根本没机会跑 —— 那种「红」是加载错误，不是闸门在工作。
@@ -64,6 +64,12 @@ CASES = [
 
 
 def run_suite():
+    """返回 (exit_code, 所有失败条目, 具名失败条目)。
+
+    ⚠️ 文件级 `not ok N - tests\\unit\\xxx.test.js` 也要算失败。
+    早先只把具名用例算进去，于是「模块因 SyntaxError 加载失败」这种红灯
+    被判成「没红」—— 那不是闸门在测量，而是测量根本没跑起来。
+    """
     proc = subprocess.run(
         ["node", "--test", "--test-reporter=tap", "tests/unit/*.test.js"],
         cwd=ROOT,
@@ -71,16 +77,21 @@ def run_suite():
         env=ENV,
     )
     out = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
-    # not ok 12 - <title> 才是具名用例；not ok 3 - tests\unit\xxx.test.js 是文件级汇总
+
+    all_fail = []
     named = []
     for line in out.split("\n"):
         if not line.startswith("not ok "):
             continue
         body = line[7:]
         num, sep, title = body.partition(" - ")
-        if sep and not title.strip().endswith(".test.js") and not title.strip().endswith(".js"):
-            named.append((num.strip(), title.strip()))
-    return proc.returncode, named, out
+        if not sep:
+            continue
+        title = title.strip()
+        all_fail.append((num.strip(), title))
+        if not title.endswith(".test.js"):
+            named.append((num.strip(), title))
+    return proc.returncode, all_fail, named, out
 
 
 def main():
@@ -104,15 +115,18 @@ def main():
                 continue
             open(target, "w", encoding="utf-8", newline="\n").write(text.replace(old, new))
 
-            code, failing, out = run_suite()
+            code, failing, named, out = run_suite()
             red = code != 0 and len(failing) > 0
             if red:
-                hit = [t for _, t in failing if any(k in t for k in expect_kw)]
+                hit = [t for _, t in named if any(k in t for k in expect_kw)]
+                if not hit:
+                    # 具名用例没命中时，用文件级失败兜底（加载失败也算红）
+                    hit = [t for _, t in failing if any(k in t for k in expect_kw)]
                 status = "RED  ✓" if hit else "RED  (关键字未匹配)"
                 if not hit:
                     overall_ok = False
                 print(f"[{status}] {name}")
-                print(f"         失败用例 {len(failing)} 条，样例：{failing[0][1][:110]}")
+                print(f"         失败条目 {len(failing)} 条（具名 {len(named)}），样例：{failing[0][1][:110]}")
                 if not hit:
                     print(f"         实际标题：{[t for _, t in failing][:6]}")
             else:
@@ -126,7 +140,7 @@ def main():
             shutil.move(backup, target)
 
     # 还原后必须恢复全绿
-    code, failing, _ = run_suite()
+    code, failing, _, _ = run_suite()
     restored_ok = code == 0 and not failing
     print("-" * 68)
     print(f"还原后整套测试：{'全绿 ✓' if restored_ok else f'仍红 ✗ ({len(failing)} 失败)'}")

@@ -21,6 +21,29 @@ import { toRemovalList } from './dedupe.js';
 
 /** 模块级重入保护 */
 let running = false;
+/** 当前执行轮次的标识，仅用于日志排查 */
+let runToken = 0;
+
+/**
+ * 当前这个 service worker 实例里是否真的有执行循环在跑。
+ *
+ * 这是判定「任务是被浏览器回收打断的」还是「此刻正在跑」的**权威判据**：
+ * SW 被回收后模块状态会重置，running 归 false；而消息会把 SW 唤醒，
+ * 唤醒后的新实例回答 false —— 正好说明原来的循环已经不存在了。
+ *
+ * 之前用 updatedAt 的时间戳去猜（「超过 5 秒没刷新就算陈旧」）不可靠：
+ * 浏览器重开只要 2~4 秒，落在阈值内，于是中断的任务永远等不到「继续」按钮。
+ *
+ * @returns {boolean}
+ */
+export function isRunnerActive() {
+  return running;
+}
+
+/** 当前执行轮次序号（诊断用） */
+export function currentRunToken() {
+  return runToken;
+}
 /** 让出事件循环的间隔。每条都 await 一个宏任务，保证 API 调用有机会派发出去 */
 const YIELD_EVERY = 1;
 const YIELD_MS = 0;
@@ -62,22 +85,38 @@ async function ensureFolder(parentId, title, createdOut) {
 }
 
 /**
+ * 把设置里的根 id（'1' 书签栏 / '2' 其他书签）解析成**根文件夹名**。
+ *
+ * ⚠️ 路径模型（踩过一次的坑）：
+ *    fromPath 的第 0 段是根**名称**，toPath 则**不含根**（就是 taxonomy 的 '大类/子类'）。
+ *    根归到哪是「写到哪儿」的问题，由 settings.targetRoot 决定，所以 plan.js 不参与。
+ *    写盘时必须把根名补回去，而 chrome.bookmarks 的 API 要的是**根 id**，
+ *    所以这里先由 id 反查名字（根名随界面语言变，不能硬编码）。
+ */
+async function resolveRootName() {
+  const settings = await getSettings();
+  const trees = await chrome.bookmarks.getTree();
+  const tops = trees?.[0]?.children || [];
+  const hit = tops.find((t) => String(t.id) === String(settings.targetRoot || '1'));
+  // 兜底：根 id 在任何语言下都是 1（书签栏）
+  return { rootId: hit ? String(hit.id) : '1', rootName: hit ? hit.title : '书签栏' };
+}
+
+/**
  * 确保目标路径存在，返回最深层文件夹 id。
- * 优先查 folderCache，再查真实树（缓存可能因用户手动删目录而失效），
- * 都没有才创建。
+ * 入参 fullPath 的第 0 段是根**名**，内部换算成根 id。
  *
  * @param {object} task 任务对象（会被就地补上 folderCache / createdFolders）
- * @param {string[]} toPath [根名, 大类, 子类]
+ * @param {string} rootId 根 id
+ * @param {string[]} fullPath [根名, 大类, 子类]
  * @returns {Promise<string>}
  */
-async function ensureTargetFolder(task, toPath) {
-  const [rootName, ...segs] = toPath;
+async function ensureTargetFolder(task, rootId, fullPath) {
+  const [rootName, ...segs] = fullPath;
   const cache = task.folderCache || (task.folderCache = {});
   const createdOut = task.createdFolders || (task.createdFolders = []);
 
-  // 根 id 就是 Chrome 的固定根名（书签栏/其他书签/移动设备书签）
-  const rootId = rootName;
-  let parentId = rootId;
+  let parentId = String(rootId);
   const acc = [];
 
   for (const seg of segs) {
@@ -93,25 +132,41 @@ async function ensureTargetFolder(task, toPath) {
       }
     }
     const id = await ensureFolder(parentId, seg, null);
-    // 新建的话记下来（回滚时要精确清理）
-    const fullPath = [rootName, ...acc];
-    const isNew = !createdOut.some((c) => c.id === id);
-    if (isNew) createdOut.push({ id, path: fullPath });
+    const full = [rootName, ...acc];
+    if (!createdOut.some((c) => c.id === id)) createdOut.push({ id, path: full });
     cache[key] = id;
     parentId = id;
   }
   return parentId;
 }
 
-/** 每完成一条就落盘（断点续跑的关键） */
-async function persistItem(item, extra) {
+/**
+ * 每完成一条就落盘（断点续跑的关键）。
+ *
+ * ⚠️ patch 与 extra 必须分开传。
+ *    之前写成 `{ ...i, ...item }`（item 是那条计划项本身），而计划项此刻的
+ *    status 仍是 'pending'，于是把 extra 里的 'done' 又覆盖回 'pending' ——
+ *    状态永远不推进，执行器会反复搬同一条，死循环。
+ *    现在 patch 只带要改的字段；extra 里的任务级状态单独写进 task，
+ *    不混进计划项。
+ *
+ * @param {string} id
+ * @param {object} patch   计划项上要改的字段，如 { status: 'done' }
+ * @param {object} [extra] 任务级状态：进度、失败列表、目录缓存
+ */
+async function persistItem(id, patch, extra) {
   return mutateMany(
     [K.TASK_CURRENT],
     (cur) => {
-      const t = { ...(cur || {}) };
-      const items = (t.plan?.items || []).map((i) => (i.id === item.id ? { ...i, ...item } : i));
+      // ⚠️ mutateMany 的回调收到的是 { key: value } 的**映射**，不是单个值。
+      //    早先写成 `{ ...(cur || {}) }` 会把映射整个摊平：t.plan 变成 undefined
+      //    → 被重建成 { items: [] } → 循环下一轮就找不到待办项，只搬了第一条就停。
+      //    同时把原任务嵌套进了 t['task:current']，落盘对象结构整个坏掉。
+      //    必须取 cur[K.TASK_CURRENT]。
+      const t = { ...(cur?.[K.TASK_CURRENT] || {}) };
+      const items = (t.plan?.items || []).map((i) => (i.id === id ? { ...i, ...patch } : i));
       t.plan = { ...(t.plan || {}), items };
-      t.lastDoneIndex = extra?.lastDoneIndex ?? t.lastDoneIndex;
+      if (extra?.lastDoneIndex !== undefined) t.lastDoneIndex = extra.lastDoneIndex;
       if (extra?.failed) t.failed = extra.failed;
       if (extra?.createdFolders) t.createdFolders = extra.createdFolders;
       if (extra?.folderCache) t.folderCache = extra.folderCache;
@@ -158,7 +213,14 @@ export async function startExecution(payload) {
   };
   await set(K.TASK_CURRENT, task);
 
-  await run();
+  // ⚠️ 不能 await run()：run() 会把整批跑完，而 sendMessage 的响应要等它返回。
+  //    那样 UI 在整个执行期间拿不到任何回音，进度条从头到尾都是空的。
+  //    run() 里的 `running = true` 是在第一个 await 之前同步置位的，
+  //    所以不 await 依然能挡住重复启动。
+  run().catch((e) => {
+    console.error('[apply] 执行循环异常', e);
+    mutate(K.TASK_CURRENT, (cur) => ({ ...(cur || {}), status: TASK_STATUS.FAILED, updatedAt: Date.now() }), {});
+  });
   return { started: true, snapshotTs: snapTs };
 }
 
@@ -170,7 +232,10 @@ export async function resumeExecution() {
   if (task.status === TASK_STATUS.DONE) return { started: false, reason: '任务已完成' };
 
   await mutate(K.TASK_CURRENT, (cur) => ({ ...(cur || {}), status: TASK_STATUS.RUNNING, updatedAt: Date.now() }), {});
-  await run();
+  run().catch((e) => {
+    console.error('[apply] 续跑异常', e);
+    mutate(K.TASK_CURRENT, (cur) => ({ ...(cur || {}), status: TASK_STATUS.FAILED, updatedAt: Date.now() }), {});
+  });
   return { started: true };
 }
 
@@ -187,7 +252,10 @@ export async function pauseExecution() {
 async function run() {
   if (running) return;
   running = true;
+  runToken += 1;
   try {
+    // 根 id/名在整轮里固定，解析一次就够
+    const { rootId, rootName } = await resolveRootName();
     let sinceYield = 0;
     for (;;) {
       const task = await getTask();
@@ -200,7 +268,7 @@ async function run() {
         // 计划项跑完 → 接着处理待删的重复项
         const removed = await processDuplicates(task);
         await mutateMany([K.TASK_CURRENT], (cur) => {
-          const t = { ...(cur || {}) };
+          const t = { ...(cur?.[K.TASK_CURRENT] || {}) };
           t.removedDuplicates = removed;
           t.status = TASK_STATUS.DONE;
           t.updatedAt = Date.now();
@@ -210,10 +278,9 @@ async function run() {
       }
 
       try {
-        const parentId = await ensureTargetFolder(task, next.toPath);
+        const parentId = await ensureTargetFolder(task, rootId, [rootName, ...next.toPath]);
         await chrome.bookmarks.move(next.id, { parentId });
-        await persistItem(next, {
-          status: 'done',
+        await persistItem(next.id, { status: 'done' }, {
           lastDoneIndex: items.indexOf(next),
           createdFolders: task.createdFolders,
           folderCache: task.folderCache,
@@ -221,7 +288,7 @@ async function run() {
       } catch (e) {
         // 单条失败不中断，记原因继续
         const failed = [...(task.failed || []), { id: next.id, url: next.url, title: next.title, error: String(e) }];
-        await persistItem(next, { status: 'failed', failed, lastDoneIndex: items.indexOf(next) });
+        await persistItem(next.id, { status: 'failed' }, { failed, lastDoneIndex: items.indexOf(next) });
       }
 
       sinceYield += 1;
@@ -251,7 +318,7 @@ async function processDuplicates(task) {
     } catch (e) {
       const failed = [...(task.failed || []), { id: d.id, url: d.url, title: d.title, error: `删除重复项失败: ${e}` }];
       await mutateMany([K.TASK_CURRENT], (cur) => {
-        const t = { ...(cur || {}) };
+        const t = { ...(cur?.[K.TASK_CURRENT] || {}) };
         t.failed = failed;
         return { [K.TASK_CURRENT]: t };
       }, {});

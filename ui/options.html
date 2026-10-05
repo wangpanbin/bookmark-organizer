@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>书签整理助手</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>书签整理助手</h1>
+      <span class="sub" id="subTitle">按功能智能分类 · 预览确认后再写入</span>
+    </div>
+    <div class="topbar-right">
+      <label class="field compact">
+        <span>归入位置</span>
+        <select id="targetRoot">
+          <option value="1">书签栏</option>
+          <option value="2">其他书签</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button id="btnPreview" class="primary">读取并预览</button>
+    <span class="sep"></span>
+    <button id="btnExecute" disabled>执行整理</button>
+    <button id="btnPause" hidden>暂停</button>
+    <button id="btnResume" hidden>继续</button>
+    <span class="sep"></span>
+    <button id="btnRestore" class="danger-ghost">恢复备份</button>
+    <span class="spacer"></span>
+    <span id="busy" class="busy" hidden></span>
+  </div>
+
+  <section class="stats" id="stats">
+    <div class="card"><b id="stTotal">—</b><span>书签总数</span></div>
+    <div class="card"><b id="stMove">—</b><span>本次将移动</span></div>
+    <div class="card"><b id="stInPlace">—</b><span>已在位</span></div>
+    <div class="card warn"><b id="stUnclassified">—</b><span>未分类</span></div>
+    <div class="card"><b id="stDup">—</b><span>重复项</span></div>
+    <div class="card"><b id="stFolders">—</b><span>将新建文件夹</span></div>
+  </section>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="plan" class="active">计划明细 <em id="tabPlanCount">0</em></button>
+    <button data-tab="dup">重复项 <em id="tabDupCount">0</em></button>
+    <button data-tab="snap">备份快照 <em id="tabSnapCount">0</em></button>
+    <button data-tab="settings">设置</button>
+  </nav>
+
+  <!-- ── 计划明细 ── -->
+  <section class="panel active" data-panel="plan">
+    <div class="panel-head">
+      <p class="hint">
+        这是 <b>预览</b>：还没有动过你的任何书签。逐条核对，确认无误再点上面的「执行整理」。
+        点 <b>✗ 改</b> 选正确分类，会当场改判并沉淀成规则，下次更准。
+      </p>
+      <div class="panel-actions">
+        <label class="chk"><input type="checkbox" id="onlyChanged"> 只看将要移动的</label>
+        <label class="chk"><input type="checkbox" id="onlyLow"> 只看低置信</label>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="plan" id="planTable">
+        <thead>
+          <tr>
+            <th class="c-lock">锁</th>
+            <th>书签</th>
+            <th class="c-from">当前位置</th>
+            <th class="c-arrow"></th>
+            <th class="c-to">目标位置</th>
+            <th class="c-why">依据</th>
+            <th class="c-fb">反馈</th>
+          </tr>
+        </thead>
+        <tbody id="planBody"></tbody>
+      </table>
+      <p class="empty" id="planEmpty" hidden>还没有预览。先点「读取并预览」。</p>
+    </div>
+    <p class="more" id="planMore" hidden></p>
+  </section>
+
+  <!-- ── 重复项 ── -->
+  <section class="panel" data-panel="dup">
+    <div class="panel-head">
+      <p class="hint">
+        同一页面被收藏多次。保留一条、删除其余。<b>删除不可逆</b>，但可以通过「恢复备份」找回。
+        归一化只剥「纯顶部锚点」白名单里的 hash，<b>SPA 路由（#/a 与 #/b）一律保留</b>，不会误判。
+      </p>
+    </div>
+    <div id="dupList" class="dup-list"></div>
+    <p class="empty" id="dupEmpty">没有发现重复项。</p>
+  </section>
+
+  <!-- ── 备份快照 ── -->
+  <section class="panel" data-panel="snap">
+    <div class="panel-head">
+      <p class="hint">
+        每次预览和执行前都会自动存一份快照。Chrome 没有原生撤销，<b>恢复备份是唯一退路</b>。
+      </p>
+      <div class="panel-actions">
+        <button id="btnSnapshot">立即备份</button>
+      </div>
+    </div>
+    <div id="snapList" class="snap-list"></div>
+    <p class="empty" id="snapEmpty">还没有快照。</p>
+  </section>
+
+  <!-- ── 设置 ── -->
+  <section class="panel" data-panel="settings">
+    <div class="settings-grid">
+      <div class="card-block">
+        <h2>类目结构</h2>
+        <p class="hint">改名或增删子类后点「保存」。「其他 / 待归类」是给你留的归口，第一轮跑完可以把落在这里的书签归到更合适的类目。</p>
+        <div id="taxonomyEditor" class="taxo-editor"></div>
+        <div class="panel-actions">
+          <button id="btnSaveTaxonomy" class="primary">保存类目</button>
+          <button id="btnResetTaxonomy">恢复预置</button>
+        </div>
+        <p class="hint" id="taxonomyState"></p>
+      </div>
+
+      <div class="card-block">
+        <h2>LLM 兜底（可选）</h2>
+        <p class="hint">
+          规则没命中、落进「待归类」的那一小撮才会发给云端模型分类 —— 不会外发整个书签列表。
+          关闭时扩展<b>不需要任何网站访问权限</b>。
+        </p>
+        <label class="chk big"><input type="checkbox" id="llmEnabled"> 启用 LLM 兜底分类</label>
+        <label class="field"><span>API base URL</span>
+          <input type="url" id="llmBaseUrl" spellcheck="false">
+        </label>
+        <label class="field"><span>模型</span>
+          <input type="text" id="llmModel" spellcheck="false" placeholder="qwen-plus">
+        </label>
+        <label class="field"><span>API Key</span>
+          <input type="password" id="llmApiKey" spellcheck="false" placeholder="只保存在本机 chrome.storage.local">
+        </label>
+        <div class="panel-actions">
+          <button id="btnGrant">授权访问该域名</button>
+          <button id="btnRevoke">撤销授权</button>
+          <button id="btnSaveLlm" class="primary">保存</button>
+        </div>
+        <p class="hint" id="llmPermState"></p>
+        <p class="hint warn-text">
+          提示：百炼的 API key 与区域强绑定，用北京区 key 调国际区端点会返回 401。
+          官方也推荐改用工作区专属域名，性能更稳。
+        </p>
+      </div>
+
+      <div class="card-block">
+        <h2>人工干预</h2>
+        <p class="hint">锁定按 URL 记录（不是节点 id），所以移动过位置也不会失效。</p>
+        <div class="row-stat">
+          <span>已锁定条目</span><b id="lockCount">0</b>
+          <button id="btnClearLocks">全部解锁</button>
+        </div>
+        <div class="row-stat">
+          <span>已沉淀规则</span><b id="learnedCount">0</b>
+          <button id="btnClearLearned">清空规则</button>
+        </div>
+        <div class="row-stat">
+          <span>已手动改判</span><b id="manualCount">0</b>
+          <button id="btnClearManual">清空改判</button>
+        </div>
+      </div>
+
+      <div class="card-block">
+        <h2>执行报告</h2>
+        <p class="hint">最近一次执行的结果。</p>
+        <div id="report" class="report"><p class="empty-inline">还没有执行记录。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="pathPicker" class="picker">
+    <form method="dialog">
+      <h3>这条应该放到哪？</h3>
+      <p class="hint" id="pickerTarget"></p>
+      <div class="picker-cols" id="pickerCols"></div>
+      <menu>
+        <button value="cancel">取消</button>
+        <button value="ok" class="primary" id="pickerOk">确定并记为规则</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

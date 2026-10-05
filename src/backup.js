@@ -16,11 +16,23 @@ import { dedupeKey } from './normalize.js';
 const snapKey = (ts) => `snapshot:${ts}`;
 
 /**
- * 取根节点 id（书签栏 '1' / 其他书签 '2' / 移动设备 '3'）。
- * 层级路径第一段就是根名，所以 [0] 即根 id。
+ * 把根文件夹**名**换成根文件夹 **id**。
+ *
+ * ⚠️ 踩过的坑：这里曾经直接 `return pathArr[0]`，把「书签栏」这个**名字**
+ *    当成 parentId 传给了 chrome.bookmarks.move()，而 API 只认 id（'1'/'2'/'3'）。
+ *    根名随界面语言变，不能硬编码，所以从 getTree() 里反查。
+ *    症状是「回滚对根级书签全部静默失败」—— 不报错，只是没归位。
+ *
+ * @param {string} rootName
+ * @param {Array} tops getTree()[0].children
+ * @returns {string} 根 id
  */
-function rootIdOf(pathArr) {
-  return pathArr && pathArr.length ? pathArr[0] : '1';
+function rootIdFromName(rootName, tops) {
+  const hit = (tops || []).find((t) => t.title === rootName);
+  if (hit) return String(hit.id);
+  // 兜底：Chrome 里 1=书签栏 2=其他书签 3=移动设备书签
+  if (rootName === '其他书签') return '2';
+  return '1';
 }
 
 /** 某段路径相对根之下的层级，用于建目录时逐级下降 */
@@ -42,12 +54,13 @@ async function ensureFolder(parentId, title) {
 
 /**
  * 按路径逐级确保文件夹存在。
- * @param {string[]} pathArr 完整路径，第 0 段是根名
- * @param {string[]} [createdOut] 新建的文件夹 [{id, path}]，用于回滚时清理
+ * @param {string[]} pathArr 完整路径，第 0 段是根**名**
+ * @param {Array} tops getTree()[0].children，用于把根名换成根 id
+ * @param {string[]} [createdOut] 新建的文件夹 [{id, path}]
  * @returns {Promise<string>} 最深层文件夹 id
  */
-async function ensurePath(pathArr, createdOut) {
-  const rootId = rootIdOf(pathArr);
+async function ensurePath(pathArr, tops, createdOut) {
+  const rootId = rootIdFromName(pathArr[0], tops);
   const segs = segmentsBelowRoot(pathArr);
   let parentId = String(rootId);
   const acc = [];
@@ -175,7 +188,9 @@ export async function restoreSnapshot(ts) {
     if (k && !snapByUrl.has(k)) snapByUrl.set(k, e);
   }
 
-  const current = flattenTree(await readTree());
+  const treesNow = await readTree();
+  const tops = treesNow?.[0]?.children || [];
+  const current = flattenTree(treesNow);
   const createdOut = [];
 
   try {
@@ -185,8 +200,7 @@ export async function restoreSnapshot(ts) {
     for (const f of snapFolders) {
       if (!f.path || f.path.length < 1) continue;
       try {
-        const id = await ensurePath(f.path, createdOut);
-        void id;
+        await ensurePath(f.path, tops, createdOut);
         report.foldersCreated += 1;
       } catch (e) {
         report.failures.push({ step: 'ensureFolder', detail: f.path.join('/'), error: String(e) });
@@ -202,7 +216,7 @@ export async function restoreSnapshot(ts) {
       if (target) {
         if (target.path.join('/') === e.path.join('/')) continue; // 已在位
         try {
-          const parentId = await ensurePath(target.path, createdOut);
+          const parentId = await ensurePath(target.path, tops, createdOut);
           await chrome.bookmarks.move(e.id, { parentId });
           report.movedBack += 1;
         } catch (err) {
@@ -242,7 +256,7 @@ export async function restoreSnapshot(ts) {
     const removedDups = Array.isArray(task.removedDuplicates) ? task.removedDuplicates : [];
     for (const d of removedDups) {
       try {
-        const parentId = await ensurePath(d.path || ['2'], createdOut);
+        const parentId = await ensurePath(d.path || ['2'], tops, createdOut);
         await chrome.bookmarks.create({ parentId, title: d.title || d.url, url: d.url });
         report.dupRestored += 1;
       } catch (err) {

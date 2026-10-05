@@ -1,0 +1,290 @@
+/**
+ * E2E 脚手架。
+ *
+ * ═══ 三条硬约束（全部来自本机已实证的坑，不是风格偏好）═══
+ * 1. `chromium_headless_shell` **不支持**加载扩展。必须用完整 chromium
+ *    （`channel: 'chromium'` 或 chromium-<rev>/chrome-win64/chrome.exe）且**有头模式**。
+ *    扩展类 E2E 的第一步就该单独验这一条 —— 不通过则整套不成立。
+ * 2. 必须 `launch_persistent_context` + **每次全新 user_data_dir**。
+ *    改扩展产物做证伪时若复用同一 context，Chrome 会命中扩展资源缓存，
+ *    补丁写了但页面跑的仍是旧脚本，看着像「闸门无效」其实是坏实现从未运行。
+ * 3. 断言走**真实用户路径**（点按钮、读表格 DOM），不要直接调应用内部函数 ——
+ *    内部函数可能压根没被用户路径触达。
+ *    只有「造夹具」和「读书签树」这两件必须绕不过去的事，才用 chrome.* API。
+ */
+
+import { chromium } from 'playwright';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+export const EXT_PATH = resolve(HERE, '..', '..');
+
+const userDataDirs = [];
+
+/**
+ * 启动带扩展的浏览器上下文。
+ * @param {{headed?: boolean, reuseUserDataDir?: string}} [opts]
+ */
+export async function launchWithExtension(opts = {}) {
+  const headed = opts.headed !== false;
+  const userDataDir = opts.reuseUserDataDir || mkdtempSync(join(tmpdir(), 'bo-e2e-'));
+  if (!opts.reuseUserDataDir) userDataDirs.push(userDataDir);
+
+  const ctx = await chromium.launchPersistentContext(userDataDir, {
+    channel: 'chromium',
+    headless: !headed,
+    args: [
+      `--disable-extensions-except=${EXT_PATH}`,
+      `--load-extension=${EXT_PATH}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
+  });
+
+  // service worker 是扩展的「活着」信号：拿不到它 = 扩展没起来
+  let [sw] = ctx.serviceWorkers();
+  if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 });
+  const extensionId = new URL(sw.url()).host;
+
+  return { ctx, sw, extensionId, userDataDir };
+}
+
+/** 打开主面板 */
+export async function openPanel(ctx, extensionId) {
+  const page = await ctx.newPage();
+  page.on('dialog', (d) => d.accept());
+  await page.goto(`chrome-extension://${extensionId}/ui/options.html`, { waitUntil: 'domcontentloaded' });
+  // ⚠️ 必须等 init() 跑完（data-ready），不能只等按钮出现。
+  //    按钮在 HTML 解析时就存在，那时模块脚本还没执行、监听器还没绑。
+  //    早点击会静默丢失；而「dry-run 零写入」会因为「什么都没发生」而假绿。
+  await page.waitForSelector('body[data-ready="1"]', { state: 'attached', timeout: 20000 });
+  return page;
+}
+
+/**
+ * 造夹具书签（固定种子，可重复）。
+ * ⚠️ 绝不用改磁盘 Bookmarks 文件的方式造夹具 —— 那样夹具会和真实状态漂移，
+ *    E2E 红了就分不清是代码缺陷还是夹具漂移。
+ * @param {import('playwright').Page} page
+ * @param {Array<{title:string,url:string,parentId?:string}>} items
+ */
+export async function seedBookmarks(page, items) {
+  return page.evaluate(async (list) => {
+    const created = [];
+    for (const it of list) {
+      const node = await chrome.bookmarks.create({
+        parentId: it.parentId || '1',
+        title: it.title,
+        url: it.url,
+      });
+      created.push({ id: node.id, title: node.title, url: node.url });
+    }
+    return created;
+  }, items);
+}
+
+/** 读整棵书签树的结构签名（忽略 id，便于跨会话比较） */
+export async function treeSignature(page) {
+  return page.evaluate(async () => {
+    const walk = (nodes) =>
+      nodes
+        .map((n) => ({
+          t: n.title,
+          u: n.url || null,
+          c: Array.isArray(n.children) && n.children.length ? walk(n.children) : null,
+        }))
+        .sort((a, b) => (a.t + (a.u || '')).localeCompare(b.t + (b.u || '')));
+    const tree = await chrome.bookmarks.getTree();
+    return JSON.stringify(walk(tree[0].children));
+  });
+}
+
+/** 固定种子夹具集：覆盖规则命中、未命中、重复、SPA 路由等场景 */
+export function makeFixtures(n = 40) {
+  const list = [];
+  const known = [
+    ['GitHub 某仓库', 'https://github.com/some/repo'],
+    ['Vue 文档', 'https://cn.vuejs.org/guide/introduction.html'],
+    ['MDN Web Docs', 'https://developer.mozilla.org/zh-CN/docs/Web/CSS'],
+    ['Redis 文档', 'https://redis.io/docs/latest/'],
+    ['Docker 入门', 'https://docs.docker.com/get-started/'],
+    ['arXiv 论文', 'https://arxiv.org/abs/1706.03762'],
+    ['ChatGPT', 'https://chatgpt.com/'],
+    ['Notion', 'https://www.notion.so/workspace'],
+    ['力扣', 'https://leetcode.cn/problemset/'],
+    ['哔哩哔哩', 'https://www.bilibili.com/'],
+    ['网易云音乐', 'https://music.163.com/'],
+    ['IT之家', 'https://www.ithome.com/'],
+    ['知乎', 'https://www.zhihu.com/'],
+    ['雪球', 'https://xueqiu.com/'],
+    ['淘宝', 'https://www.taobao.com/'],
+    ['美团', 'https://www.meituan.com/'],
+    ['Dribbble', 'https://dribbble.com/shots/popular'],
+    ['Figma', 'https://www.figma.com/files/recent'],
+    ['iconfont', 'https://www.iconfont.cn/collections/index'],
+    ['CSDN', 'https://blog.csdn.net/'],
+  ];
+  for (const [title, url] of known) {
+    if (list.length >= n) break;
+    list.push({ title, url });
+  }
+  // 补齐到 n 条：长尾未命中项
+  for (let i = list.length; i < n; i++) {
+    list.push({ title: `未知站点 ${i}`, url: `https://unknown-tail-${i}.example.org/page` });
+  }
+  return list;
+}
+
+/** 造一组明确的重复项（同一 URL 收藏两次） */
+export function makeDuplicateFixtures() {
+  return [
+    { title: '重复 A', url: 'https://dup.example.com/same?utm_source=wx' },
+    { title: '重复 A2', url: 'https://dup.example.com/same' },
+    { title: 'SPA 设置页', url: 'https://spa.example.com/#/settings' },
+    { title: 'SPA 个人页', url: 'https://spa.example.com/#/profile' },
+  ];
+}
+
+/**
+ * 点「读取并预览」并等这一轮真的跑完。
+ *
+ * ⚠️ 判据用的是页面上的 previewSeq（每次渲染完成自增），
+ *    不是「表格有没有行」或「空态文案有没有出现」。
+ *    后两者在 init() 之后就已经是那个状态了 —— 会在新结果渲染出来之前
+ *    立刻判定通过，然后读到上一轮的旧数据。
+ *    更糟的是：点击若丢失（监听器还没绑），这个条件天然成立，
+ *    「dry-run 零写入」那条就会因为「什么都没发生」而假绿。
+ *    previewSeq 单调递增，点击丢失时它不动 → 超时报红，绝不假绿。
+ */
+export async function runPreview(page, opts = {}) {
+  const before = await page.evaluate(() => Number(document.body.dataset.previewSeq || 0));
+  await page.click('#btnPreview');
+  await page.waitForFunction(
+    (n) => Number(document.body.dataset.previewSeq || 0) > n,
+    before,
+    { timeout: opts.timeout || 30000 },
+  );
+
+  const rendered = await page.evaluate(() => ({
+    move: document.getElementById('stMove').textContent.trim(),
+    total: document.getElementById('stTotal').textContent.trim(),
+    rows: document.querySelectorAll('#planBody tr').length,
+  }));
+  if (!/^\d+$/.test(rendered.total)) {
+    throw new Error(`预览后统计卡未渲染（total="${rendered.total}"）`);
+  }
+  return { move: Number(rendered.move), total: Number(rendered.total), rows: rendered.rows };
+}
+
+/**
+ * 等执行推进到「已完成 >= min 条」。
+ *
+ * ⚠️ 不要用 page.waitForFunction + 异步谓词：Playwright 对 Promise 返回值的
+ *    真值判断不可靠，会在 Promise 对象上直接判真，于是立刻返回并拿不到数据，
+ *    表现为「执行没有产生任何进度」。改成 Node 侧显式轮询，行为完全确定。
+ *
+ * 直接读落盘的 task:current —— 这才是断点续跑真正依赖的数据源。
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<{done:number,total:number,status:string}>}
+ */
+export async function waitForPartialProgress(page, min = 1, timeout = 30000) {
+  const readOnce = () =>
+    page.evaluate(async () => {
+      const got = await chrome.storage.local.get('task:current');
+      const task = got['task:current'];
+      if (!task || !task.plan) return null;
+      const items = task.plan.items || [];
+      return {
+        done: items.filter((i) => i.status === 'done').length,
+        total: items.length,
+        status: task.status,
+      };
+    });
+
+  const deadline = Date.now() + timeout;
+  let last = null;
+  for (;;) {
+    last = await readOnce();
+    if (last && last.done >= min) return last;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `等待执行进度超时（min=${min}）。最后一次读到：${JSON.stringify(last)}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 40));
+  }
+}
+
+/** 读统计卡 */
+export async function readStats(page) {
+  return page.evaluate(() => ({
+    total: document.getElementById('stTotal').textContent,
+    move: document.getElementById('stMove').textContent,
+    inPlace: document.getElementById('stInPlace').textContent,
+    unclassified: document.getElementById('stUnclassified').textContent,
+    dup: document.getElementById('stDup').textContent,
+    folders: document.getElementById('stFolders').textContent,
+  }));
+}
+
+/**
+ * 等执行结束。
+ *
+ * ⚠️ 判据必须是 #reportStatus 单元格的**值**，不能对报告全文做子串匹配 ——
+ *    报告里有一行标签就叫「失败」，全文匹配 /失败/ 会在任务刚建立时就命中，
+ *    于是「等执行结束」立刻返回，后续断言全建立在「已经跑完」的错误前提上。
+ *    （这个坑真的踩过：幂等用例在只搬了 4 条时就断言「二次预览应为 0 变更」。）
+ */
+const TERMINAL_STATUS = ['已完成', '失败', '已暂停'];
+
+export async function waitForExecutionDone(page, timeout = 60000) {
+  await page.waitForFunction(
+    (terminal) => {
+      const el = document.getElementById('reportStatus');
+      const v = el ? (el.textContent || '').trim() : '';
+      return terminal.includes(v);
+    },
+    TERMINAL_STATUS,
+    { timeout, polling: 100 },
+  );
+  return readReportStatus(page);
+}
+
+/** 读执行状态（只看状态单元格） */
+export async function readReportStatus(page) {
+  return page.evaluate(() => (document.getElementById('reportStatus')?.textContent || '').trim());
+}
+
+/**
+ * 等报告状态变成指定值。
+ *
+ * ⚠️ 续跑场景必须用它，不能直接用 waitForExecutionDone：
+ *    「已暂停」本身就是 waitForExecutionDone 认定的终态，点「继续」之前
+ *    状态就已经是终态，于是等待立即返回，后续断言建立在「还没开始跑」的前提上。
+ *    先显式等 '执行中' 证明续跑真的启动了，再等终态。
+ */
+export async function waitForReportStatus(page, expected, timeout = 60000) {
+  await page.waitForFunction(
+    (want) => {
+      const el = document.getElementById('reportStatus');
+      const v = el ? (el.textContent || '').trim() : '';
+      return v === want;
+    },
+    expected,
+    { timeout, polling: 100 },
+  );
+  return readReportStatus(page);
+}
+
+
+/** 清理临时 profile */
+export function cleanupAll() {
+  for (const d of userDataDirs) {
+    try { rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+  userDataDirs.length = 0;
+}

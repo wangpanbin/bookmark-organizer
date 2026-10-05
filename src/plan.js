@@ -132,7 +132,15 @@ export function buildPlan(opts) {
     base.confidence = hit.confidence;
 
     // 幂等：已经在目标位置 → 跳过，不产生任何变更
-    if (toStr === base.fromStr) {
+    //
+    // ⚠️ 路径模型：fromPath 的第 0 段是**根文件夹名**（书签栏 / 其他书签），
+    //    toPath 则**不含根**（就是 taxonomy 里的 '大类/子类'）。
+    //    根归到哪是「写到哪儿」的问题，交给 apply.js 按 settings.targetRoot 决定，
+    //    本模块保持纯函数、不依赖任何设置。
+    //    所以比较「是否已在位」时必须把 fromPath 的根名剥掉再比，
+    //    否则两边永远不等，幂等直接失效。
+    const fromRel = base.fromPath.slice(1).join('/');
+    if (toStr === fromRel) {
       base.status = 'skipped';
       base.reason = REASON.IN_PLACE;
       byReason[REASON.IN_PLACE] = (byReason[REASON.IN_PLACE] || 0) + 1;

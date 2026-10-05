@@ -47,6 +47,35 @@ const B = (id, url, extra = {}) => ({
   readOnly: extra.readOnly ?? false,
 });
 
+test('⚠️ 路径模型：toPath 不含根名，fromPath 含 —— 已在位判断必须剥掉根名', () => {
+  // toPath 来自 taxonomy（'大类/子类'），不含根；fromPath 第 0 段是根文件夹名。
+  // 若直接比 fromStr，两边永远不等，幂等会彻底失效。
+  const p = buildPlan({
+    entries: [B('1', 'https://github.com/a', { path: ['书签栏', '开发与技术', '代码托管'] })],
+    taxonomy: DEFAULT_TAXONOMY,
+  });
+  assert.equal(p.items.length, 0, '已在位的条目被判成了待移动');
+  assert.equal(p.stats.byReason[REASON.IN_PLACE], 1);
+
+  // 其他根下同样算在位（只比相对路径，不跨根搬，避免反复横跳）
+  const p2 = buildPlan({
+    entries: [B('1', 'https://github.com/a', { path: ['其他书签', '开发与技术', '代码托管'] })],
+    taxonomy: DEFAULT_TAXONOMY,
+  });
+  assert.equal(p2.items.length, 0, '换到另一个根下的同一路径被判成了待移动');
+});
+
+test('toPath 只输出 taxonomy 路径，不含根名', () => {
+  const p = buildPlan({
+    entries: [B('1', 'https://github.com/a', { path: ['书签栏'] })],
+    taxonomy: DEFAULT_TAXONOMY,
+  });
+  assert.deepEqual(p.items[0].toPath, ['开发与技术', '代码托管']);
+  assert.equal(p.items[0].toStr, '开发与技术/代码托管');
+  // 根名只出现在 fromPath 里
+  assert.deepEqual(p.items[0].fromPath, ['书签栏']);
+});
+
 test('规则命中生成 pending 计划项', () => {
   const p = buildPlan({
     entries: [B('1', 'https://github.com/a', { title: 'repo' })],
@@ -62,7 +91,7 @@ test('规则命中生成 pending 计划项', () => {
 
 test('已在目标位置 → skipped（幂等的核心）', () => {
   const p = buildPlan({
-    entries: [B('1', 'https://github.com/a', { path: ['开发与技术', '代码托管'] })],
+    entries: [B('1', 'https://github.com/a', { path: ['书签栏', '开发与技术', '代码托管'] })],
     taxonomy: DEFAULT_TAXONOMY,
   });
   assert.equal(p.items.length, 0, '已在位的条目不该产生计划项');
@@ -73,10 +102,10 @@ test('重复运行产生 0 变更（幂等）', () => {
   const entries = [B('1', 'https://github.com/a'), B('2', 'https://reactjs.org/')];
   const first = buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY });
 
-  // 模拟执行完成：所有条目已经在目标路径
+  // 模拟执行完成：所有条目已经在目标路径（注意要补上根名）
   const after = entries.map((e) => {
     const target = first.items.find((i) => i.id === e.id);
-    return target ? { ...e, path: target.toPath } : e;
+    return target ? { ...e, path: [e.path[0], ...target.toPath] } : e;
   });
   const second = buildPlan({ entries: after, taxonomy: DEFAULT_TAXONOMY });
   assert.equal(second.items.length, 0, '第二轮仍有变更，幂等被破坏');
