@@ -130,26 +130,39 @@ async function loadAndClassify(opts) {
   });
 
   // LLM 兜底：只对规则未命中的那一小撮发请求
+  //
+  // ⚠️ 这一段必须自己兜住，不能让它把 loadAndClassify 整个带崩。
+  //    loadAndClassify 是面板上**所有**交互的入口：预览、改判、锁定、
+  //    去重否决、恢复备份全都 await 它。它一旦抛错，调用方又没有统一的
+  //    try/catch，结果是：计划表停在**上一次**的旧数据上、也不弹任何提示，
+  //    用户接着点「执行整理」——执行器忠实地把书签搬到**旧分类**里去，
+  //    看起来就是「分类没按我改的来」。
+  //    LLM 是兜底，兜底坏了应该降级成「纯规则分类」，而不是拖垮主流程。
   state.llmErrors = [];
   if (settings.llmEnabled) {
-    const todo = selectForLlm(plan, state.entries, locks);
-    if (todo.length) {
-      busy(`LLM 兜底分类中（${todo.length} 条待判）…`);
-      const res = await classifyBatch(todo, {
-        taxonomy: state.taxonomy,
-        settings,
-        onProgress: ({ done, total }) => busy(`LLM 兜底分类中… ${done}/${total}`),
-      });
-      state.llmErrors = res.errors || [];
-      const { valid } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
-      plan = buildPlan({
-        entries: state.entries,
-        taxonomy: state.taxonomy,
-        learnedRules: learned,
-        locks,
-        manualAssignments: manual,
-        llmAssignments: valid,
-      });
+    try {
+      const todo = selectForLlm(plan, state.entries, locks);
+      if (todo.length) {
+        busy(`LLM 兜底分类中（${todo.length} 条待判）…`);
+        const res = await classifyBatch(todo, {
+          taxonomy: state.taxonomy,
+          settings,
+          onProgress: ({ done, total }) => busy(`LLM 兜底分类中… ${done}/${total}`),
+        });
+        state.llmErrors = res.errors || [];
+        const { valid } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
+        plan = buildPlan({
+          entries: state.entries,
+          taxonomy: state.taxonomy,
+          learnedRules: learned,
+          locks,
+          manualAssignments: manual,
+          llmAssignments: valid,
+        });
+      }
+    } catch (e) {
+      // 降级：继续用规则分类的结果，并把原因摆到台面上
+      state.llmErrors = [`LLM 兜底异常，已降级为纯规则分类：${e && e.message ? e.message : e}`];
     }
   }
 
@@ -168,7 +181,7 @@ async function loadAndClassify(opts) {
   await set(K.LAST_PLAN, { plan, duplicates: state.dupPayload, snapshotTs: state.snapshotTs });
 
   busy('');
-  render();
+  await render();
   // 渲染完成计数。E2E 用它判断「这一轮预览真的跑完了」。
   // ⚠️ 之前靠等 #planEmpty 是否可见来判断是错的：它在 init() 之后就一直可见，
   //    点击后会在新结果渲染出来之前立刻「通过」，读到的还是上一轮的数据。
@@ -176,15 +189,57 @@ async function loadAndClassify(opts) {
   document.body.dataset.previewSeq = String(state.seq);
 }
 
+/**
+ * 面板内部所有「小改动后重算」的统一入口：改判、锁定、去重否决、
+ * 清空人工干预、恢复备份、执行完刷新。
+ *
+ * ⚠️ 为什么不直接调 loadAndClassify：
+ *    它会抛错（读树失败、storage 写失败……），而这些调用点原来都没有
+ *    try/catch。抛错的后果比报错本身严重得多 ——
+ *    计划表会**静默地停留在上一次的数据**上，也不弹任何提示。
+ *    用户看到的仍是正确的旧清单，点「执行整理」就按旧分类搬了，
+ *    于是「我明明改对了，整理出来的还是老样子」。
+ *
+ *    这里保证两件事：
+ *      ① 失败一定有可见提示（红 toast），不再无声无息
+ *      ② 无论成败都重新渲染，面板不会卡在不一致的中间态
+ */
+async function safeReload(opts = { backup: false }) {
+  try {
+    await loadAndClassify(opts);
+    return true;
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.error('[options] 重新分类失败', e);
+    toast(`重新分类失败：${msg}`, true);
+    // 关键：即使失败也要把界面刷回自洽状态，别让用户对着陈旧清单做决策
+    try {
+      busy('');
+      await render();
+    } catch { /* 渲染失败就算了，至少错误已经提示过 */ }
+    return false;
+  }
+}
+
 // ───────────────────────── 渲染 ─────────────────────────
 
-function render() {
+/**
+ * 渲染全部面板。
+ *
+ * ⚠️ 这里必须 await 异步的那几个（renderSnapshots / renderCounts / renderReport）。
+ *    它们各自 await 一次 storage 读，原来全是「发射后不管」，
+ *    于是 DOM 里的执行报告可能停在上一次的数字上 ——
+ *    用户看到「成功移动 0 / 10」就以为整理没生效，
+ *    而实际上 task 早就 10/10 完成了。
+ *    「面板显示的数字」本身就是用户判断有没有成功的唯一依据，不能是半旧的。
+ */
+async function render() {
   renderStats();
   renderPlan();
   renderDup();
-  renderSnapshots();
-  renderCounts();
-  renderReport();
+  await renderSnapshots();
+  await renderCounts();
+  await renderReport();
   syncExecuteButton();
 }
 
@@ -364,7 +419,7 @@ async function onVeto(dupId, on) {
   await toggleDedupeVeto(dupId, on);
   state.veto = await getDedupeVeto();
   // 重新走一遍分类，把过滤后的 dupPayload 和确认弹窗的计数一起对齐
-  await loadAndClassify({ backup: false });
+  await safeReload();
   toast(on ? '已标记为不删' : '已恢复为待删除');
 }
 
@@ -535,7 +590,7 @@ async function markWrong(itemId, toPath) {
     return [...(rs || []).filter((r) => !sameRuleShape(r, rule)), rule];
   }, []);
 
-  await loadAndClassify({ backup: false });
+  await safeReload();
   toast(`已改到「${to}」，并记为规则`);
 }
 
@@ -564,7 +619,7 @@ async function toggleLock(itemId, on) {
     else s.delete(entry.url);
     return [...s];
   }, []);
-  await loadAndClassify({ backup: false });
+  await safeReload();
   toast(on ? '已锁定，这条不会被移动' : '已解锁');
 }
 
@@ -644,7 +699,7 @@ async function pollProgress() {
     await new Promise((r) => setTimeout(r, 400));
   }
   // 跑完重新读树，刷新计划视图
-  await loadAndClassify({ backup: false });
+  await safeReload();
   const task = await getTask();
   if (task.status === TASK_STATUS.DONE) toast('整理完成');
 }
@@ -676,7 +731,7 @@ async function doRestore(snap) {
     (failed ? `，${failed} 条失败（见执行报告）` : ''),
     failed > 0,
   );
-  await loadAndClassify({ backup: false });
+  await safeReload();
   await renderSnapshots();
 }
 
@@ -914,26 +969,26 @@ async function init() {
   $('btnClearVeto').addEventListener('click', async () => {
     if (!state.veto.length) { toast('当前没有「不删」标记'); return; }
     await clearDedupeVeto();
-    await loadAndClassify({ backup: false });
+    await safeReload();
     toast('已清除全部「不删」标记');
   });
 
   // 人工干预清理
   $('btnClearLocks').addEventListener('click', async () => {
     await set(K.LOCKS, []);
-    await loadAndClassify({ backup: false });
+    await safeReload();
     toast('已全部解锁');
   });
   $('btnClearLearned').addEventListener('click', async () => {
     if (!confirm('清空所有人工沉淀的规则？')) return;
     await set(K.RULES_LEARNED, []);
-    await loadAndClassify({ backup: false });
+    await safeReload();
     toast('已清空规则');
   });
   $('btnClearManual').addEventListener('click', async () => {
     if (!confirm('清空所有手动改判？')) return;
     await set(K.MANUAL_ASSIGNMENTS, {});
-    await loadAndClassify({ backup: false });
+    await safeReload();
     toast('已清空改判');
   });
 
@@ -950,7 +1005,7 @@ async function init() {
   await loadSettingsUi();
   renderTaxonomyEditor();
   renderPresetSelect();
-  render();
+  await render();
   await renderSnapshots();
 
   // ── 崩溃/回收后的任务认领 ──

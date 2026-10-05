@@ -48,16 +48,47 @@ export const MODEL_PRESETS = [
 let injectedPromise = null;
 
 /**
+ * 注入文件的候选路径。
+ *
+ * ⚠️ 这里曾经是一个**静默失效**的 bug，症状极有欺骗性：
+ *    面板一直报「没有 API key，LLM 兜底已跳过」，
+ *    但用户明明跑过 `python tools/inject_key.py`、文件也确实躺在磁盘上。
+ *    根因是路径写错了一级：
+ *      · tools/inject_key.py 写的是  <root>/src/llm-key.local.js
+ *      · 本文件在 <root>/src/classify/llm.js，
+ *        写 `import('./llm-key.local.js')` 会解析到
+ *        <root>/src/classify/llm-key.local.js —— 那个文件从来不存在。
+ *    再加上原来的 `.catch(() => ({}))` 把加载失败整个吞掉，
+ *    于是「读不到」和「没注入」长得一模一样，排查成本极高。
+ *
+ * 修法有两条，缺一不可：
+ *    ① 两条路径都试（../ 指回 src/，./ 是为将来挪目录留的余地）
+ *    ② 加载失败要**带原因**返回，不能再无声退化成 {}
+ */
+const INJECTED_CANDIDATES = ['../llm-key.local.js', './llm-key.local.js'];
+
+async function loadInjected() {
+  const tried = [];
+  for (const spec of INJECTED_CANDIDATES) {
+    try {
+      const m = await import(/* @vite-ignore */ spec);
+      const cfg = (m && m.default) || null;
+      if (cfg) return { ...cfg, source: cfg.source || 'env', loadedFrom: spec };
+      tried.push(`${spec} → 模块里没有 default 导出`);
+    } catch (e) {
+      tried.push(`${spec} → ${e && e.message ? e.message : e}`);
+    }
+  }
+  return { loadedFrom: null, tried };
+}
+
+/**
  * 读 tools/inject_key.py 注入的本地配置。
- * 用动态 import + catch：没注入过就没有这个文件，属正常情况。
- * @returns {Promise<{apiKey?:string, baseUrl?:string, model?:string, source?:string}>}
+ *
+ * @returns {Promise<{apiKey?:string, baseUrl?:string, model?:string, source?:string, loadedFrom:?string, tried?:string[]}>}
  */
 export function getInjectedConfig() {
-  if (!injectedPromise) {
-    injectedPromise = import('./llm-key.local.js')
-      .then((m) => (m && m.default) || {})
-      .catch(() => ({}));
-  }
+  if (!injectedPromise) injectedPromise = loadInjected();
   return injectedPromise;
 }
 
@@ -79,6 +110,9 @@ export async function resolveConfig(settings) {
     model: (settings?.model || '').trim() || injected.model || DEFAULT_MODEL,
     apiKey,
     keySource: manual ? 'manual' : envKey ? 'env' : 'none',
+    // 诊断用：让面板能说清「key 到底从哪来 / 为什么读不到」
+    injectedLoadedFrom: injected.loadedFrom || null,
+    injectedTried: injected.tried || [],
   };
 }
 
@@ -239,6 +273,45 @@ function describeHttpError(status, body) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * 单次请求的超时（毫秒）。
+ *
+ * ⚠️ 为什么必须有：loadAndClassify() 是 **await** 它的，而 loadAndClassify
+ *    是面板上所有交互的入口 —— 预览、改判、锁定、去重否决、恢复备份
+ *    全都要等它返回。原来的 fetch 没有任何超时/AbortSignal，
+ *    于是一个挂住的连接（连接被墙、代理半开、服务端不回包）
+ *    会让整个面板永久停在「LLM 兜底分类中…」：
+ *    计划算不出来 → 计划表空着 → **「执行整理」按钮一直是禁用的**，
+ *    用户点它等于点空气，看上去就是「点了没反应」。
+ *    再叠上 classifyBatch 按 BATCH_SIZE 分批、每批还重试 2 次，
+ *    未分类条目一多，等待时间被成倍放大。
+ *
+ * 取 30s：比正常推理（秒级）宽裕得多，又不至于让人等到以为面板死了。
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * 带超时的 fetch。
+ * 超时抛出的错误文案要说清是「超时」而不是「网络错误」——
+ * 这两者的排查方向完全不同（前者是慢/被墙，后者是 DNS/证书/断网）。
+ */
+async function fetchWithTimeout(url, opts, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s 无响应）。`
+        + '通常是网络不通或服务商不可达 —— 可以在「设置」里关掉 LLM 兜底，'
+        + '规则分类不受影响。');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * 发一次请求（带重试与指数退避）。
  *
  * `useJsonMode`：DeepSeek 的 deepseek-chat 支持 JSON 模式，但并非所有模型都支持。
@@ -268,7 +341,7 @@ async function callOnce({ system, user, settings }) {
       // 思考型模型不支持 temperature，传了也只是被忽略，但别添乱
       if (!isReasoner) body.temperature = 0;
 
-      const res = await fetch(url, {
+      const res = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -326,11 +399,19 @@ export async function classifyBatch(items, opts) {
 
   if (!cfg.llmEnabled) return out;
   if (!cfg.apiKey) {
+    // ⚠️ 措辞要能区分两种完全不同的情况：
+    //    「压根没注入」和「注入了但没读到」。
+    //    早先这里只说「没有 API key」，而动态 import 路径写错一级导致
+    //    「注入了却读不到」也报同一句 —— 用户按提示去检查环境变量，
+    //    一切正常，于是判定扩展在骗人。真正的信息在 loadedFrom/tried 里。
+    const diag = cfg.injectedTried && cfg.injectedTried.length
+      ? `（已尝试读取注入文件：${cfg.injectedTried.join('；')}）`
+      : '';
     out.errors.push(
       '没有 API key，LLM 兜底已跳过。'
       + '可以设环境变量 DEEPSEEK_API_KEY 后跑 python tools/inject_key.py 注入，'
       + '或在「设置 → LLM 兜底」里手填。'
-      + '未分类的条目会留在「其他/待归类」，不影响其余整理。',
+      + '未分类的条目会留在「其他/待归类」，不影响其余整理。' + diag,
     );
     return out;
   }

@@ -9,6 +9,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // 替身必须在 import llm.js 之前装好
 const permissionState = { contains: false, requested: false, removed: false };
@@ -44,10 +47,34 @@ test('面板显式关闭时，resolveConfig 尊重它', async () => {
   assert.equal(cfg.llmEnabled, false);
 });
 
-test('没有 key 时 keySource=none，且不抛异常', async () => {
+/**
+ * 注入文件是否在本机存在。
+ *
+ * ⚠️ 这条判据必须由**文件系统**推导，不能写死。
+ *    早先这里断言的是 `keySource === 'none'`（固定值），
+ *    看起来像在测「没有 key 时的行为」，实际是**把 bug 固化成了期望**：
+ *    llm.js 里的动态 import 路径错了一级，注入文件永远读不到，
+ *    于是无论本机有没有跑过 inject_key.py，keySource 都是 'none'，
+ *    这条断言恒绿 —— 闸门就这样替 bug 打了掩护。
+ *    现在改成按磁盘实际情况推导：文件在，就必须读得到。
+ */
+const INJECTED_FILE = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'llm-key.local.js');
+const injectedExists = existsSync(INJECTED_FILE);
+
+test('没有面板 key 时：注入文件在就必须被读到，读不到才是 none', async () => {
   const cfg = await L.resolveConfig({});
-  assert.equal(cfg.keySource, 'none');
-  assert.equal(cfg.apiKey, '');
+  if (injectedExists) {
+    // 本机注入过 key —— 读不到就是 bug（历史上就是这样坏的）
+    assert.equal(cfg.keySource, 'env',
+      `注入文件存在（${INJECTED_FILE}）但 keySource=${cfg.keySource} —— `
+      + '注入的 key 又没被读到，LLM 兜底会一直静默跳过');
+    assert.notEqual(cfg.apiKey, '', '注入文件存在却拿到空 key');
+    assert.ok(cfg.injectedLoadedFrom,
+      '没记录是从哪个路径读到的 —— 面板上无法自证「为什么读不到 key」');
+  } else {
+    assert.equal(cfg.keySource, 'none');
+    assert.equal(cfg.apiKey, '');
+  }
 });
 
 test('⚠️ 面板手填的 key 优先，keySource=manual', async () => {
@@ -144,7 +171,7 @@ test('权限三件套都走 optional host_permissions 派生的 origin', async (
   assert.equal(await L.hasLlmPermission('非法 URL'), false, '非法 base URL 不该去要权限');
 });
 
-test('没有 key 时 classifyBatch 静默跳过并给出可操作提示', async () => {
+test('面板没填 key 时 classifyBatch 给出可操作提示', async () => {
   const res = await L.classifyBatch([{ key: 'k', url: 'https://a.com', title: 't' }], {
     taxonomy: [{ name: '其他', children: ['待归类'] }],
     settings: { llmEnabled: true, baseUrl: 'https://api.deepseek.com', model: 'm', apiKey: '' },
@@ -152,7 +179,14 @@ test('没有 key 时 classifyBatch 静默跳过并给出可操作提示', async 
   assert.deepEqual(res.assignments, {});
   assert.equal(res.asked, 0);
   assert.equal(res.errors.length, 1);
-  assert.match(res.errors[0], /inject_key\.py|没有 API key/, '提示要说清怎么配');
+  // 走到哪个分支取决于本机有没有注入 key（见上面 injectedExists 的说明），
+  // 两条分支的提示都必须可操作 —— 不能出现「什么都没说就跳过」。
+  if (injectedExists) {
+    assert.match(res.errors[0], /尚未授予|访问权限/,
+      '本机有注入 key 时应提示去授权域名，而不是谎称没有 key');
+  } else {
+    assert.match(res.errors[0], /inject_key\.py|没有 API key/, '提示要说清怎么配');
+  }
 });
 
 test('LLM 关闭时 classifyBatch 什么都不做、连错误都不报', async () => {
