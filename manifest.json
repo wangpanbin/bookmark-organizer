@@ -1,0 +1,28 @@
+{
+  "name": "书签整理助手",
+  "version": "1.0.0",
+  "description": "按功能智能分类 Chrome 书签：规则基线 + LLM 兜底，支持 dry-run 预览、幂等重跑、自动备份与回滚。",
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "unlimitedStorage"
+  ],
+  "optional_host_permissions": [
+    "https://dashscope.aliyuncs.com/*",
+    "https://*.maas.aliyuncs.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "ui/popup.html",
+    "default_title": "书签整理助手"
+  },
+  "options_ui": {
+    "page": "ui/options.html",
+    "open_in_tab": true
+  }
+}

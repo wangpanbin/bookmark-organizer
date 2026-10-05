@@ -1,0 +1,15 @@
+{
+  "name": "bookmark-organizer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 书签智能分类扩展（零构建：原生 ES Module）",
+  "scripts": {
+    "test": "node --test \"tests/unit/*.test.js\"",
+    "test:falsify": "python tests/product_falsification.py",
+    "test:e2e": "node tests/e2e/run.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

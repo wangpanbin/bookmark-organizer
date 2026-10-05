@@ -1,0 +1,19 @@
+# 统一行尾：仓库内一律 LF，检出后也是 LF。
+# 背景：本机 Windows + 混合 shell 环境，若不锁定，脚本文件会在
+# 「改过又改回」时留下整文件 CRLF 幽灵改动（memory/git-github 里的已实证教训）。
+# 对 JS 源码，LF 是 Node / Chrome 两侧都正确的选择。
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd 解析异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.zip binary
