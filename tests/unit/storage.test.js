@@ -164,11 +164,13 @@ test('getTask 无记录时返回空壳（调用方不必到处判空）', async 
 test('getSettings 合并默认值', async () => {
   const s = await S.getSettings();
   assert.equal(s.targetRoot, '1');
-  assert.equal(s.llmEnabled, false);
-  assert.equal(s.keepSnapshots, 10);
+  assert.equal(s.llmEnabled, true, 'LLM 兜底默认开启');
+  assert.equal(s.baseUrl, 'https://api.deepseek.com', '默认走 DeepSeek');
+  assert.equal(s.model, 'deepseek-flash');
+  assert.equal(s.apiKey, '', '注入的 key 不进 storage，默认必须为空');
   await S.updateSettings({ targetRoot: '2' });
   assert.equal((await S.getSettings()).targetRoot, '2');
-  assert.equal((await S.getSettings()).llmEnabled, false, '未提供的字段应回落默认值');
+  assert.equal((await S.getSettings()).llmEnabled, true, '未提供的字段应回落默认值');
 });
 
 test('串行链在一次写失败后不中断后续写', async () => {

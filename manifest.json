@@ -10,8 +10,9 @@
     "unlimitedStorage"
   ],
   "optional_host_permissions": [
+    "https://api.deepseek.com/*",
     "https://dashscope.aliyuncs.com/*",
-    "https://*.maas.aliyuncs.com/*"
+    "https://api.openai.com/*"
   ],
   "background": {
     "service_worker": "src/background.js",

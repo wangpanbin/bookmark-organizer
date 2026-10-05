@@ -6,13 +6,19 @@
  *    URL 列表本身就是隐私（内网地址、项目名、私有仓库都在里面），
  *    所以默认只发「其他/待归类」那一小撮。
  * 2. **权限按需申请**：manifest 里只写 optional_host_permissions，
- *    用户点「开启 LLM 兜底」时才弹窗。关闭 LLM 时整个扩展不需要任何 host 权限。
- * 3. **API key 只存 chrome.storage.local**，不进 manifest、不进代码、不进 git。
+ *    用户点「授权访问该域名」时才弹窗。关闭 LLM 时扩展不需要任何 host 权限。
+ * 3. **API key 的来源与存放**（按优先级）：
+ *      ① tools/inject_key.py 从本机环境变量注入到 src/llm-key.local.js
+ *         —— 扩展运行时读不到 OS 环境变量（没有 process 对象），
+ *            只能在加载前由本机脚本读一次。key 不进 git、不进发布包。
+ *      ② 面板里手填，存在 chrome.storage.local
+ *      ③ 都没有 → 跳过 LLM，未分类条目留在「其他/待归类」
+ *    从环境变量注入的 key **不写入 storage**，只在内存里用。
  *
- * 供应商：阿里云百炼 / 通义千问（OpenAI 兼容协议）。
- * base URL 与 model 都可配置 —— 官方已在推工作区专属域名
- * （https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1），
- * 稳定性比老域名好，UI 里提示可替换。
+ * 供应商：默认 DeepSeek（OpenAI 兼容协议）。
+ * base URL 与 model 都可配置 —— DeepSeek 官方文档对「当前该用哪个模型名」
+ * 存在互相矛盾的说法，且 deepseek-chat 已公告弃用，与其押注一个会失效的
+ * 名字，不如给默认值 + 面板可改 + 预设列表。
  */
 
 /** 单次请求最多带多少条 */
@@ -20,9 +26,61 @@ const BATCH_SIZE = 20;
 /** 最多重试几次（不含首次） */
 const MAX_RETRY = 2;
 
+export const DEFAULT_BASE_URL = 'https://api.deepseek.com';
+export const DEFAULT_MODEL = 'deepseek-flash';
+
+/** 面板预设：不同服务商的可用模型。DeepSeek 的模型名变动较频繁，这里只列确认存在的。 */
+export const MODEL_PRESETS = [
+  { label: 'DeepSeek · flash（默认，非思考模式）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' },
+  { label: 'DeepSeek · pro（更强，较慢较贵）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro' },
+  { label: 'DeepSeek · v4-flash（旧名，仍可调用）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
+  { label: 'DeepSeek · reasoner（思考模式，不支持 temperature）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-reasoner' },
+  { label: '阿里云百炼 · qwen-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { label: '阿里云百炼 · qwen-turbo（更便宜）', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-turbo' },
+  { label: 'OpenAI · gpt-4o-mini', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+];
+
+/** 注入配置的缓存（文件不存在是正常情况，不能让整个模块挂掉） */
+let injectedPromise = null;
+
+/**
+ * 读 tools/inject_key.py 注入的本地配置。
+ * 用动态 import + catch：没注入过就没有这个文件，属正常情况。
+ * @returns {Promise<{apiKey?:string, baseUrl?:string, model?:string, source?:string}>}
+ */
+export function getInjectedConfig() {
+  if (!injectedPromise) {
+    injectedPromise = import('./llm-key.local.js')
+      .then((m) => (m && m.default) || {})
+      .catch(() => ({}));
+  }
+  return injectedPromise;
+}
+
+/**
+ * 合并出实际生效的配置。
+ * key 优先级：面板手填 > 环境变量注入。从环境变量注入的**不写进 storage**。
+ *
+ * @param {object} settings 面板里存的设置
+ * @returns {Promise<object>} 附加了 apiKey / keySource 的配置
+ */
+export async function resolveConfig(settings) {
+  const injected = await getInjectedConfig();
+  const manual = (settings?.apiKey || '').trim();
+  const envKey = (injected.apiKey || '').trim();
+  const apiKey = manual || envKey;
+  return {
+    llmEnabled: settings?.llmEnabled !== false,
+    baseUrl: (settings?.baseUrl || '').trim() || injected.baseUrl || DEFAULT_BASE_URL,
+    model: (settings?.model || '').trim() || injected.model || DEFAULT_MODEL,
+    apiKey,
+    keySource: manual ? 'manual' : envKey ? 'env' : 'none',
+  };
+}
+
 /**
  * 从 base URL 推出 host_permissions 需要的模式串。
- * https://dashscope.aliyuncs.com/compatible-mode/v1 → https://dashscope.aliyuncs.com/*
+ * https://api.deepseek.com → https://api.deepseek.com/*
  * @param {string} baseUrl
  * @returns {string}
  */
@@ -134,24 +192,42 @@ export function buildPrompt(items, taxonomy) {
   return { system, user };
 }
 
-/** 统一错误信息。401 必须区分「key 无效」与「key 与区域不匹配」——两者修法完全不同。 */
+/**
+ * 统一错误信息。
+ * ⚠️ 401 的成因因服务商而异：DeepSeek 没有区域绑定（key 有效就是有效），
+ *    而阿里云百炼的 key 与区域强绑定，跨区调会返回 401 且看起来像 key 无效。
+ *    所以文案不能只说「key 无效」—— 两者修法完全不同。
+ */
 function describeHttpError(status, body) {
   const text = String(body || '');
+
   if (status === 401 || status === 403) {
-    if (/InvalidApiKey|invalid_api_key/i.test(text)) {
-      return `API key 无效或没有该模型的权限（HTTP ${status}）。请检查 key 是否复制完整、是否已过期。`;
+    if (/region|区域|cross-region|invalid_api_key|incorrect api key/i.test(text)) {
+      return `HTTP ${status} 鉴权失败：${text.slice(0, 200)}\n`
+        + '（若你用的是阿里云百炼：它的 key 与区域强绑定，用某区 key 调另一区端点就会报这个错，'
+        + '请让 base URL 的区域与创建 key 的区域一致。DeepSeek 无此限制。）';
     }
-    return (
-      `HTTP ${status} 鉴权失败。${text}`
-      .trim() +
-      '。\n百炼的 key 与区域强绑定：用北京区 key 调美区/国际区端点会返回 401。' +
-      '请确认 base URL 的区域与创建 key 的区域一致。'
-    );
+    return `HTTP ${status} 鉴权失败：key 无效、已过期或没有该模型的权限。${text.slice(0, 200)}`;
   }
+
   if (status === 404) {
-    return `HTTP 404：端点或模型名不对。请检查 base URL（应形如 .../compatible-mode/v1）与 model 名。`;
+    return `HTTP 404：端点或模型名不对。请检查 base URL（DeepSeek 官方格式是 https://api.deepseek.com，`
+      + '不带 /v1 也能通）与 model 名。DeepSeek 的模型名变动较频繁，建议在面板里换一个预设。';
   }
-  if (status === 429) return `HTTP 429：触发限流或额度用尽。稍后重试，或降低批次大小。`;
+
+  if (status === 400) {
+    if (/response_format|json_object|json mode/i.test(text)) {
+      return `HTTP 400：该模型不支持 JSON 模式（response_format）。${text.slice(0, 200)}`;
+    }
+    if (/model/i.test(text)) {
+      return `HTTP 400：请求被拒，通常是模型名不存在或已下线。${text.slice(0, 200)}\n`
+        + '（DeepSeek 曾公告 deepseek-chat / deepseek-reasoner 于 2026-07-24 弃用，'
+        + '请在面板里换一个预设模型。）';
+    }
+    return `HTTP 400：请求格式有误。${text.slice(0, 200)}`;
+  }
+
+  if (status === 429) return `HTTP 429：触发限流或额度用尽。稍后重试，或减少批次大小。`;
   if (status >= 500) return `HTTP ${status}：服务端错误，稍后重试。`;
   return `HTTP ${status}：${text.slice(0, 300)}`;
 }
@@ -160,34 +236,51 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * 发一次请求（带重试与指数退避）。
+ *
+ * `useJsonMode`：DeepSeek 的 deepseek-chat 支持 JSON 模式，但并非所有模型都支持。
+ * 先按支持的方式发，若 400 明确指向 response_format，去掉它重试一次 ——
+ * 提示词里已经要求只输出 JSON，解析侧也剥代码块，退一步不影响可用性。
+ *
  * @returns {Promise<{items:Array, usage:object|null}>}
  */
 async function callOnce({ system, user, settings }) {
   const url = `${String(settings.baseUrl).replace(/\/+$/, '')}/chat/completions`;
+  const isReasoner = /reasoner|thinking/i.test(String(settings.model || ''));
+  let jsonMode = !isReasoner;
   let lastErr = null;
 
   for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
     if (attempt > 0) await sleep(600 * 2 ** (attempt - 1));
     try {
+      const body = {
+        model: settings.model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        stream: false,
+      };
+      if (jsonMode) body.response_format = { type: 'json_object' };
+      // 思考型模型不支持 temperature，传了也只是被忽略，但别添乱
+      if (!isReasoner) body.temperature = 0;
+
       const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${settings.apiKey}`,
         },
-        body: JSON.stringify({
-          model: settings.model,
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: user },
-          ],
-          temperature: 0,
-          response_format: { type: 'json_object' },
-        }),
+        body: JSON.stringify(body),
       });
 
       const text = await res.text();
       if (!res.ok) {
+        // JSON 模式不被支持 → 去掉它再试（本次不计入重试次数）
+        if (res.status === 400 && jsonMode && /response_format|json_object|json mode/i.test(text)) {
+          jsonMode = false;
+          attempt -= 1;
+          continue;
+        }
         lastErr = new Error(describeHttpError(res.status, text));
         // 4xx 里除了 429 以外重试没有意义
         if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
@@ -223,21 +316,27 @@ async function callOnce({ system, user, settings }) {
  * @returns {Promise<{assignments:Record<string,string>, errors:string[], asked:number, batches:number, usage:object[]}>}
  */
 export async function classifyBatch(items, opts) {
-  const { taxonomy, settings, onProgress } = opts || {};
+  const { taxonomy, onProgress } = opts || {};
+  const cfg = await resolveConfig(opts?.settings);
   const out = { assignments: {}, errors: [], asked: 0, batches: 0, usage: [] };
 
-  if (!settings?.llmEnabled) return out;
-  if (!settings?.apiKey) {
-    out.errors.push('未填写 API key，LLM 兜底已跳过（未分类条目会留在「其他/待归类」）');
+  if (!cfg.llmEnabled) return out;
+  if (!cfg.apiKey) {
+    out.errors.push(
+      '没有 API key，LLM 兜底已跳过。'
+      + '可以设环境变量 DEEPSEEK_API_KEY 后跑 python tools/inject_key.py 注入，'
+      + '或在「设置 → LLM 兜底」里手填。'
+      + '未分类的条目会留在「其他/待归类」，不影响其余整理。',
+    );
     return out;
   }
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return out;
 
-  const granted = await hasLlmPermission(settings.baseUrl);
+  const granted = await hasLlmPermission(cfg.baseUrl);
   if (!granted) {
     out.errors.push(
-      '尚未授予该域名的访问权限。请在「设置 → LLM 兜底」里点「授权访问」后再开启。',
+      `尚未授予 ${cfg.baseUrl} 的访问权限。请在「设置 → LLM 兜底」里点「授权访问该域名」后再开启。`,
     );
     return out;
   }
@@ -250,7 +349,7 @@ export async function classifyBatch(items, opts) {
 
     const { system, user } = buildPrompt(batch, taxonomy);
     try {
-      const { items: arr, usage } = await callOnce({ system, user, settings });
+      const { items: arr, usage } = await callOnce({ system, user, settings: cfg });
       if (usage) out.usage.push(usage);
       for (const row of arr) {
         const key = row && row.key ? String(row.key) : null;

@@ -61,7 +61,29 @@ export async function openPanel(ctx, extensionId) {
   //    按钮在 HTML 解析时就存在，那时模块脚本还没执行、监听器还没绑。
   //    早点击会静默丢失；而「dry-run 零写入」会因为「什么都没发生」而假绿。
   await page.waitForSelector('body[data-ready="1"]', { state: 'attached', timeout: 20000 });
+  await forceLlmOff(page);
   return page;
+}
+
+/**
+ * 强制关掉 LLM，让 E2E 与机器环境解耦。
+ *
+ * 为什么必须做：
+ *   LLM 兜底默认开启，而 settings 里的 key 可能来自 tools/inject_key.py
+ *   注入的 src/llm-key.local.js —— 那是**本机环境状态**，不该影响测试结果。
+ *   现状下即使开着也不会真发请求（optional host permission 在全新 profile 里
+ *   从未授予，classifyBatch 会提前返回），但那依赖「权限恰好没被授予」这个
+ *   隐含前提；一旦哪天测试 profile 继承了权限，就会变成真的联网调用。
+ *   显式关掉，把前提写死在代码里。
+ *
+ * loadAndClassify 是在**预览时**才读 settings 的，所以这里写完立即生效，无需 reload。
+ */
+export async function forceLlmOff(page) {
+  await page.evaluate(async () => {
+    const got = await chrome.storage.local.get('settings');
+    const cur = got.settings || {};
+    await chrome.storage.local.set({ settings: { ...cur, llmEnabled: false } });
+  });
 }
 
 /**

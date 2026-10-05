@@ -1,6 +1,10 @@
 # 依赖（Playwright 只在跑 E2E 时需要，不入库）
 node_modules/
 
+# 注入的 API key（tools/inject_key.py 生成）
+# 绝不能进版本库，也绝不能进发布 zip
+src/llm-key.local.js
+
 # 测试输出（TAP 日志、诊断报告，每次跑都会变）
 tests/.*
 !tests/.gitignore

@@ -18,6 +18,8 @@ INCLUDE_DIRS = ["src", "ui"]
 
 EXCLUDE_NAMES = {"node_modules", ".git", "tests", "dist"}
 EXCLUDE_SUFFIX = {".zip", ".bak", ".map"}
+# 注入的 API key：绝不能进发布包
+EXCLUDE_FILES = {"llm-key.local.js"}
 
 
 def should_skip_dir(name):
@@ -25,6 +27,8 @@ def should_skip_dir(name):
 
 
 def should_skip_file(name):
+    if name in EXCLUDE_FILES:
+        return True
     if name.startswith("."):
         return True
     return os.path.splitext(name)[1].lower() in EXCLUDE_SUFFIX
@@ -71,7 +75,9 @@ def main():
         assert any(n.startswith("ui/") for n in names), "ui/ 缺失"
         assert not any(n.startswith("tests/") for n in names), "tests/ 不该进包"
         assert not any(n.startswith("node_modules/") for n in names), "node_modules 不该进包"
-    print("  校验通过：manifest 在根、src/ui 齐全、tests 与 node_modules 已排除")
+        leaked = [n for n in names if "llm-key.local" in n]
+        assert not leaked, f"注入的 API key 泄漏进了发布包：{leaked}"
+    print("  校验通过：manifest 在根、src/ui 齐全、tests 与 node_modules 已排除、注入的 key 未泄漏")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,8 @@ import {
 } from '../src/storage.js';
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot } from '../src/backup.js';
 import {
-  classifyBatch, hasLlmPermission, requestLlmPermission, revokeLlmPermission, validateAssignments,
+  classifyBatch, hasLlmPermission, requestLlmPermission, revokeLlmPermission,
+  validateAssignments, resolveConfig, MODEL_PRESETS,
 } from '../src/classify/llm.js';
 
 const MAX_ROWS = 300;
@@ -720,6 +721,21 @@ function collectTaxonomyFromEditor() {
 
 // ───────────────────────── 设置 ─────────────────────────
 
+function renderPresetSelect() {
+  const sel = $('llmPreset');
+  sel.textContent = '';
+  const custom = document.createElement('option');
+  custom.value = '';
+  custom.textContent = '— 自定义（在下面手填 base URL 与模型）—';
+  sel.append(custom);
+  for (const p of MODEL_PRESETS) {
+    const o = document.createElement('option');
+    o.value = `${p.baseUrl}::${p.model}`;
+    o.textContent = p.label;
+    sel.append(o);
+  }
+}
+
 async function loadSettingsUi() {
   const s = await getSettings();
   $('targetRoot').value = s.targetRoot;
@@ -728,10 +744,34 @@ async function loadSettingsUi() {
   $('llmModel').value = s.model;
   $('llmApiKey').value = s.apiKey;
 
-  const granted = await hasLlmPermission(s.baseUrl);
+  // 预选当前配置对应的预设项
+  const cur = `${s.baseUrl}::${s.model}`;
+  const match = MODEL_PRESETS.find((p) => `${p.baseUrl}::${p.model}` === cur);
+  $('llmPreset').value = match ? cur : '';
+
+  // key 来源要说清楚：手填 / 环境变量注入 / 没有
+  const cfg = await resolveConfig(s);
+  const stateEl = $('llmKeyState');
+  if (cfg.keySource === 'env') {
+    stateEl.textContent = `API key：已从本机环境变量注入的 src/llm-key.local.js 读取`
+      + '（不写入 storage，只在内存里用）。上面输入框留空即可。';
+    stateEl.classList.remove('warn-text');
+  } else if (cfg.keySource === 'manual') {
+    stateEl.textContent = 'API key：使用上面输入框里的值（保存在本机 chrome.storage.local）。';
+    stateEl.classList.remove('warn-text');
+  } else {
+    stateEl.textContent = 'API key：没有。设环境变量 DEEPSEEK_API_KEY 后跑 '
+      + '`python tools/inject_key.py` 注入，或在上面手填。'
+      + '没有 key 时 LLM 兜底会自动跳过，未分类条目留在「其他/待归类」。';
+    stateEl.classList.add('warn-text');
+  }
+
+  const granted = await hasLlmPermission(cfg.baseUrl);
+  let host = cfg.baseUrl;
+  try { host = new URL(cfg.baseUrl).host; } catch { /* 保持原样 */ }
   $('llmPermState').textContent = granted
-    ? `已授权访问：${new URL(s.baseUrl).host}`
-    : `尚未授权访问 ${(() => { try { return new URL(s.baseUrl).host; } catch { return s.baseUrl; } })()}。启用 LLM 前需要先点「授权访问该域名」。`;
+    ? `已授权访问：${host}`
+    : `尚未授权访问 ${host}。启用 LLM 前需要先点「授权访问该域名」—— 权限是按需申请的，不开 LLM 就不需要。`;
 }
 
 // ───────────────────────── 启动 ─────────────────────────
@@ -796,6 +836,12 @@ async function init() {
   });
 
   // LLM 设置
+  $('llmPreset').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    const [baseUrl, model] = e.target.value.split('::');
+    $('llmBaseUrl').value = baseUrl;
+    $('llmModel').value = model;
+  });
   $('btnSaveLlm').addEventListener('click', async () => {
     await updateSettings({
       llmEnabled: $('llmEnabled').checked,
@@ -855,6 +901,7 @@ async function init() {
 
   await loadSettingsUi();
   renderTaxonomyEditor();
+  renderPresetSelect();
   render();
   await renderSnapshots();
 

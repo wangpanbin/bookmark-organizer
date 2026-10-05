@@ -123,21 +123,25 @@
       </div>
 
       <div class="card-block">
-        <h2>LLM 兜底（可选）</h2>
+        <h2>LLM 兜底（默认开启）</h2>
         <p class="hint">
-          规则没命中、落进「待归类」的那一小撮才会发给云端模型分类 —— 不会外发整个书签列表。
-          关闭时扩展<b>不需要任何网站访问权限</b>。
+          规则没命中、落进「待归类」的那一小撮才会发给模型 —— 不会外发整个书签列表。
+          没配 key 时自动跳过，不影响其余整理。默认服务商 <b>DeepSeek</b>。
         </p>
         <label class="chk big"><input type="checkbox" id="llmEnabled"> 启用 LLM 兜底分类</label>
+        <label class="field"><span>服务商 / 模型预设</span>
+          <select id="llmPreset"></select>
+        </label>
         <label class="field"><span>API base URL</span>
           <input type="url" id="llmBaseUrl" spellcheck="false">
         </label>
         <label class="field"><span>模型</span>
-          <input type="text" id="llmModel" spellcheck="false" placeholder="qwen-plus">
+          <input type="text" id="llmModel" spellcheck="false" placeholder="deepseek-flash">
         </label>
         <label class="field"><span>API Key</span>
-          <input type="password" id="llmApiKey" spellcheck="false" placeholder="只保存在本机 chrome.storage.local">
+          <input type="password" id="llmApiKey" spellcheck="false" placeholder="留空则用本机环境变量注入的 key">
         </label>
+        <p class="hint" id="llmKeyState"></p>
         <div class="panel-actions">
           <button id="btnGrant">授权访问该域名</button>
           <button id="btnRevoke">撤销授权</button>
@@ -145,8 +149,14 @@
         </div>
         <p class="hint" id="llmPermState"></p>
         <p class="hint warn-text">
-          提示：百炼的 API key 与区域强绑定，用北京区 key 调国际区端点会返回 401。
-          官方也推荐改用工作区专属域名，性能更稳。
+          扩展运行时读不到操作系统环境变量（MV3 里没有 <code>process</code> 对象），
+          所以 key 由 <code>python tools/inject_key.py</code> 在加载前从环境变量读一次，
+          写入 <code>src/llm-key.local.js</code>。该文件已在 .gitignore 排除，打包时也不会包含。
+        </p>
+        <p class="hint warn-text">
+          DeepSeek 的模型名变动较频繁（<code>deepseek-chat</code> 已公告弃用），
+          官方文档对「当前该用哪个名字」说法也不一致。若报 400/404，
+          换一个预设模型即可。
         </p>
       </div>
 

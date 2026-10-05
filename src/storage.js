@@ -182,11 +182,17 @@ export const K = {
   },
 };
 
-/** 默认设置。apiKey 存在 storage.local，绝不进 manifest / 代码 / git。 */
+/**
+ * 默认设置。
+ * ⚠️ apiKey 一律留空：注入的 key 走 tools/inject_key.py 落在 src/llm-key.local.js，
+ *    由 llm.js 在内存里读，**不写入 storage**。这里只存用户手填的覆盖值。
+ *    LLM 默认开启 —— 规则命中率已经 90%，剩下的未分类量很小，值得兜底；
+ *    没配 key 时会自动跳过，不影响其余整理。
+ */
 export const DEFAULT_SETTINGS = Object.freeze({
-  llmEnabled: false,
-  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  model: 'qwen-plus',
+  llmEnabled: true,
+  baseUrl: 'https://api.deepseek.com',
+  model: 'deepseek-flash',
   apiKey: '',
   /** 目标顶层根：'1' = 书签栏，'2' = 其他书签 */
   targetRoot: '1',
