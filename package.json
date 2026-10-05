@@ -19,6 +19,7 @@
     "test:fail-log": "node tests/e2e/fail-log.js",
     "log:sink": "python tools/fail_log_sink.py",
     "log:sink:selftest": "python tools/fail_log_sink.py --selftest",
+    "gate:privacy": "python tools/privacy_gate.py",
     "test:all": "python tools/verify_all.py",
     "package": "python tools/package.py"
   },
