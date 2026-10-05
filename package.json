@@ -16,6 +16,7 @@
     "test:matrix": "node tests/e2e/matrix.js",
     "test:llm": "node tests/e2e/llm-path.js",
     "test:scale": "node tests/e2e/scale.js 800",
+    "test:fail-log": "node tests/e2e/fail-log.js",
     "log:sink": "python tools/fail_log_sink.py",
     "log:sink:selftest": "python tools/fail_log_sink.py --selftest",
     "test:all": "python tools/verify_all.py",

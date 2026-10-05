@@ -13,7 +13,15 @@ export const FORBIDDEN_IN_PURE_CHAIN = [
   'llm.js',
   'tree.js',
   'background.js',
+  'fail-log.js',
 ];
+
+/**
+ * ⚠️ 上面这个列表是**文件名后缀匹配**（spec.endsWith(bad)），不是全名匹配。
+ *    所以新模块名只要**以**其中任何一项结尾，就会因为名字被当成写操作模块 ——
+ *    典型地雷：把日志缓冲叫 fail-log-storage.js，会被 'storage.js' 命中。
+ *    加新模块时先 `rg 'endsWith\(bad\)'` 想一下名字，别等闸门报红才发现。
+ */
 
 /**
  * 扫描前先去掉注释。

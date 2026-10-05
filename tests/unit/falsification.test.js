@@ -21,7 +21,7 @@ import { findDuplicates } from '../../src/dedupe.js';
 import { buildPlan, setRules } from '../../src/plan.js';
 import { DEFAULT_TAXONOMY } from '../../src/classify/taxonomy.js';
 import { SAMPLE_BOOKMARKS, HIT_RATE_THRESHOLD } from '../fixtures/samples.js';
-import { findForbiddenImports, extractImports } from '../helpers/sourceScan.js';
+import { findForbiddenImports, extractImports, FORBIDDEN_IN_PURE_CHAIN } from '../helpers/sourceScan.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = join(HERE, '..', '..', 'src');
@@ -147,11 +147,45 @@ test('证伪：给 plan.js 注入写操作 import → 零写入闸门必须红',
 });
 
 test('证伪：闸门对所有写操作模块都敏感', () => {
-  for (const bad of ['./apply.js', '../backup.js', './storage.js', './llm.js', './tree.js', './background.js']) {
+  for (const bad of ['./apply.js', '../backup.js', './storage.js', './llm.js', './tree.js', './background.js', './fail-log.js']) {
     const src = `import * as m from '${bad}';\nexport default m;\n`;
     const hits = findForbiddenImports([{ rel: 'plan.js', text: src }]);
     assert.equal(hits.length, 1, `写操作模块 ${bad} 没被识别`);
   }
+});
+
+test('证伪：fail-log.js 那一行是「承重」的，删掉闸门立刻失效', () => {
+  // 这一条专门盯住 FORBIDDEN_IN_PURE_CHAIN 里的 'fail-log.js'。
+  // 有人哪天「清理」时把它删了，日志模块就能被纯链路 import 而没人拦 ——
+  // 而日志模块会发网络请求，dry-run 就不再是零写入、零外发。
+  const src = "import { recordFailure } from './fail-log.js';\nexport const x = recordFailure;\n";
+
+  const withEntry = findForbiddenImports([{ rel: 'plan.js', text: src }]);
+  assert.deepEqual(withEntry, ['plan.js → ./fail-log.js'], 'fail-log.js 没被闸门拦住');
+
+  // 模拟「那一行被删掉」：用一个不含 fail-log.js 的禁用表
+  const WITHOUT = FORBIDDEN_IN_PURE_CHAIN.filter((f) => f !== 'fail-log.js');
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: src }], WITHOUT),
+    [],
+    '删掉列表项后竟然还能拦住 —— 说明这条断言测的不是列表项本身',
+  );
+});
+
+test('证伪：禁写模块名是后缀匹配，新模块起名要当心', () => {
+  // 记录在案的命名地雷：叫 fail-log-storage.js 会被 'storage.js' 命中。
+  // 闸门分不清「因为它是写操作模块」和「只是名字撞了」—— 所以起名必须自己当心。
+  const sneaky = "import { x } from './fail-log-storage.js';\nexport const y = x;\n";
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: sneaky }]),
+    ['plan.js → ./fail-log-storage.js'],
+    '后缀匹配行为变了 —— 以后给新模块起名可以放松警惕了（别）',
+  );
+  // 真正的模块名不受影响
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: "import { x } from './fail-log.js';\nexport const y = x;\n" }]),
+    ['plan.js → ./fail-log.js'],
+  );
 });
 
 test('证伪：import 扫描器能认全部 ESM 写法（含跨行与动态导入）', () => {

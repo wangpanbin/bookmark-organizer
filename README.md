@@ -118,6 +118,73 @@ DeepSeek 官方格式是 `https://api.deepseek.com`（不带 `/v1` 也能通）�
 所以给了默认值 + 面板预设列表 + 逐类错误提示，不押注单个名字。
 模型被要求**只能用给定类目、不许自造**，返回里不存在的类目会被丢弃。
 
+## 移动失败日志
+
+书签没搬成时，失败原因会记到本机 **`F:\logs\bookmark-organizer\<日期>.jsonl`**，
+一行一条（JSON Lines，方便 `grep` 或直接喂 Python）。
+
+### 为什么需要「本机接收器」
+
+**Chrome 扩展没有任意写本地文件的能力。** MV3 没有文件系统 API，
+service worker 里连 `showSaveFilePicker` 都不存在（那只在有 DOM 的面板页，
+而且必须由用户手势触发）。所以要把日志落到 `F:\logs`，必须由**本机进程**写 ——
+这就是 `tools/fail_log_sink.py` 的全部理由。
+
+### 怎么用
+
+```bash
+npm run log:sink              # 起接收器（前台）
+npm run log:sink:selftest     # 自检：写一条再读回，证明 F 盘真能落盘
+```
+
+或直接双击 `tools\start_fail_log_sink.bat`。然后在「设置 → 移动失败日志」里点一次
+**「授权本机日志接收器」**（权限按需申请，和 LLM 兜底同一套做法）。
+
+日志在哪儿、什么格式：
+
+```
+F:\logs\bookmark-organizer\2026-10-05.jsonl
+{"ts":"…","kind":"move","id":"1234","title":"…","url":"https://…",
+ "error":"移动后回读：实际在「收集箱」而不是「开发与技术」…",
+ "fromPath":["书签栏","收集箱"],"toPath":["开发与技术","前端"],
+ "batch":1759679130000,"chrome":"139.0.7258.67","ext":"1.0.0"}
+```
+
+- `error` 直接用执行器的 `explainMoveError()` 文案，**已经是可操作的中文**
+  （说清实际落在哪、目标在哪、下一步查什么），不用再翻译一遍。
+- `batch` 是本轮任务的 `startedAt`：日志按天追加、跨批次混在一起，
+  没有它就没法把某一次执行的失败从整月记录里摘出来。
+- `kind` 只记失败：`move`（没搬成）与 `delete`（重复项没删掉）。
+  **成功条目不记** —— 800 条规模会刷屏，而排查用不上。
+
+### 接收器没开怎么办
+
+**静默降级，不打断整理。** 失败记录会留在扩展的 `chrome.storage.local` 缓冲里
+（上限 200 条），在「设置 → 移动失败日志」点 **「重新导出」** 手动存一份。
+执行结束时还会再兜底补发一次。
+
+> 「以为记上了、其实没记」是这个项目栽过最多的坑类型，所以面板上永远有一行
+> **接收器状态**（在线 / 离线 / 未授权）。那行是判断「到底写没写进去」的唯一依据。
+
+### 端口
+
+`8731`。它只出现在两个地方：扩展侧 `src/fail-log.js` 的 `SINK_PORT`，
+接收器侧 `tools/fail_log_sink.py` 的 `DEFAULT_PORT`。**改端口要同时改两侧**，
+否则症状是「状态一直显示离线」。
+
+### ⚠️ 两个必须知道的坑
+
+1. **`Access-Control-Allow-Private-Network: true` 不能少。**
+   扩展 origin（`chrome-extension://…`）请求 `127.0.0.1` 属于
+   「公开来源访问私有网络」（PNA）。少这个响应头，浏览器会**在 service worker 里
+   直接把 `fetch` 掐掉**，现象是「失败明明发生了、日志文件一直没生成」——
+   和没接一样。`--selftest` 第一步就查这个头。
+2. **新模块名不要以写操作模块名结尾。** 零写入闸门是**后缀匹配**
+   （`spec.endsWith(bad)`）：把日志缓冲模块叫 `fail-log-storage.js`，
+   会被 `storage.js` 命中而报错。日志模块因此只叫 `fail-log.js`。
+
+---
+
 ## 开发
 
 ```bash
@@ -128,9 +195,10 @@ npm run test:e2e     # E2E（需要完整 chromium + 有头模式）
 node tests/e2e/diagnose.js   # 诊断：打印执行过程中任务状态的推进与失败原因
 ```
 
-### 「点了执行整理但没变化」的四把手术刀
+### 「点了执行整理但没变化」的手术刀
 
-这四个脚本是为追一个具体症状写的：**预览里分类看着是对的，点「执行整理」后书签页却毫无动静**。
+这些脚本大多是为追「预览里分类看着是对的，点「执行整理」后书签页却毫无动静」
+这一个具体症状写的（判据一律是**用户可见的承诺**）。
 它们全部用全新 profile 起真实浏览器，判据一律是**用户可见的承诺**——
 每条计划项都得落在它承诺的文件夹里、落在设置指定的根下、再预览必须是 0。
 不查 `task.status`（那只是「循环跑完了」，不说明书签动了）。
@@ -145,6 +213,7 @@ node tests/e2e/diagnose.js   # 诊断：打印执行过程中任务状态的推�
 | `npm run test:stale` | 把书签**删掉再按同 URL 重建**（id 全变，书签还在）→ 断言执行器能按 URL 自愈并搬成功；再全删干净 → 断言**拒绝启动**而不是跑出 45 条同样的失败 |
 | `node tests/e2e/probe-errid.js` | 探针：Chrome 到底对哪些故障报哪句话（用来判断错误文案能不能直接透传） |
 | `npm run test:scale` | 800 条的真实规模：能不能跑完、每条多久、跑完是否全部落位 |
+| `npm run test:fail-log` | 失败日志链路：接收器开着时**磁盘文件里必须真出现该条**（判据是读盘，不是接口返回码）；接收器没开时静默降级、一条不丢、「重新导出」可用 |
 
 ```bash
 npm run test:llm -- ok        # 只跑一个变体
@@ -157,7 +226,7 @@ npm run test:scale -- 2000    # 换个规模
 
 ### 单元测试
 
-**136 项**，覆盖 URL 归一化、去重、规则匹配、计划生成、类目合并、storage 契约、去重逐条否决。
+**154 项**，覆盖 URL 归一化、去重、规则匹配、计划生成、类目合并、storage 契约、去重逐条否决、失败日志降级路径。
 `tests/fixtures/samples.js` 是命中率闸门的输入（阈值 70%，实测 90.3%）。
 
 `tests/unit/inject-path.test.js` 守的是「`tools/inject_key.py` 写的路径必须是
@@ -183,8 +252,9 @@ storage.js 是全项目最容易**静默**损坏数据的模块，之前只能�
 故意造坏实现，确认对应闸门**确实会红**。
 
 `npm run test:falsify` 会备份真实源码、打上坏补丁、跑整套测试、断言变红、再还原。
-当前覆盖 6 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
-注入**跨行**写操作 import、注入**动态** import 写操作模块、字典位置参数错位。
+当前覆盖 9 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
+注入**跨行**写操作 import、注入**动态** import 写操作模块、字典位置参数错位、
+给 `plan.js` 注入**日志模块**、发送成功后整条清空缓冲、`recordFailure` 不再兜底。
 
 > 绿灯本身不算证据。一道从来没红过的闸门，和没有闸门是一样的。
 
@@ -237,6 +307,7 @@ src/
   tree.js             getTree 扁平化
   backup.js           快照与回滚
   apply.js            逐条执行 + 断点续跑（在 service worker 里跑）
+  fail-log.js         失败记录：本机缓冲 + 送本机接收器（写操作模块）
   listener.js         变更监听（导入期抑制）
   background.js       service worker 入口
 ui/
@@ -252,6 +323,8 @@ tools/
   verify_all.py       全套验证（单测 + 证伪 + E2E）
   package.py          打包产物
   inject_key.py       从本机环境变量把 API key 注入 src/llm-key.local.js（已 gitignore）
+  fail_log_sink.py    失败日志接收器：接住扩展 POST，写 F:\logs\bookmark-organizer\<日期>.jsonl
+  start_fail_log_sink.bat  双击启动接收器
 ```
 
 ### 三条硬约束在代码里的位置

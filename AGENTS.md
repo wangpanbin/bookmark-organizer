@@ -19,6 +19,11 @@ Chrome MV3 书签整理扩展。原生 ES Module，零构建，`load unpacked` �
 
 ## 三条不可破的约束
 
+0. **`fail-log.js` 同属写操作模块。** 它会发网络请求（本机接收器），
+   被纯链路 import 就意味着 dry-run 不再零外发。已进 `FORBIDDEN_IN_PURE_CHAIN`。
+   ⚠️ 那个列表是**文件名后缀匹配**：新模块名不要以 `storage.js` / `apply.js` /
+   `llm.js` / `tree.js` / `backup.js` / `background.js` / `fail-log.js` 结尾 ——
+   `xxx-storage.js` 会**因为名字**被判成 `storage.js`。
 1. **`plan.js` 不 import 任何写操作模块。** 这是 dry-run 零写入的全部依据，由 `tests/unit/plan.test.js` 的静态断言守着。扫描器（`tests/helpers/sourceScan.js`）必须同时覆盖：具名 / 默认 / namespace / 副作用 / re-export / **跨行子句** / **动态 import**，且**扫描前先去掉注释**。
    - 漏掉副作用导入 → `import './apply.js'` 整条绕过。
    - 子句正则用 `[^;\n]*?` → `import {\n a,\n} from './apply.js'` 整类绕过。

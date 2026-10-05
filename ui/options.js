@@ -26,6 +26,10 @@ import {
   classifyBatch, hasLlmPermission, requestLlmPermission, revokeLlmPermission,
   validateAssignments, resolveConfig, MODEL_PRESETS,
 } from '../src/classify/llm.js';
+import {
+  getPending, clearPending, probeSink, toJsonl,
+  requestSinkPermission, revokeSinkPermission,
+} from '../src/fail-log.js';
 
 const MAX_ROWS = 300;
 
@@ -587,6 +591,13 @@ async function renderReport() {
   const isRunning = task.status === TASK_STATUS.RUNNING;
   $('btnPause').hidden = !isRunning;
   $('btnResume').hidden = isRunning || !task.plan || task.status === TASK_STATUS.DONE;
+
+  // 待导出条数跟着每次渲染更新。
+  // ⚠️ 这里只刷**计数**、不探接收器：renderReport 在轮询里会被反复调用，
+  //    而探一次接收器在它没开时要等超时 —— 每次渲染都探会把面板拖卡。
+  // ⚠️ 但必须刷：失败是**执行时**才产生的，而按钮状态只在 init 刷过一次 ——
+  //    不刷的话「重新导出」会一直是禁用的，用户刷新面板才发现能点。
+  refreshPendingCount().catch(() => {});
 }
 
 // ───────────────────────── 人工反馈 ─────────────────────────
@@ -1037,6 +1048,95 @@ async function loadSettingsUi() {
     : `尚未授权访问 ${host}。启用 LLM 前需要先点「授权访问该域名」—— 权限是按需申请的，不开 LLM 就不需要。`;
 }
 
+// ───────────────────── 移动失败日志 ─────────────────────
+
+/**
+ * 只刷「未送出条数 + 导出按钮可用性」—— 纯 storage 读，不发网络请求。
+ * 便宜到可以在每次 renderReport 里调。
+ */
+async function refreshPendingCount() {
+  const pending = await getPending();
+  $('pendingCount').textContent = String(pending.length);
+  $('btnExportPending').disabled = pending.length === 0;
+}
+
+/**
+ * 探一次接收器并刷新状态文案。**只在打开面板 / 点「刷新状态」时调**，
+ * 因为接收器没开时每次探测都要等超时。
+ */
+async function refreshSinkState() {
+  const p = await probeSink();
+  const el = $('sinkState');
+  if (p.state === 'no-permission') {
+    el.textContent = '接收器状态：未授权 —— 点下面的「授权本机日志接收器」一次即可。';
+    el.classList.add('warn-text');
+  } else if (p.state === 'online') {
+    el.textContent = `接收器状态：在线（本次会话已写入 ${p.lines} 条）→ ${p.dir}`;
+    el.classList.remove('warn-text');
+  } else {
+    el.textContent = '接收器状态：离线 —— 先在本机开 npm run log:sink。'
+      + '这不影响整理，失败记录会存在扩展里，随时可以「重新导出」。';
+    el.classList.add('warn-text');
+  }
+}
+
+/**
+ * 刷新「移动失败日志」这块 UI。
+ *
+ * ⚠️ 状态是**静默**的：接收器没开不弹 toast、不打断整理。
+ *    但没有它就没法判断「到底写没写进去」—— 而「以为记上了其实没记」
+ *    正是这个项目栽过最多的坑。
+ */
+async function renderFailLogUi() {
+  const s = await getSettings();
+  $('failLogEnabled').value = s.failLogEnabled === false ? '0' : '1';
+  await refreshPendingCount();
+  await refreshSinkState();
+}
+
+/** 导出缓冲里的失败记录。成功存盘才清缓冲。 */
+async function exportPendingFailures() {
+  const pending = await getPending();
+  if (!pending.length) { toast('没有待导出的失败记录'); return; }
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  const name = `bookmark-organizer-failures-${stamp}.jsonl`;
+  const blob = new Blob([toJsonl(pending)], { type: 'application/x-ndjson' });
+
+  // ⚠️ showSaveFilePicker 必须在**用户手势里直接**调。
+  //    中间 await 过别的东西，浏览器会认为手势已过期，弹窗直接不出现 ——
+  //    症状是「点了按钮，什么都没发生，也没有报错」。
+  if (typeof window.showSaveFilePicker === 'function') {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: 'JSON Lines', accept: { 'application/x-ndjson': ['.jsonl'] } }],
+      });
+    } catch (e) {
+      // 用户自己取消保存不是错误，别弹红提示
+      if (e && e.name === 'AbortError') return;
+      toast(`导出失败：${e.message || e}`, true);
+      return;
+    }
+    const w = await handle.createWritable();
+    await w.write(blob);
+    await w.close();
+  } else {
+    // 降级：API 不可用就落 Chrome 下载目录
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  await clearPending();
+  await renderFailLogUi();
+  toast(`已导出 ${pending.length} 条失败记录`);
+}
+
 // ───────────────────────── 启动 ─────────────────────────
 
 async function init() {
@@ -1136,6 +1236,27 @@ async function init() {
     toast('已保存，重新预览即可');
   });
 
+  // 移动失败日志
+  $('btnExportPending').addEventListener('click', () => exportPendingFailures());
+  $('btnGrantSink').addEventListener('click', async () => {
+    const ok = await requestSinkPermission();
+    toast(
+      ok ? '已授权本机日志接收器' : '未授权（需要在弹窗里点允许）—— 失败记录会存在扩展里，可随时重新导出',
+      !ok,
+    );
+    await renderFailLogUi();
+  });
+  $('btnRevokeSink').addEventListener('click', async () => {
+    const ok = await revokeSinkPermission();
+    toast(ok ? '已撤销授权' : '撤销失败', !ok);
+    await renderFailLogUi();
+  });
+  $('btnProbeSink').addEventListener('click', () => renderFailLogUi());
+  $('failLogEnabled').addEventListener('change', async (e) => {
+    await updateSettings({ failLogEnabled: e.target.value === '1' });
+    toast(e.target.value === '1' ? '已开启失败日志' : '已关闭失败日志');
+  });
+
   // 去重逐条否决
   $('btnClearVeto').addEventListener('click', async () => {
     if (!state.veto.length) { toast('当前没有「不删」标记'); return; }
@@ -1176,6 +1297,9 @@ async function init() {
   await loadSettingsUi();
   renderTaxonomyEditor();
   renderPresetSelect();
+  // 探一次接收器。不 await 到主流程外抛错 —— 面板能不能开，
+  // 不该取决于 F 盘上那个接收器在不在跑。
+  await renderFailLogUi().catch(() => {});
   await render();
   await renderSnapshots();
 

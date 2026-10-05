@@ -184,6 +184,39 @@
       </div>
 
       <div class="card-block">
+        <h2>移动失败日志</h2>
+        <p class="hint">
+          书签没搬成时，把原因记到本机 <code>F:\logs\bookmark-organizer\</code>，
+          按天一个 <code>.jsonl</code>（一行一条，方便 grep 或喂脚本）。
+        </p>
+        <p class="hint">
+          扩展没法直接写本地磁盘，所以要先在本机开一个接收器：
+          <code>npm run log:sink</code>，或双击 <code>tools\start_fail_log_sink.bat</code>。
+          端口 <code>8731</code>。
+        </p>
+        <p class="hint" id="sinkState">接收器状态：检查中…</p>
+        <div class="row-stat">
+          <span>未送出的失败记录</span><b id="pendingCount">0</b>
+          <button id="btnExportPending">重新导出</button>
+        </div>
+        <div class="panel-actions">
+          <button id="btnGrantSink">授权本机日志接收器</button>
+          <button id="btnRevokeSink">撤销授权</button>
+          <button id="btnProbeSink">刷新状态</button>
+        </div>
+        <label class="field"><span>失败日志</span>
+          <select id="failLogEnabled">
+            <option value="1">开启（默认）</option>
+            <option value="0">关闭</option>
+          </select>
+        </label>
+        <p class="hint">
+          接收器没开时不报错、不打断整理，失败记录会存在扩展里，
+          随时可以用上面的「重新导出」手动存一份。
+        </p>
+      </div>
+
+      <div class="card-block">
         <h2>人工干预</h2>
         <p class="hint">锁定按 URL 记录（不是节点 id），所以移动过位置也不会失效。</p>
         <div class="row-stat">

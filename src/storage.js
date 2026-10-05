@@ -178,6 +178,8 @@ export const K = {
   LAST_PLAN: 'plan:last',
   PENDING_COUNT: 'pending:count',
   TREE_VERSION: 'tree:version',
+  /** 还没成功送到本机接收器的失败记录。既是重试队列，也是「重新导出」的数据源 */
+  FAIL_LOG_PENDING: 'fail:pending',
   get snapshot() {
     return (ts) => `snapshot:${ts}`;
   },

@@ -80,6 +80,31 @@ CASES = [
         ["pathWords", "titleWords", "domains", "命中率", "expect", "错位"],
         None,
     ),
+    (
+        "计划生成引入日志模块（预览阶段就可能发网络请求，dry-run 不再零外发）",
+        os.path.join("src", "plan.js"),
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';",
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';\n"
+        "import { recordFailure } from './fail-log.js';   // ← 证伪补丁：纯链路混入了日志模块",
+        ["写操作", "零写入", "plan.js", "闸门"],
+        os.path.join("src", "fail-log.js"),
+    ),
+    (
+        "发送成功后整条清空缓冲（发送途中新来的失败会被静默吞掉）",
+        os.path.join("src", "fail-log.js"),
+        "  await removeDelivered(pending);",
+        "  await clearPending();   // ← 证伪补丁：整条清空，不再按内容比对",
+        ["发送途中", "误删", "缓冲"],
+        None,
+    ),
+    (
+        "recordFailure 不再兜底（日志功能一坏，整批书签跟着卡死）",
+        os.path.join("src", "fail-log.js"),
+        "    console.warn('[fail-log] 记录失败日志时出错（已忽略，不影响整理）', e);",
+        "    throw e;   // ← 证伪补丁：把异常直接抛回执行器",
+        ["storage 整个炸了", "不 reject", "recordFailure"],
+        None,
+    ),
 ]
 
 
