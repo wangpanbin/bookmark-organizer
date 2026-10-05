@@ -10,6 +10,7 @@
     "test:falsify:llm": "python tests/falsify_inject_path.py",
     "test:e2e": "node --test tests/e2e/run.js",
     "test:repro": "node tests/e2e/repro-organize.js",
+    "test:real": "node tests/e2e/repro-real.js",
     "test:matrix": "node tests/e2e/matrix.js",
     "test:llm": "node tests/e2e/llm-path.js",
     "test:scale": "node tests/e2e/scale.js 800",

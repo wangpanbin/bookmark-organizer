@@ -652,10 +652,43 @@ function openPicker(itemId) {
 
 // ───────────────────────── 执行 ─────────────────────────
 
+/**
+ * 解析「归入位置」当前指向哪个根，并给出可读名称。
+ *
+ * ⚠️ 为什么执行相关的每一句话都必须带上它：
+ *    根归到哪是 `settings.targetRoot` 决定的，而计划里的 `toPath` **不含根名**
+ *    （见 plan.js 的路径模型）。于是同一份清单在「书签栏」和「其他书签」
+ *    两个设置下产出**完全一样**，界面上也**看不出区别**。
+ *    实测踩过：「归入位置」是「其他书签」时，45 条书签全部搬到其他书签下的
+ *    10 个类目文件夹里，原文件夹被搬空但仍留在书签栏 ——
+ *    书签栏看上去「一点没变」，面板还弹「整理完成」。
+ *    用户只能靠猜「到底搬到哪去了」。所以确认弹窗和完成提示都必须写明根名。
+ *
+ * @returns {Promise<{id: string, name: string}>}
+ */
+async function resolveTargetRoot() {
+  const settings = await getSettings();
+  const id = String(settings.targetRoot || '1');
+  try {
+    const trees = await chrome.bookmarks.getTree();
+    const hit = (trees?.[0]?.children || []).find((t) => String(t.id) === id);
+    // 兜底只能给 id 契约下的默认值 —— 根标题是本地化的，不能硬编码中文名
+    return { id, name: hit ? (hit.title || id) : '书签栏' };
+  } catch {
+    return { id, name: '书签栏' };
+  }
+}
+
 async function doExecute() {
   const plan = state.plan;
   if (!plan) return;
   const dups = state.dupPayload;
+  const root = await resolveTargetRoot();
+
+  // 将要新建的**顶层**文件夹名 —— 用户靠它就能预判整理后的书签栏长什么样
+  const newTops = [...new Set(plan.newFolders
+    .filter((p) => Array.isArray(p) && p.length)
+    .map((p) => p[0]))];
 
   const msg = [
     '即将整理你的书签：',
@@ -666,6 +699,12 @@ async function doExecute() {
     // 把否决条数摆出来：用户勾了「不删」却看不到任何变化，
     // 就只能靠猜这份清单到底准不准 —— 那等于没给否决权。
     ...(state.veto.length ? [`　　　　　（其中 ${state.veto.length} 条已被你标记为不删）`] : []),
+    '',
+    // ⚠️ 这一行是本次修复的重点：整理到**哪个根**是设置决定的，
+    //    而计划清单里不含根名，界面上看不出来。不写清楚的话，
+    //    「归入位置」不是书签栏的用户会看到「整理完成」却找不到书。
+    `归入位置：${root.name}`,
+    ...(newTops.length ? [`　将新建顶层文件夹：${newTops.join('、')}`] : []),
     '',
     `快照：${state.snapshotTs ? new Date(Number(state.snapshotTs)).toLocaleString() : '（将自动创建）'}`,
     '',
@@ -686,7 +725,16 @@ async function doExecute() {
     syncExecuteButton();
     return;
   }
-  toast('已开始执行');
+  // ⚠️ 后端「拒绝启动」时返回的是 `{ok:true, result:{started:false, reason}}` ——
+  //    ok 只代表消息送达了，不代表整理真的跑起来了。
+  //    早先只判 res.ok，于是「已在执行中 / 计划为空」这两种拒绝
+  //    都会弹「已开始执行」，然后什么都不发生 —— 从用户看就是「点了没反应」。
+  if (res.result && res.result.started === false) {
+    toast(`没有开始整理：${res.result.reason || '未知原因'}`, true);
+    syncExecuteButton();
+    return;
+  }
+  toast(`已开始整理，结果会归入「${root.name}」`);
   pollProgress();
 }
 
@@ -701,7 +749,54 @@ async function pollProgress() {
   // 跑完重新读树，刷新计划视图
   await safeReload();
   const task = await getTask();
-  if (task.status === TASK_STATUS.DONE) toast('整理完成');
+  if (task.status !== TASK_STATUS.DONE) {
+    if (task.status === TASK_STATUS.FAILED) toast('整理中断了，点「继续」可以接着跑', true);
+    return;
+  }
+
+  // ⚠️ 这里原来无条件弹「整理完成」。但 status=done 只说明**循环跑完了**，
+  //    不代表每条都搬成功 —— 全军覆没时同样是 done。
+  //    一条都没搬动却弹「整理完成」，用户只会更困惑：
+  //    「提示成功了，可书签一点没动」。失败必须自己说出来。
+  const items = task.plan?.items || [];
+  const doneN = items.filter((i) => i.status === 'done').length;
+  const failN = items.filter((i) => i.status === 'failed').length;
+  const root = await resolveTargetRoot();
+
+  if (failN > 0) {
+    toast(`整理结束：成功 ${doneN} 条，失败 ${failN} 条 —— 失败原因见下方红色明细`, true);
+    renderFailures(items, task);
+    return;
+  }
+  toast(`整理完成：${doneN} 条已归入「${root.name}」`);
+}
+
+/**
+ * 把失败明细摆在**主面板**上。
+ *
+ * ⚠️ 原来失败列表只在「设置 → 执行报告」里。用户点完执行整理，
+ *    视线在书签栏和计划表上，不会去翻设置 —— 于是「一条都没搬成」
+ *    这种事对用户是完全不可见的。现在在计划页顶部直接挂一条红色横幅。
+ */
+function renderFailures(items, task) {
+  const host = $('failBanner');
+  if (!host) return;
+  const rows = (task.failed || [])
+    .slice(0, 10)
+    .map((f) => `<li>${escapeHtml(f.title || f.url || f.id)} —— ${escapeHtml(String(f.error || ''))}</li>`)
+    .join('');
+  const more = (task.failed || []).length > 10 ? `<li>…共 ${task.failed.length} 条</li>` : '';
+  host.innerHTML =
+    `<b>有 ${items.filter((i) => i.status === 'failed').length} 条没能移动</b>`
+    + '<p>这些书签还留在原处。常见原因：目标位置不可写、书签已被删除、'
+    + '或「归入位置」指向了只读目录（如移动设备书签）。</p>'
+    + `<ul>${rows}${more}</ul>`;
+  host.hidden = false;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 async function doRestore(snap) {
