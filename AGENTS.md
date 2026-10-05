@@ -51,7 +51,9 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
 
 ### Issue tracker
 
-Issues and specs live as local markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+Agent 工作流的 issue 走**本地 markdown**：`.scratch/<feature>/`，随代码一起提交。
+GitHub Issues 是对外那一面，模版在 `.github/ISSUE_TEMPLATE/`。
+`Status:` 行与 GitHub label 字符串必须一致，见 `docs/agents/triage-labels.md`。
 
 ### Triage labels
 
@@ -59,4 +61,6 @@ Five canonical roles kept as-is: `needs-triage`, `needs-info`, `ready-for-agent`
 
 ### Domain docs
 
-Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+Single-context: 词汇表在根 `CONTEXT.md`，决策记录在 `docs/adr/`。
+**这两个都还不存在** —— 按 `docs/agents/domain.md` 的约定，「不存在就静默跳过」，
+既不要报缺失，也不要预先创建。改 `src/` 之前先读 `README.md`，那里已有全部领域知识。
