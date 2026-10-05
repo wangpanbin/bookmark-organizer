@@ -19,6 +19,7 @@ import {
   getDedupeVeto, isDedupeVetoed,
 } from './storage.js';
 import { toRemovalList } from './dedupe.js';
+import { recordFailure, flushPending } from './fail-log.js';
 
 /** 模块级重入保护 */
 let running = false;
@@ -79,10 +80,10 @@ export async function getProgress() {
 async function ensureFolder(parentId, title, createdOut) {
   const children = await chrome.bookmarks.getChildren(parentId);
   const found = (children || []).find((c) => !c.url && c.title === title);
-  if (found) return String(found.id);
+  if (found) return { id: String(found.id), created: false };
   const created = await chrome.bookmarks.create({ parentId: String(parentId), title });
   if (createdOut) createdOut.push({ id: String(created.id), path: [title] });
-  return String(created.id);
+  return { id: String(created.id), created: true };
 }
 
 /**
@@ -132,11 +133,17 @@ async function ensureTargetFolder(task, rootId, fullPath) {
         delete cache[key]; // 缓存指向的目录被用户删了
       }
     }
-    const id = await ensureFolder(parentId, seg, null);
-    const full = [rootName, ...acc];
-    if (!createdOut.some((c) => c.id === id)) createdOut.push({ id, path: full });
-    cache[key] = id;
-    parentId = id;
+    // ⚠️ createdOut 传 null —— 记账统一由下面这一处负责。
+    //    早先的两个版本各有毛病：传 null 后无条件 push，会把「复用了用户已有的
+    //    同名文件夹」也记成我们建的（回滚时 backup.js 按此清单 removeTree，
+    //    于是删掉用户自己的文件夹）；改成传 createdOut 又会和下面这处重复记账。
+    //    正确做法：只要 created 这个布尔，由这里带完整路径记一次。
+    const r = await ensureFolder(parentId, seg, null);
+    if (r.created) {
+      createdOut.push({ id: r.id, path: [rootName, ...acc] });
+    }
+    cache[key] = r.id;
+    parentId = r.id;
   }
   return parentId;
 }
@@ -188,7 +195,9 @@ async function persistItem(id, patch, extra) {
 export async function startExecution(payload) {
   if (running) return { started: false, reason: '已在执行中' };
 
-  const { plan, duplicates = [], snapshotTs = null } = payload || {};
+  // plan 要能被下面的 reconcile 替换掉，所以必须是 let —— 早先写成 const 又去赋值，
+  // 抛 `Assignment to constant variable`，整批任务直接启动失败。
+  let { plan, duplicates = [], snapshotTs = null } = payload || {};
   if (!plan || !Array.isArray(plan.items)) return { started: false, reason: '计划为空' };
 
   // 执行前先落一份快照 —— 回滚是唯一退路，必须在动第一个字节之前就有
@@ -199,12 +208,37 @@ export async function startExecution(payload) {
     snapTs = snap.ts;
   }
 
+  // ⚠️ 计划里的 id 必须在动手前对齐一次「活着的树」。
+  //
+  //    踩过的坑：2026-10-05 用户 45 条**全部**报 `Can't find bookmark for id.`
+  //    （探针验过：这句话就是「源 id 不存在」，与「目标文件夹不存在」是两句不同的话）。
+  //    书签本身都还在树上，是 id 变了 —— 用户恢复过备份、书签被删过重建、
+  //    或者同步落地过，都会让旧 id 失效。
+  //    早先不校验就硬搬，于是 45 条逐条撞同一句墙，
+  //    而 Chrome 的原话对用户零信息量。
+  //
+  //    这里做两件事：
+  //    ① 按 URL 重新定位到活着的节点（书签没被删，只是 id 变了）
+  //    ② 真的找不到的标成 skipped，并带可操作的原因
+  const reconciled = await reconcilePlanIds(plan);
+  if (reconciled.recovered === 0 && reconciled.missing.length > 0
+      && reconciled.missing.length === plan.items.length) {
+    // 一条都对不上 → 这份计划整体作废，硬跑只会产出 45 条同样的失败
+    return {
+      started: false,
+      reason: `这份计划的 ${plan.items.length} 条书签 id 全部失效了（书签被删过或恢复过备份，id 变了）。`
+        + '请点「读取并预览」重新算一份 —— 预览是只读的，不会动你的书签。',
+    };
+  }
+  plan = reconciled.plan;
+
   const task = {
     status: TASK_STATUS.RUNNING,
     plan,
     duplicates,
     lastDoneIndex: -1,
     failed: [],
+    stale: reconciled.missing,
     createdFolders: [],
     removedDuplicates: [],
     folderCache: {},
@@ -222,7 +256,52 @@ export async function startExecution(payload) {
     console.error('[apply] 执行循环异常', e);
     mutate(K.TASK_CURRENT, (cur) => ({ ...(cur || {}), status: TASK_STATUS.FAILED, updatedAt: Date.now() }), {});
   });
-  return { started: true, snapshotTs: snapTs };
+  return {
+    started: true,
+    snapshotTs: snapTs,
+    recovered: reconciled.recovered,
+    missing: reconciled.missing.length,
+  };
+}
+
+/**
+ * 把计划里的书签 id 对齐到活着的书签树上。
+ *
+ * 为什么按 **URL** 而不是按标题找：id 会变、标题会被用户改、URL 更稳定；
+ * 且 `chrome.bookmarks.search({url})` 走的是 Chrome 自己的精确匹配，
+ * 拿到的是**当前真实存在的节点**。
+ *
+ * @param {object} plan
+ * @returns {Promise<{plan:object, recovered:number, missing:Array}>}
+ */
+async function reconcilePlanIds(plan) {
+  const items = Array.isArray(plan.items) ? plan.items : [];
+  const missing = [];
+  let recovered = 0;
+  const next = [];
+
+  for (const it of items) {
+    // id 还活着就不用动 —— 这是绝大多数情况，一次 get 就够
+    const alive = await chrome.bookmarks.get(String(it.id)).catch(() => null);
+    if (alive && alive.length) {
+      next.push(it);
+      continue;
+    }
+
+    // id 失效 → 按 URL 找活着的同一条
+    const hit = it.url ? await chrome.bookmarks.search({ url: it.url }).catch(() => []) : [];
+    const same = (hit || []).find((n) => n && n.url && n.id && String(n.id) !== String(it.id));
+    if (same) {
+      recovered += 1;
+      next.push({ ...it, id: String(same.id), idRelocated: true });
+      continue;
+    }
+
+    missing.push({ title: it.title, url: it.url, oldId: String(it.id) });
+    next.push({ ...it, status: 'skipped', reason: 'bookmark-missing' });
+  }
+
+  return { plan: { ...plan, items: next }, recovered, missing };
 }
 
 /** 继续执行（worker 被回收后，或用户手动继续） */
@@ -243,6 +322,40 @@ export async function resumeExecution() {
 /** 暂停 */
 export async function pauseExecution() {
   return mutate(K.TASK_CURRENT, (cur) => ({ ...(cur || {}), status: TASK_STATUS.PAUSED, updatedAt: Date.now() }), {});
+}
+
+/**
+ * 把 Chrome 的原话翻译成能照着做的中文。
+ *
+ * ⚠️ 为什么必须翻译：Chrome 对几种**完全不同的**故障只有三句话，
+ *    探针实测（tests/e2e/probe-errid.js）：
+ *      Can't find bookmark for id.      ← 源书签 id 不存在
+ *      Can't find parent bookmark for id.← 目标文件夹 id 不存在
+ *      Bookmark id is invalid.          ← id 不是数字
+ *    2026-10-05 用户拿到 45 条「Can't find bookmark for id.」，
+ *    光看这句既不知道是哪条、也不知道该查什么，只能干瞪眼。
+ *
+ * @param {unknown} e
+ * @returns {string}
+ */
+export function explainMoveError(e) {
+  const raw = String(e && e.message ? e.message : e);
+  if (/Can't find parent bookmark for id/i.test(raw)) {
+    return `${raw} —— 目标文件夹已经不存在了（可能被其他扩展删掉，或同步覆盖了）。`
+      + '重新点一次「读取并预览」再执行即可。';
+  }
+  if (/Can't find bookmark for id/i.test(raw)) {
+    return `${raw} —— 这条书签在当前书签树里已经不存在了`
+      + '（删过又重建、或恢复过备份，都会让 id 失效）。'
+      + '请点「读取并预览」重新算一份计划。';
+  }
+  if (/Bookmark id is invalid/i.test(raw)) {
+    return `${raw} —— 书签 id 格式不对，节点已被删除。请重新预览。`;
+  }
+  if (/Can't modify the root/i.test(raw)) {
+    return `${raw} —— 不能把书签移动到根目录。`;
+  }
+  return raw;
 }
 
 /**
@@ -316,6 +429,9 @@ async function run() {
           t.updatedAt = Date.now();
           return { [K.TASK_CURRENT]: t };
         }, {});
+        // 兜底补发：某条失败时若接收器刚好没开，那条会留在本机缓冲里。
+        // 这里统一再试一次，缓冲上限 200 条，正常情况下是空转。
+        await flushPending();
         return;
       }
 
@@ -341,8 +457,25 @@ async function run() {
         });
       } catch (e) {
         // 单条失败不中断，记原因继续
-        const failed = [...(task.failed || []), { id: next.id, url: next.url, title: next.title, error: String(e) }];
+        const reason = explainMoveError(e);
+        const failed = [...(task.failed || []), {
+          id: next.id, url: next.url, title: next.title, error: reason,
+        }];
         await persistItem(next.id, { status: 'failed' }, { failed, lastDoneIndex: items.indexOf(next) });
+        // 旁路：把这条失败送到本机接收器，由脚本落成 F 盘上的 jsonl。
+        // ⚠️ 放在 persistItem **之后** —— 日志写不进去绝不能影响进度落盘。
+        // ⚠️ recordFailure 自己保证不抛，所以这里不需要（也不该）再包 try。
+        // ⚠️ 但必须 await：MV3 SW 空闲 30 秒即被回收，不等的话这条可能根本没发出去。
+        await recordFailure({
+          kind: 'move',
+          id: next.id,
+          url: next.url,
+          title: next.title,
+          error: reason,
+          fromPath: next.fromPath,
+          toPath: next.toPath,
+          batch: task.startedAt,
+        });
       }
 
       sinceYield += 1;
@@ -378,12 +511,25 @@ export async function processDuplicates(task) {
       await chrome.bookmarks.remove(d.id);
       removed.push({ url: d.url, title: d.title, path: d.path, keepId: d.keepId });
     } catch (e) {
-      const failed = [...(task.failed || []), { id: d.id, url: d.url, title: d.title, error: `删除重复项失败: ${e}` }];
+      const reason = `删除重复项失败: ${e}`;
+      const failed = [...(task.failed || []), { id: d.id, url: d.url, title: d.title, error: reason }];
       await mutateMany([K.TASK_CURRENT], (cur) => {
         const t = { ...(cur?.[K.TASK_CURRENT] || {}) };
         t.failed = failed;
         return { [K.TASK_CURRENT]: t };
       }, {});
+      // 同样进 F 盘日志。kind 标成 delete，面板上它们和移动失败并排在同一个横幅里，
+      // 日志里却不出现的话，面板和日志会自相矛盾。
+      await recordFailure({
+        kind: 'delete',
+        id: d.id,
+        url: d.url,
+        title: d.title,
+        error: reason,
+        fromPath: d.path,
+        toPath: [],
+        batch: task.startedAt,
+      });
     }
     await sleep(YIELD_MS);
   }

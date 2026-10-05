@@ -780,7 +780,19 @@ async function doExecute() {
     syncExecuteButton();
     return;
   }
-  toast(`已开始整理，结果会归入「${root.name}」`);
+  // 执行器会在落盘前把失效的 id 按 URL 重新定位到活着的节点上，
+  // 这里必须把这件事说出来 —— 否则用户会以为「只是照原样搬」，
+  // 而实际上计划已经被修正过了。
+  const rec = Number(res.result?.recovered || 0);
+  const gone = Number(res.result?.missing || 0);
+  if (rec > 0 || gone > 0) {
+    const parts = [];
+    if (rec) parts.push(`已按 URL 重新定位 ${rec} 条`);
+    if (gone) parts.push(`${gone} 条书签已不存在，已跳过`);
+    toast(`已开始整理（${parts.join('；')}），结果会归入「${root.name}」`, gone > 0);
+  } else {
+    toast(`已开始整理，结果会归入「${root.name}」`);
+  }
   pollProgress();
 }
 
@@ -807,14 +819,26 @@ async function pollProgress() {
   const items = task.plan?.items || [];
   const doneN = items.filter((i) => i.status === 'done').length;
   const failN = items.filter((i) => i.status === 'failed').length;
+  const movedN = items.filter((i) => i.idRelocated).length;
+  const goneN = (task.stale || []).length;
   const root = await resolveTargetRoot();
 
+  // 计划被修正过这件事，必须留在**最后**这条提示里。
+  // 早先只在开始时提示「已按 URL 重新定位 N 条」，几秒后被「整理完成」覆盖 ——
+  // 而用户往往是在最后那条才确认结果，等于白提示。
+  const notes = [];
+  if (movedN) notes.push(`其中 ${movedN} 条的 id 已失效、按 URL 重新定位后才搬动`);
+  if (goneN) notes.push(`${goneN} 条书签确实已不存在，已跳过`);
+
   if (failN > 0) {
-    toast(`整理结束：成功 ${doneN} 条，失败 ${failN} 条 —— 失败原因见下方红色明细`, true);
+    toast(`整理结束：成功 ${doneN} 条，失败 ${failN} 条`
+      + (notes.length ? `（${notes.join('；')}）` : '')
+      + ' —— 失败原因见下方红色明细', true);
     renderFailures(items, task);
     return;
   }
-  toast(`整理完成：${doneN} 条已归入「${root.name}」`);
+  toast(`整理完成：${doneN} 条已归入「${root.name}」`
+    + (notes.length ? `（${notes.join('；')}）` : ''));
 }
 
 /**
