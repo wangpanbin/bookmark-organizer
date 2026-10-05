@@ -34,10 +34,20 @@ const argLlm = (() => {
   return i >= 0 ? process.argv[i + 1] : 'on';
 })();
 
-/** 面板顶部「归入位置」：1=书签栏 2=其他书签。默认 1。 */
+/**
+ * 面板顶部「归入位置」。
+ *
+ * ⚠️ 这里传的是**语义键**（bar / other），不是根 id。
+ *    根 id 不是常量 —— Chrome 154 的账号书签模型里书签栏是 279、其他书签是 280，
+ *    早先传 '1' / '2' 正是 2026-10-05 那次 45 条全军覆没的同源问题。
+ */
 const argRoot = (() => {
   const i = process.argv.indexOf('--root');
-  return i >= 0 ? process.argv[i + 1] : '1';
+  const v = i >= 0 ? process.argv[i + 1] : 'bar';
+  // 兼容旧命令行：--root 1 / --root 2 直接翻成语义键
+  if (v === '1') return 'bar';
+  if (v === '2') return 'other';
+  return v;
 })();
 
 /** 截图③：书签栏原有文件夹 */
@@ -247,7 +257,7 @@ async function main() {
     //    也不该为了看结果去翻「设置」tab。确认弹窗与完成提示
     //    都必须点名归入位置 —— 否则「归入位置=其他书签」的用户
     //    会看到「整理完成」却发现书签栏纹丝不动。
-    const expectRootName = argRoot === '2' ? '其他书签' : '书签栏';
+    const expectRootName = argRoot === 'other' ? '其他书签' : '书签栏';
     say(`  确认弹窗文本:\n${confirmText.split('\n').map((l) => '      ' + l).join('\n')}`);
     if (!confirmText.includes(expectRootName)) {
       say(`  🔴 确认弹窗没有写明「归入位置：${expectRootName}」`);

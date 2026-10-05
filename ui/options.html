@@ -23,9 +23,17 @@
     <div class="topbar-right">
       <label class="field compact">
         <span>归入位置</span>
+        <!--
+          ⚠️ value 是**语义键**（bar / other），**不是根 id**。
+             早先这里写死 value="1" / "2"，而根 id 根本不是常量
+             （Chrome 154 的账号书签模型里书签栏是 279、其他书签是 280），
+             于是 2026-10-05 用户 45 条书签全军覆没。
+             这两个 option 只是 JS 读不到书签树时的兜底，
+             正常情况下会被 options.js 按真实根节点重建（标签也跟着 Chrome 的语言走）。
+        -->
         <select id="targetRoot">
-          <option value="1">书签栏</option>
-          <option value="2">其他书签</option>
+          <option value="bar">书签栏</option>
+          <option value="other">其他书签</option>
         </select>
       </label>
     </div>

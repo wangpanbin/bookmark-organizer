@@ -20,6 +20,7 @@ import {
 } from './storage.js';
 import { toRemovalList } from './dedupe.js';
 import { recordFailure, flushPending } from './fail-log.js';
+import { resolveRoot } from './roots.js';
 
 /** 模块级重入保护 */
 let running = false;
@@ -87,22 +88,16 @@ async function ensureFolder(parentId, title, createdOut) {
 }
 
 /**
- * 把设置里的根 id（'1' 书签栏 / '2' 其他书签）解析成**根文件夹名**。
- *
- * ⚠️ 路径模型（踩过一次的坑）：
+ * 路径模型（踩过一次的坑）：
  *    fromPath 的第 0 段是根**名称**，toPath 则**不含根**（就是 taxonomy 的 '大类/子类'）。
  *    根归到哪是「写到哪儿」的问题，由 settings.targetRoot 决定，所以 plan.js 不参与。
- *    写盘时必须把根名补回去，而 chrome.bookmarks 的 API 要的是**根 id**，
- *    所以这里先由 id 反查名字（根名随界面语言变，不能硬编码）。
+ *    写盘时把根名补回去，再由根名找到根 id。
+ *
+ * ⚠️ 根 id **不是常量**，所以这里不再有任何硬编码，也不再有「兜底返回 '1'」。
+ *    解析与存在性校验全部交给 roots.js 的 resolveRoot()，它会用
+ *    chrome.bookmarks.get() 实测。详见 roots.js 顶部那段事故记录：
+ *    写死 '1' 导致 2026-10-05 的 45 条全军覆没。
  */
-async function resolveRootName() {
-  const settings = await getSettings();
-  const trees = await chrome.bookmarks.getTree();
-  const tops = trees?.[0]?.children || [];
-  const hit = tops.find((t) => String(t.id) === String(settings.targetRoot || '1'));
-  // 兜底：根 id 在任何语言下都是 1（书签栏）
-  return { rootId: hit ? String(hit.id) : '1', rootName: hit ? hit.title : '书签栏' };
-}
 
 /**
  * 确保目标路径存在，返回最深层文件夹 id。
@@ -199,6 +194,25 @@ export async function startExecution(payload) {
   // 抛 `Assignment to constant variable`，整批任务直接启动失败。
   let { plan, duplicates = [], snapshotTs = null } = payload || {};
   if (!plan || !Array.isArray(plan.items)) return { started: false, reason: '计划为空' };
+
+  // ⚠️ 预检：动手之前先确认「归入位置」真的能解析成一个活着的根。
+  //
+  //    2026-10-05 的事故：目标根 id 被写死成 '1'，而 Chrome 154 的账号书签
+  //    模型里书签栏是 279。于是 getChildren('1') 抛错、17 个分类文件夹一个没建成、
+  //    45 条 move 全部报同一句 `Can't find bookmark for id.` ——
+  //    用户只看到「45 条全军覆没」，完全看不出是目标根的问题。
+  //    这里提前一步失败，理由能直接照着做。
+  const preSettings = await getSettings();
+  const preRoot = await resolveRoot(preSettings.targetRoot);
+  if (!preRoot.ok) {
+    return {
+      started: false,
+      reason: `归入位置解析失败：${preRoot.reason}。`
+        + '这是 Chrome 的书签模型换了导致的（根 id 不再是固定的 1/2），'
+        + '不是你的书签有问题。请点「读取并预览」重新算一份计划；'
+        + '如果仍然失败，请到 chrome://extensions 重新加载一次扩展。',
+    };
+  }
 
   // 执行前先落一份快照 —— 回滚是唯一退路，必须在动第一个字节之前就有
   let snapTs = snapshotTs;
@@ -327,35 +341,49 @@ export async function pauseExecution() {
 /**
  * 把 Chrome 的原话翻译成能照着做的中文。
  *
- * ⚠️ 为什么必须翻译：Chrome 对几种**完全不同的**故障只有三句话，
- *    探针实测（tests/e2e/probe-errid.js）：
- *      Can't find bookmark for id.      ← 源书签 id 不存在
- *      Can't find parent bookmark for id.← 目标文件夹 id 不存在
- *      Bookmark id is invalid.          ← id 不是数字
- *    2026-10-05 用户拿到 45 条「Can't find bookmark for id.」，
- *    光看这句既不知道是哪条、也不知道该查什么，只能干瞪眼。
+ * ⚠️⚠️ 这里**刻意不再有「消息 → 原因」的对照表**。
+ *    早先有一张表，是用 tests/e2e/probe-errid.js 在 Playwright 自带的
+ *    chromium 上实测的，结论是「`Can't find bookmark for id.` = 源书签 id 不存在」。
+ *    到了用户本机的 Chrome 154 上，这张表**是错的**：目标根 id 失效导致的
+ *    失败，报的也是同一句话。于是 45 条失败被统一解释成
+ *    「书签被删过或恢复过备份」，我据此加了一整套「按 URL 重新定位 id」的自愈逻辑，
+ *    而真实根因（根 id 写死成 '1'）从头到尾没被看见。
+ *
+ *    教训：**错误文案不是稳定契约，跨 Chrome 版本会变。**
+ *    所以这里改成「只说核实过的事」：把源 id 和目标 id 分别 get() 一遍，
+ *    哪个不存在就点哪个的名字。核实不出来的就明说不知道，不猜。
  *
  * @param {unknown} e
- * @returns {string}
+ * @param {{item?:object, parentId?:string|null}} [ctx] 本次尝试的目标
+ * @returns {Promise<string>}
  */
-export function explainMoveError(e) {
+export async function explainMoveError(e, ctx = {}) {
   const raw = String(e && e.message ? e.message : e);
-  if (/Can't find parent bookmark for id/i.test(raw)) {
-    return `${raw} —— 目标文件夹已经不存在了（可能被其他扩展删掉，或同步覆盖了）。`
-      + '重新点一次「读取并预览」再执行即可。';
+  const bits = [raw];
+
+  const exists = async (id) => {
+    if (id === null || id === undefined || id === '') return false;
+    return !!(await chrome.bookmarks.get(String(id)).then((r) => r && r[0]).catch(() => null));
+  };
+
+  const srcId = ctx.item ? ctx.item.id : null;
+  const [srcOk, parOk] = await Promise.all([exists(srcId), exists(ctx.parentId)]);
+
+  if (!srcOk) {
+    bits.push('这条书签的 id 在当前书签树里已经查不到了（被删过又重建、或恢复过备份都会让 id 失效）');
   }
-  if (/Can't find bookmark for id/i.test(raw)) {
-    return `${raw} —— 这条书签在当前书签树里已经不存在了`
-      + '（删过又重建、或恢复过备份，都会让 id 失效）。'
-      + '请点「读取并预览」重新算一份计划。';
+  if (!parOk) {
+    bits.push('要移过去的那个文件夹不存在 —— 目标根或分类文件夹在这一轮里失效了');
   }
-  if (/Bookmark id is invalid/i.test(raw)) {
-    return `${raw} —— 书签 id 格式不对，节点已被删除。请重新预览。`;
+  if (srcOk && parOk) {
+    bits.push('源和目标都还在，多半是另一个扩展（广告拦截器 / 书签整理类插件）在书签变更时'
+      + '自动重排，或 Chrome 同步覆盖了改动。可先到 chrome://extensions 临时关掉其他'
+      + '有「书签」权限的扩展，再重跑一次');
   }
-  if (/Can't modify the root/i.test(raw)) {
-    return `${raw} —— 不能把书签移动到根目录。`;
+  if (bits.length === 1) {
+    bits.push('（原因未确认。点面板上的「重新导出」把日志发出来，里面带 id 和完整路径）');
   }
-  return raw;
+  return bits.join(' —— ');
 }
 
 /**
@@ -409,8 +437,26 @@ async function run() {
   running = true;
   runToken += 1;
   try {
-    // 根 id/名在整轮里固定，解析一次就够
-    const { rootId, rootName } = await resolveRootName();
+    // 根 id / 根名在整轮里固定，解析一次就够
+    //
+    // ⚠️ 解析不出来就在这里**停掉整轮**，而不是继续跑。
+    //    根 id 错位的后果是 45 条 move 报同一句 `Can't find bookmark for id.`：
+    //    用户看到的是「全部失败」，而真正的原因（目标根不存在）一个字母都没露。
+    //    宁可一条都不搬并说清原因，也不要产出 45 条一模一样的噪音。
+    const settings = await getSettings();
+    const root = await resolveRoot(settings.targetRoot);
+    if (!root.ok) {
+      await mutateMany([K.TASK_CURRENT], (cur) => {
+        const t = { ...(cur?.[K.TASK_CURRENT] || {}) };
+        t.status = TASK_STATUS.FAILED;
+        t.failed = [...(t.failed || []), { id: '-', url: '', title: '（整轮未启动）', error: `归入位置解析失败：${root.reason}` }];
+        t.updatedAt = Date.now();
+        return { [K.TASK_CURRENT]: t };
+      }, {});
+      return;
+    }
+    const rootId = root.id;
+    const rootName = root.title;
     let sinceYield = 0;
     for (;;) {
       const task = await getTask();
@@ -435,8 +481,12 @@ async function run() {
         return;
       }
 
+      // parentId 提到 try 外面：catch 要靠它核实「目标文件夹到底还在不在」，
+      // 而核实结果决定错误文案怎么说 —— 早先那张凭错误文案猜原因的对照表
+      // 就是这么把诊断带偏的（见 explainMoveError 的注释）。
+      let parentId = null;
       try {
-        const parentId = await ensureTargetFolder(task, rootId, [rootName, ...next.toPath]);
+        parentId = await ensureTargetFolder(task, rootId, [rootName, ...next.toPath]);
         await chrome.bookmarks.move(next.id, { parentId });
         // ⚠️ 写完必须回读校验 —— 这是本次踩坑的直接教训。
         //
@@ -457,7 +507,7 @@ async function run() {
         });
       } catch (e) {
         // 单条失败不中断，记原因继续
-        const reason = explainMoveError(e);
+        const reason = await explainMoveError(e, { item: next, parentId });
         const failed = [...(task.failed || []), {
           id: next.id, url: next.url, title: next.title, error: reason,
         }];

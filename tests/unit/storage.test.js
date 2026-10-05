@@ -163,13 +163,15 @@ test('getTask 无记录时返回空壳（调用方不必到处判空）', async 
 
 test('getSettings 合并默认值', async () => {
   const s = await S.getSettings();
-  assert.equal(s.targetRoot, '1');
+  // ⚠️ 存的是**语义键**不是根 id。写死 '1' 的那版让 2026-10-05 的 45 条书签全军覆没
+  // （Chrome 154 的书签栏 id 是 279），真实 id 由 roots.js 运行时解析。
+  assert.equal(s.targetRoot, 'bar');
   assert.equal(s.llmEnabled, true, 'LLM 兜底默认开启');
   assert.equal(s.baseUrl, 'https://api.deepseek.com', '默认走 DeepSeek');
   assert.equal(s.model, 'deepseek-flash');
   assert.equal(s.apiKey, '', '注入的 key 不进 storage，默认必须为空');
-  await S.updateSettings({ targetRoot: '2' });
-  assert.equal((await S.getSettings()).targetRoot, '2');
+  await S.updateSettings({ targetRoot: 'other' });
+  assert.equal((await S.getSettings()).targetRoot, 'other');
   assert.equal((await S.getSettings()).llmEnabled, true, '未提供的字段应回落默认值');
 });
 

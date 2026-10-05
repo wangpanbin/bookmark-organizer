@@ -10,6 +10,7 @@
  */
 
 import { readFlatTree } from '../src/tree.js';
+import { listRoots, pickRootKey, resolveRoot } from '../src/roots.js';
 import { findDuplicates, toRemovalList, dedupeStats } from '../src/dedupe.js';
 import { buildPlan, setRules, selectForLlm, REASON } from '../src/plan.js';
 import { DEFAULT_RULES } from '../src/classify/dict.js';
@@ -720,19 +721,12 @@ function openPicker(itemId) {
  *    书签栏看上去「一点没变」，面板还弹「整理完成」。
  *    用户只能靠猜「到底搬到哪去了」。所以确认弹窗和完成提示都必须写明根名。
  *
- * @returns {Promise<{id: string, name: string}>}
+ * @returns {Promise<{ok:boolean, id:string|null, name:string, reason?:string}>}
  */
 async function resolveTargetRoot() {
   const settings = await getSettings();
-  const id = String(settings.targetRoot || '1');
-  try {
-    const trees = await chrome.bookmarks.getTree();
-    const hit = (trees?.[0]?.children || []).find((t) => String(t.id) === id);
-    // 兜底只能给 id 契约下的默认值 —— 根标题是本地化的，不能硬编码中文名
-    return { id, name: hit ? (hit.title || id) : '书签栏' };
-  } catch {
-    return { id, name: '书签栏' };
-  }
+  const root = await resolveRoot(settings.targetRoot);
+  return { ok: root.ok, id: root.id, name: root.title || '', reason: root.reason };
 }
 
 async function doExecute() {
@@ -740,6 +734,16 @@ async function doExecute() {
   if (!plan) return;
   const dups = state.dupPayload;
   const root = await resolveTargetRoot();
+
+  // ⚠️ 归入位置解析不出来就地拦下，别让用户点完确认才看结果。
+  //    这一条是 2026-10-05 那次全军覆没的直接补丁：根 id 写死成 '1'，
+  //    而 Chrome 154 的书签栏是 279，于是 17 个分类文件夹一个没建成、45 条全失败。
+  if (!root.ok) {
+    toast(`归入位置解析失败，已取消整理：${root.reason || '未知原因'}`
+      + '（Chrome 换了书签模型，顶层文件夹 id 不再是固定的 1/2；你的书签都在，没丢）'
+      + '请点「读取并预览」重新算一份计划；仍然失败就到 chrome://extensions 重新加载扩展。', true);
+    return;
+  }
 
   // 将要新建的**顶层**文件夹名 —— 用户靠它就能预判整理后的书签栏长什么样
   const newTops = [...new Set(plan.newFolders
@@ -1012,7 +1016,41 @@ function renderPresetSelect() {
 
 async function loadSettingsUi() {
   const s = await getSettings();
-  $('targetRoot').value = s.targetRoot;
+
+  // ── 归入位置：选项由活着的书签树生成 ──
+  //
+  // ⚠️ 为什么不用 HTML 里写死的选项：根 id 不是常量，标签也随 Chrome 的语言变。
+  //    早先这里是 `<option value="1">书签栏</option>`，value 直接当根 id 用 ——
+  //    Chrome 154 的书签栏是 279，于是每一次整理的 45 条 move 全部失败。
+  //    现在 value 是语义键（bar / other），标签从 live tree 取，
+  //    真实 id 每次使用时由 roots.js 现查。
+  const sel = $('targetRoot');
+  let roots = [];
+  try {
+    roots = await listRoots();
+  } catch { /* 读不到就沿用 HTML 里的兜底选项 */ }
+
+  const writable = roots.filter((r) => r.key);
+  if (writable.length) {
+    const cur = sel.value;
+    sel.textContent = '';
+    for (const r of writable) {
+      const opt = document.createElement('option');
+      opt.value = r.key;
+      opt.textContent = r.title || r.key;   // 标签跟随 Chrome 的界面语言
+      sel.appendChild(opt);
+    }
+    // 设置里可能是旧值（'1' / '2' / 某个已失效的 id），统一翻译成语义键
+    const key = pickRootKey(s.targetRoot, writable);
+    sel.value = writable.some((r) => r.key === key) ? key : writable[0].key;
+    // 顺手把旧值就地迁移掉：存着 '1' 迟早还会有人拿它当 id 用
+    if (String(s.targetRoot) !== sel.value) {
+      await updateSettings({ targetRoot: sel.value });
+    }
+  } else {
+    sel.value = pickRootKey(s.targetRoot, []);
+  }
+
   $('llmEnabled').checked = !!s.llmEnabled;
   $('llmBaseUrl').value = s.baseUrl;
   $('llmModel').value = s.model;

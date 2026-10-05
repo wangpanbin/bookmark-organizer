@@ -4,12 +4,20 @@
  * flattenTree 是纯函数（不碰 chrome），可在 Node 下单测；
  * readTree 是唯一的 chrome 入口。
  *
- * ⚠️ 移动设备书签根（Chrome 恒为 id '3'）是只读的：move() 进去/出来都会失败。
+ * ⚠️ 移动设备书签根是只读的：move() 进去/出来都会失败。
  *    必须在扁平化阶段就标出来，而不是等执行时逐条失败。
+ *
+ * ⚠️⚠️ 只读根的判定**不能只写死 id === '3'**：根 id 不是常量。
+ *    Chrome 154 的账号书签模型里移动设备书签是 281（书签栏 279 / 其他书签 280），
+ *    只认 '3' 就会漏判，条目被当成可写项送进计划，执行时逐条失败。
+ *    所以按**位置**（第 3 个顶层根）+ 标题 + id 三重判定。
  */
 
 const SYNCED_ROOT_ID = '3';
 const READ_ONLY_NAMES = ['移动设备书签', '移动设备', '手机书签', 'Mobile bookmarks'];
+
+/** 跨 Chrome 版本都成立的那条判据：第 3 个顶层根是只读的移动设备书签 */
+const MOBILE_ROOT_INDEX = 2;
 
 /**
  * 读整棵树。
@@ -21,11 +29,14 @@ export async function readTree() {
 
 /**
  * 判断某个根节点是否只读。
+ *
  * @param {object} node
+ * @param {number} [index] 它在顶层根里的下标。给了就按位置判 —— 这条跨 Chrome 版本都成立
  * @returns {boolean}
  */
-export function isReadOnlyRoot(node) {
+export function isReadOnlyRoot(node, index) {
   if (!node) return false;
+  if (typeof index === 'number' && index >= MOBILE_ROOT_INDEX) return true;
   if (String(node.id) === SYNCED_ROOT_ID) return true;
   return READ_ONLY_NAMES.includes(String(node.title || '').trim());
 }
@@ -63,9 +74,9 @@ export function flattenTree(trees) {
     }
   };
 
-  for (const top of tops) {
-    walk(top, [], top.id === SYNCED_ROOT_ID ? '0' : '-1', 0, isReadOnlyRoot(top));
-  }
+  tops.forEach((top, i) => {
+    walk(top, [], top.id === SYNCED_ROOT_ID ? '0' : '-1', 0, isReadOnlyRoot(top, i));
+  });
   return out;
 }
 

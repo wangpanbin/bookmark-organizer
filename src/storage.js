@@ -197,8 +197,17 @@ export const DEFAULT_SETTINGS = Object.freeze({
   baseUrl: 'https://api.deepseek.com',
   model: 'deepseek-flash',
   apiKey: '',
-  /** 目标顶层根：'1' = 书签栏，'2' = 其他书签 */
-  targetRoot: '1',
+  /**
+   * 目标顶层根。
+   *
+   * ⚠️ 这里存的是**语义键**（'bar' / 'other'），**不是根 id**。
+   *    早先存的是 '1' / '2'，默认「根 id 恒为 1/2/3」——
+   *    而根 id 根本不是常量：Chrome 154 的账号书签模型里实测是
+   *    书签栏=279 / 其他书签=280 / 移动设备=281，传统 Bookmarks 文件被清空。
+   *    于是 2026-10-05 用户 45 条书签全军覆没（17 个分类文件夹一个也没建成）。
+   *    真实 id 由 roots.js 在每次使用时从活着的书签树解析。
+   */
+  targetRoot: 'bar',
   /** 快照保留份数 */
   keepSnapshots: 10,
   /** 自动去重 */

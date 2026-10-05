@@ -118,7 +118,7 @@ const SCENARIOS = {
 
   /** 用户把「归入位置」改成了「其他书签」——面板顶部那个下拉框 */
   async otherRoot(page) {
-    await page.selectOption('#targetRoot', '2');
+    await page.selectOption('#targetRoot', 'other');
     await seedBookmarks(page, [
       { title: 'GitHub', url: 'https://github.com/a/b' },
       { title: 'Redis', url: 'https://redis.io/docs/latest/' },
@@ -238,9 +238,20 @@ async function runScenario(name) {
         for (const f of a.stored.failed.slice(0, 5)) say(`     失败：${f}`);
       }
       const settings = await page.evaluate(async () => (await chrome.storage.local.get('settings')).settings || {});
-      const rootId = String(settings.targetRoot || '1');
-      const expectRootName = a.after.roots[rootId];
-      say(`  目标根：id=${rootId} 名称=${expectRootName}`);
+      // ⚠️ targetRoot 存的是**语义键**（bar / other），不是根 id。
+      //    根 id 不是常量（Chrome 154 的书签栏是 279），所以这里**独立地**
+      //    按位置从活着的树上取根名（第 0 个=书签栏，第 1 个=其他书签）——
+      //    刻意不 import 产品的 roots.js，否则闸门和产品一起错就一起绿。
+      const rootKey = String(settings.targetRoot || 'bar');
+      const expectRootName = await page.evaluate(async (k) => {
+        const t = await chrome.bookmarks.getTree();
+        const tops = t?.[0]?.children || [];
+        return (k === 'other' ? tops[1] : tops[0])?.title || null;
+      }, rootKey);
+      if (!expectRootName) {
+        bad.push(`${name}: 解析不出目标根（targetRoot=${rootKey}），这条断言无法执行 —— 按失败计`);
+      }
+      say(`  目标根：键=${rootKey} 名称=${expectRootName}`);
       const r = assertPlaced({ stored: a.stored, after: a.after, expectRootName, label: name });
       bad.push(...r.bad);
       say(`  落位核对：${r.total - r.bad.length}/${r.total} 条正确`);
