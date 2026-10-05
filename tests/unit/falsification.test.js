@@ -154,19 +154,68 @@ test('证伪：闸门对所有写操作模块都敏感', () => {
   }
 });
 
-test('证伪：import 扫描器能认全部 ESM 写法', () => {
-  const text = [
-    "import { a } from './a.js';",
-    "import b from '../b.js';",
-    "import * as c from './c.js';",
-    "import './side-effect.js';",
-    "export { d } from './d.js';",
-  ].join('\n');
-  const specs = extractImports(text);
-  assert.ok(specs.includes('./a.js'), '具名 import 没识别');
-  assert.ok(specs.includes('../b.js'), '相对父级 import 没识别');
-  assert.ok(specs.includes('./c.js'), 'namespace import 没识别');
-  assert.ok(specs.includes('./d.js'), 're-export 没识别');
+test('证伪：import 扫描器能认全部 ESM 写法（含跨行与动态导入）', () => {
+  // 每一种都必须被抓到。少一种，dry-run 零写入闸门就多一类绕过。
+  const MUST_CATCH = [
+    ['单行具名', "import { a } from './a.js';"],
+    ['相对父级', "import b from '../b.js';"],
+    ['单行 namespace', "import * as c from './c.js';"],
+    ['副作用导入', "import './side-effect.js';"],
+    ['re-export 具名', "export { d } from './d.js';"],
+    ['re-export star', "export * from './e.js';"],
+    ['re-export star as', "export * as ns from './f.js';"],
+    ['多行具名', "import {\n  a,\n  b,\n} from './g.js';"],
+    ['多行 re-export', "export {\n  h,\n} from './h.js';"],
+    ['多行 默认+具名', "import i, {\n  j,\n} from './i.js';"],
+    ['多行 namespace', "import *\n  as k\n  from './k.js';"],
+    ['from 换行', "import {\n  l\n} from\n  './l.js';"],
+    ['动态导入', "const m = await import('./m.js');"],
+  ];
+  for (const [label, text] of MUST_CATCH) {
+    const specs = extractImports(text);
+    const want = text.match(/['"](\.[^'"]+)['"]/)[1];
+    assert.ok(specs.includes(want), `${label} 没被识别：${JSON.stringify(text)} -> ${JSON.stringify(specs)}`);
+  }
+});
+
+test('证伪：闸门不能因为「看起来像导入」而误报', () => {
+  // 反方向同样要钉死：误报会让闸门因为错误的原因而红，
+  // 那和闸门从来没红过一样没用 —— 大家只会学会忽略它。
+  const MUST_NOT_FLAG = [
+    ['JSDoc 类型位置 import()', "/**\n * @param {import('./apply.js').Foo} x\n */\nexport const f = (x) => x;"],
+    ['行注释里的具名 import', "// import { a } from './apply.js';\nexport const y = 1;"],
+    ['块注释里的副作用 import', "/* import './apply.js'; */\nexport const y = 1;"],
+    ['块注释里的多行 import', "/*\n * import {\n *   a,\n * } from './apply.js';\n */\nexport const y = 1;"],
+    ['字符串里的 https://', "export const u = 'https://example.com/a';\nexport const z = 2;"],
+    ['干净的纯链路源码', "import { a } from './normalize.js';\nexport const x = a;"],
+  ];
+  for (const [label, text] of MUST_NOT_FLAG) {
+    assert.deepEqual(
+      findForbiddenImports([{ rel: 'plan.js', text }]), [],
+      `${label} 被误报了 —— 闸门会因为错误的原因而红`,
+    );
+  }
+});
+
+test('证伪：动态 import 写操作模块同样算违规', () => {
+  // 动态 import 的作用域和时机由运行时决定，闸门没法证明它安全。
+  const src = "import { a } from './normalize.js';\nasync function go(){ return import('./apply.js'); }";
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: src }]),
+    ['plan.js → ./apply.js'],
+    '动态 import 绕过零写入闸门',
+  );
+});
+
+test('证伪：跨行注入的写操作 import 必须被抓到', () => {
+  // 这条对应历史上真实存在的洞：扫描器曾用 `[^;\n]*?`，禁掉换行，
+  // 于是 `import {\n applyPlan,\n} from './apply.js'` 整条绕过。
+  const DIRTY = "import {\n  applyPlan,\n} from './apply.js';\nexport const x = applyPlan;\n";
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: DIRTY }]),
+    ['plan.js → ./apply.js'],
+    '多行 import 绕过了零写入闸门 —— 扫描器又变回摆设了',
+  );
 });
 
 // ───────────────── 4. 幂等闸门能红吗 ─────────────────

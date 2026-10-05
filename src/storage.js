@@ -174,6 +174,7 @@ export const K = {
   TASK_CURRENT: 'task:current',
   STATS: 'stats',
   MANUAL_ASSIGNMENTS: 'manual:assignments',
+  DEDUPE_VETO: 'dedupe:veto',
   LAST_PLAN: 'plan:last',
   PENDING_COUNT: 'pending:count',
   TREE_VERSION: 'tree:version',
@@ -240,4 +241,44 @@ export async function getTask() {
       snapshotTs: null,
     }
   );
+}
+
+// ───────────────────── 去重逐条否决 ─────────────────────
+
+/**
+ * 读「不要删」的条目 id 列表。
+ *
+ * ⚠️ 这里必须存 **id** 而不是 URL。
+ *    重复项彼此的 URL 是同一个（否则就不算重复了），
+ *    按 URL 记会把该组的**保留项也一起保住**，等于去重完全失效。
+ *    id 恰好也是执行器 chrome.bookmarks.remove() 用的键，两边对齐。
+ */
+export async function getDedupeVeto() {
+  const v = await get(K.DEDUPE_VETO, []);
+  return Array.isArray(v) ? v.map(String) : [];
+}
+
+/** 某条是否被否决（不删） */
+export function isDedupeVetoed(id, vetoList) {
+  return (vetoList || []).includes(String(id));
+}
+
+/** 否决/取消否决一条。读-改-写走 mutate，全程持串行锁。 */
+export function toggleDedupeVeto(id, on) {
+  return mutate(
+    K.DEDUPE_VETO,
+    (cur) => {
+      const s = new Set(Array.isArray(cur) ? cur.map(String) : []);
+      const k = String(id);
+      if (on) s.add(k);
+      else s.delete(k);
+      return [...s];
+    },
+    [],
+  );
+}
+
+/** 清空所有否决 */
+export function clearDedupeVeto() {
+  return set(K.DEDUPE_VETO, []);
 }

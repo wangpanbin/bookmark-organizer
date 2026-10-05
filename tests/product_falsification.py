@@ -53,6 +53,26 @@ CASES = [
         os.path.join("src", "apply.js"),
     ),
     (
+        "计划生成引入【跨行】写操作 import（扫描器曾用 [^;\\n]*?，整类绕过）",
+        os.path.join("src", "plan.js"),
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';",
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';\n"
+        "import {\n"
+        "  isRunnerActive,\n"
+        "} from './apply.js';   // ← 证伪补丁：跨行形态的多行 import",
+        ["写操作", "零写入", "plan.js", "闸门"],
+        os.path.join("src", "apply.js"),
+    ),
+    (
+        "计划生成引入动态 import 写操作模块（作用域由运行时决定，闸门不能放过）",
+        os.path.join("src", "plan.js"),
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';",
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';\n"
+        "const lazyApply = () => import('./apply.js');   // ← 证伪补丁：动态 import 写操作模块",
+        ["写操作", "零写入", "plan.js", "闸门", "动态"],
+        os.path.join("src", "apply.js"),
+    ),
+    (
         "字典位置参数错位（pathWords 落进 domains，标题匹配全废）",
         os.path.join("src", "classify", "dict.js"),
         "const R = (to, domains = [], pathWords = [], titleWords = [], domainSuffixes = []) => ({",

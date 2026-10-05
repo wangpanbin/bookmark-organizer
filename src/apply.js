@@ -16,6 +16,7 @@
 
 import {
   get, set, mutate, mutateMany, setVerified, K, TASK_STATUS, getTask, getSettings,
+  getDedupeVeto, isDedupeVetoed,
 } from './storage.js';
 import { toRemovalList } from './dedupe.js';
 
@@ -305,13 +306,21 @@ async function run() {
 /**
  * 处理待删除的重复项。返回被删除的条目清单（回滚时要重建）。
  * 删除是不可逆的，所以清单必须落到 task.removedDuplicates。
+ *
+ * ⚠️ 这里再查一次否决名单，是**兜底**而不是重复劳动：
+ *    面板在生成 payload 时已经过滤过一遍，但 payload 落进 storage 后可能被
+ *    下一轮预览覆盖、或来自上一次会话的残留计划。
+ *    「用户明确说不删的条目被执行器删掉」是不可逆损失，
+ *    所以执行侧必须自己认否决名单，不能只信上游。
  */
-async function processDuplicates(task) {
+export async function processDuplicates(task) {
   const list = Array.isArray(task.duplicates) ? task.duplicates : [];
   if (!list.length) return task.removedDuplicates || [];
 
+  const veto = await getDedupeVeto();
   const removed = [...(task.removedDuplicates || [])];
   for (const d of list) {
+    if (isDedupeVetoed(d.id, veto)) continue;   // ← 用户否决过，跳过
     try {
       await chrome.bookmarks.remove(d.id);
       removed.push({ url: d.url, title: d.title, path: d.path, keepId: d.keepId });

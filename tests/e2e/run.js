@@ -8,6 +8,9 @@
  *   4. 备份回滚
  *   5. 断点续跑（模拟 SW 被回收）
  *   6. SW 回收后 UI 仍能读出完整数据（不能「计数有值但列表空」）
+ *   7. 去重不误删 SPA 路由
+ *   8. 锁定条目不进执行队列
+ *   9. 去重逐条否决：勾了「不删」的条目执行后仍在，没勾的照删
  */
 
 import test from 'node:test';
@@ -15,7 +18,7 @@ import assert from 'node:assert/strict';
 
 import {
   launchWithExtension, openPanel, seedBookmarks, treeSignature,
-  makeFixtures, makeDuplicateFixtures, runPreview, readStats, readReportStatus,
+  makeFixtures, makeDuplicateFixtures, makeVetoFixtures, runPreview, readStats, readReportStatus,
   waitForExecutionDone, waitForPartialProgress, waitForReportStatus, cleanupAll,
 } from './harness.js';
 
@@ -280,6 +283,105 @@ test('锁定：锁定的条目不进执行队列', async () => {
 
     const after = Number((await readStats(page)).move);
     assert.equal(after, before - 1, '锁定后待移动条数没有减 1');
+  } finally {
+    await ctx.close();
+  }
+});
+
+// ───────────────────── 9. 去重逐条否决 ─────────────────────
+
+test('去重逐条否决：勾了「不删」的条目执行后仍在，没勾的照删', async () => {
+  const FIXTURES = makeVetoFixtures();
+  const urlOf = (title) => (FIXTURES.find((f) => f.title === title) || {}).url;
+
+  const { ctx, extensionId } = await launchWithExtension();
+  try {
+    const page = await openPanel(ctx, extensionId);
+    await seedBookmarks(page, FIXTURES);
+
+    await runPreview(page);
+    await page.click('#tabs button[data-tab="dup"]');
+
+    // 精确定位 A 组那条待删项。
+    // ⚠️ 不靠「某段文本出现了」等条件 —— 那类判据在面板 init() 之后就可能成立，
+    //    会在真实渲染出来之前提前返回，然后读到上一轮的空清单。
+    //    这里等的是带 data-dup-id 且带 .label 的完整 li，读到即渲染完成。
+    const handle = await page
+      .waitForFunction(
+        () => {
+          const li = [...document.querySelectorAll('#dupList li.drop')].find(
+            (n) => (n.querySelector('.label')?.textContent || '').includes('否决组-待删'),
+          );
+          if (!li || !li.dataset.dupId) return null;
+          if (!li.querySelector('input.veto')) return null;
+          return { dupId: li.dataset.dupId, text: li.querySelector('.label').textContent };
+        },
+        null,
+        { timeout: 20000 },
+      )
+      .then((h) => h.jsonValue());
+    assert.ok(handle, 'A 组的待删项没渲染出来，这条闸门测不到东西');
+
+    // 勾上「不删」，然后等 previewSeq 再涨一次（onVeto 会重跑一遍分类）
+    const seqBefore = await page.evaluate(() => Number(document.body.dataset.previewSeq || 0));
+    await page.click(`#dupList li.drop[data-dup-id="${handle.dupId}"] input.veto`);
+    await page.waitForFunction(
+      (n) => Number(document.body.dataset.previewSeq || 0) > n,
+      seqBefore,
+      { timeout: 20000 },
+    );
+
+    // 勾完之后该行文案必须变成「不删：」——
+    // 勾了却看不出任何变化，用户就没法确认自己的否决生效了。
+    const afterVeto = await page.evaluate(
+      (id) => document.querySelector(`#dupList li.drop[data-dup-id="${id}"] .label`)?.textContent || '',
+      handle.dupId,
+    );
+    assert.match(afterVeto, /^不删：/, `勾了「不删」但文案没变：${afterVeto}`);
+
+    // 两组的待删项都还列在清单里 —— 否决只改这一行的状态，不会让整组从清单消失，
+    // 否则用户勾了之后清单会自己少一行，反而看不出否决的是哪条。
+    const dropCount = await page.evaluate(() => document.querySelectorAll('#dupList li.drop').length);
+    assert.equal(dropCount, 2, `否决一条后清单里应仍列着 2 条待删，实际 ${dropCount}`);
+
+    // 但**执行载荷**必须只剩 1 条：被否决的那条不能进删除队列。
+    // 这条断言是本闸门的核心 —— 载荷里还留着它，执行器就会去删。
+    const dupCount = await page.evaluate(async () => {
+      const got = await chrome.storage.local.get('plan:last');
+      return (got['plan:last']?.duplicates || []).length;
+    });
+    assert.equal(dupCount, 1, `执行载荷里应只剩 1 条待删，实际 ${dupCount}`);
+
+    await page.click('#btnExecute');
+    await waitForExecutionDone(page, 90000);
+
+    // 读书签树是允许用 chrome.* 的两处之一（另一处是造夹具）
+    const urls = await page.evaluate(async () => {
+      const out = [];
+      const walk = (nodes) => {
+        for (const n of nodes || []) {
+          if (n.url) out.push(n.url);
+          walk(n.children);
+        }
+      };
+      walk(await chrome.bookmarks.getTree());
+      return out;
+    });
+
+    const vetoKept = urlOf('否决组-待删');
+    const controlDropped = urlOf('对照组-待删');
+    assert.ok(
+      urls.includes(vetoKept),
+      `勾了「不删」的条目被删掉了（${vetoKept}）—— 不可逆数据损失`,
+    );
+    assert.ok(
+      !urls.includes(controlDropped),
+      `没勾的对照组条目没被删（${controlDropped}）—— 否决被当成了全局跳过`,
+    );
+    // 两条保留项都必须在
+    for (const t of ['否决组-保留', '对照组-保留']) {
+      assert.ok(urls.includes(urlOf(t)), `保留项 ${urlOf(t)} 不见了`);
+    }
   } finally {
     await ctx.close();
   }

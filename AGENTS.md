@@ -19,7 +19,11 @@ Chrome MV3 书签整理扩展。原生 ES Module，零构建，`load unpacked` �
 
 ## 三条不可破的约束
 
-1. **`plan.js` 不 import 任何写操作模块。** 这是 dry-run 零写入的全部依据，由 `tests/unit/plan.test.js` 的静态断言守着（import 扫描要覆盖具名/默认/namespace/副作用/re-export 五种写法，漏掉副作用导入就能整条绕过）。
+1. **`plan.js` 不 import 任何写操作模块。** 这是 dry-run 零写入的全部依据，由 `tests/unit/plan.test.js` 的静态断言守着。扫描器（`tests/helpers/sourceScan.js`）必须同时覆盖：具名 / 默认 / namespace / 副作用 / re-export / **跨行子句** / **动态 import**，且**扫描前先去掉注释**。
+   - 漏掉副作用导入 → `import './apply.js'` 整条绕过。
+   - 子句正则用 `[^;\n]*?` → `import {\n a,\n} from './apply.js'` 整类绕过。
+   - 不去注释 → JSDoc 里的 `{import('./x.js')}` 被当真导入，闸门**因为错误的原因而红**。
+   - 三条都有对应的长期回归：`npm run test:falsify` 里的跨行/动态两个用例，加 `falsification.test.js` 里的误报用例。
 2. **`storage.js` 的读-改-写在同一个串行临界区内。** 不采用「内存累积 + hydrate」，那种写法要防的竞态恰是它自己引入的。
 3. **去重保留 hash 路由、只剥跟踪参数白名单。** `example.com/#/settings` 与 `example.com/#/profile` 是两个页面；过度归一化会把它们判成重复，进而删掉用户真收藏的条目。
 

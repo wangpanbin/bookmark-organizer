@@ -163,6 +163,12 @@ tr.is-skipped { opacity: .55; }
 .dup ul { margin: 0; padding-left: 18px; font-size: 13px; }
 .dup .keep { color: var(--ok); }
 .dup .drop { color: var(--danger); text-decoration: line-through; text-decoration-color: var(--danger); }
+.dup .drop .veto { margin-right: 6px; vertical-align: -1px; }
+.dup .drop .label { text-decoration: none; }
+/* 被勾了「不删」的条目：撤掉删除线并换成中性色，
+   否则它和真要删的条目长得一样，用户会以为自己否决没生效。 */
+.dup .drop.vetoed { color: var(--muted); text-decoration: none; }
+.dup .drop.vetoed .label { color: var(--ok); }
 
 /* ── 快照 ── */
 .snap-list { display: flex; flex-direction: column; gap: 8px; }

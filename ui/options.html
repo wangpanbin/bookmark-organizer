@@ -88,7 +88,9 @@
       <p class="hint">
         同一页面被收藏多次。保留一条、删除其余。<b>删除不可逆</b>，但可以通过「恢复备份」找回。
         归一化只剥「纯顶部锚点」白名单里的 hash，<b>SPA 路由（#/a 与 #/b）一律保留</b>，不会误判。
+        <b>每一条都可以单独勾「不删」</b>，勾上的条目不会进删除清单。
       </p>
+      <button class="ghost" id="btnClearVeto" type="button">清除全部「不删」标记</button>
     </div>
     <div id="dupList" class="dup-list"></div>
     <p class="empty" id="dupEmpty">没有发现重复项。</p>

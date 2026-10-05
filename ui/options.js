@@ -19,6 +19,7 @@ import {
 import { dedupeKey, hostOf, parseUrl, isExcludedUrl } from '../src/normalize.js';
 import {
   get, set, mutate, K, getSettings, updateSettings, getTask, TASK_STATUS,
+  getDedupeVeto, isDedupeVetoed, toggleDedupeVeto, clearDedupeVeto,
 } from '../src/storage.js';
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot } from '../src/backup.js';
 import {
@@ -37,6 +38,7 @@ const state = {
   plan: null,
   groups: [],
   dupPayload: [],
+  veto: [],          // 被否决「不删」的重复项条目 id
   taxonomy: DEFAULT_TAXONOMY,
   snapshotTs: null,
   llmErrors: [],
@@ -107,14 +109,16 @@ async function loadAndClassify(opts) {
   }
 
   busy('正在分类…');
-  const [settings, learned, locks, manual, taxOverride] = await Promise.all([
+  const [settings, learned, locks, manual, taxOverride, veto] = await Promise.all([
     getSettings(),
     get(K.RULES_LEARNED, []),
     get(K.LOCKS, []),
     get(K.MANUAL_ASSIGNMENTS, {}),
     get(K.TAXONOMY_OVERRIDE, null),
+    getDedupeVeto(),
   ]);
   state.taxonomy = getTaxonomy(taxOverride);
+  state.veto = veto;
 
   setRules(DEFAULT_RULES);
   let plan = buildPlan({
@@ -151,10 +155,14 @@ async function loadAndClassify(opts) {
 
   // 去重
   state.groups = settings.dedupeEnabled ? findDuplicates(state.entries) : [];
-  state.dupPayload = toRemovalList(state.groups).map((d) => {
-    const src = state.byId.get(d.id);
-    return { id: d.id, url: d.url, title: d.title, path: src?.path || ['2'], keepId: d.keepId };
-  });
+  // 被否决的条目不进执行载荷 —— README 承诺「待删条目逐条可否决」，
+  // 过滤放在这里才能让确认弹窗的删除数和真正会删的数一致。
+  state.dupPayload = toRemovalList(state.groups)
+    .filter((d) => !isDedupeVetoed(d.id, state.veto))
+    .map((d) => {
+      const src = state.byId.get(d.id);
+      return { id: d.id, url: d.url, title: d.title, path: src?.path || ['2'], keepId: d.keepId };
+    });
 
   state.plan = plan;
   await set(K.LAST_PLAN, { plan, duplicates: state.dupPayload, snapshotTs: state.snapshotTs });
@@ -320,15 +328,44 @@ function renderDup() {
     ul.append(liKeep);
 
     for (const d of g.duplicates) {
+      const vetoed = isDedupeVetoed(d.id, state.veto);
       const li = document.createElement('li');
-      li.className = 'drop';
-      li.textContent = `删除：${d.title || d.url} — ${displayPath(d.path)}`;
+      li.className = vetoed ? 'drop vetoed' : 'drop';
+      // data-dup-id 供 E2E 精确定位某一条，不靠文本匹配
+      li.dataset.dupId = String(d.id);
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'veto';
+      cb.checked = vetoed;
+      cb.title = '勾上=这条不删';
+      cb.addEventListener('change', () => onVeto(d.id, cb.checked));
+
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = vetoed
+        ? `不删：${d.title || d.url} — ${displayPath(d.path)}`
+        : `删除：${d.title || d.url} — ${displayPath(d.path)}`;
+
+      li.append(cb, label);
       ul.append(li);
     }
     div.append(key, ul);
     frag.append(div);
   }
   box.append(frag);
+}
+
+/**
+ * 逐条否决/取消否决。
+ * 勾上 = 「这条我不要你删」，所以语义上 vetoed = 不进删除清单。
+ */
+async function onVeto(dupId, on) {
+  await toggleDedupeVeto(dupId, on);
+  state.veto = await getDedupeVeto();
+  // 重新走一遍分类，把过滤后的 dupPayload 和确认弹窗的计数一起对齐
+  await loadAndClassify({ backup: false });
+  toast(on ? '已标记为不删' : '已恢复为待删除');
 }
 
 async function renderSnapshots() {
@@ -571,6 +608,9 @@ async function doExecute() {
     `　移动　　${plan.items.length} 条`,
     `　新建　　${plan.newFolders.length} 个文件夹`,
     `　删除　　${dups.length} 条重复项`,
+    // 把否决条数摆出来：用户勾了「不删」却看不到任何变化，
+    // 就只能靠猜这份清单到底准不准 —— 那等于没给否决权。
+    ...(state.veto.length ? [`　　　　　（其中 ${state.veto.length} 条已被你标记为不删）`] : []),
     '',
     `快照：${state.snapshotTs ? new Date(Number(state.snapshotTs)).toLocaleString() : '（将自动创建）'}`,
     '',
@@ -868,6 +908,14 @@ async function init() {
   $('targetRoot').addEventListener('change', async (e) => {
     await updateSettings({ targetRoot: e.target.value });
     toast('已保存，重新预览即可');
+  });
+
+  // 去重逐条否决
+  $('btnClearVeto').addEventListener('click', async () => {
+    if (!state.veto.length) { toast('当前没有「不删」标记'); return; }
+    await clearDedupeVeto();
+    await loadAndClassify({ backup: false });
+    toast('已清除全部「不删」标记');
   });
 
   // 人工干预清理

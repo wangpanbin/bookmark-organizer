@@ -34,7 +34,11 @@ export const MODEL_PRESETS = [
   { label: 'DeepSeek · flash（默认，非思考模式）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' },
   { label: 'DeepSeek · pro（更强，较慢较贵）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro' },
   { label: 'DeepSeek · v4-flash（旧名，仍可调用）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
-  { label: 'DeepSeek · reasoner（思考模式，不支持 temperature）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-reasoner' },
+  // ⚠️ 不要再把 `deepseek-reasoner` 加回预设列表：
+  //    本文件下方的 400 错误提示明确写了 DeepSeek 已公告它于 2026-07-24 弃用。
+  //    预置一个自家文档说已下线的模型名，等于让用户每次都去撞一次 400。
+  //    思考型模型的手工用法仍然支持 —— callOnce 按模型名里的 reasoner/thinking
+  //    自动关掉 json_mode 和 temperature，与是否在预设里无关。
   { label: '阿里云百炼 · qwen-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
   { label: '阿里云百炼 · qwen-turbo（更便宜）', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-turbo' },
   { label: 'OpenAI · gpt-4o-mini', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },

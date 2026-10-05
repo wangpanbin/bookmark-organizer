@@ -171,6 +171,27 @@ export function makeDuplicateFixtures() {
 }
 
 /**
+ * 「去重逐条否决」闸门的夹具：**两组**重复项。
+ *
+ * 为什么要两组：只造一组的话，把唯一那条待删项勾掉之后执行器一条都不删，
+ * 这条闸门就只能证明「没删」，证明不了「该删的还照删」——
+ * 也就是说，一个「无论勾什么都全跳过」的实现也能让它变绿。
+ * B 组不作任何操作当对照，A 组勾一条，两种行为必须在同一轮里同时被验到。
+ *
+ * 每组两条的 URL 只有跟踪参数不同（utm_source / spm 都在剥离白名单里），
+ * 所以两条确实是重复项；但它们的**原始 URL 不相同**，
+ * 执行后才能按 URL 区分「哪条活下来了」。
+ */
+export function makeVetoFixtures() {
+  return [
+    { title: '否决组-保留', url: 'https://veto-a.example.com/same' },
+    { title: '否决组-待删', url: 'https://veto-a.example.com/same?utm_source=wx' },
+    { title: '对照组-保留', url: 'https://veto-b.example.com/same' },
+    { title: '对照组-待删', url: 'https://veto-b.example.com/same?spm=abc' },
+  ];
+}
+
+/**
  * 点「读取并预览」并等这一轮真的跑完。
  *
  * ⚠️ 判据用的是页面上的 previewSeq（每次渲染完成自增），
