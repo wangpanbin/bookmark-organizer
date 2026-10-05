@@ -1,0 +1,45 @@
+name: CI
+
+# 闸门跑的是仓库自己的 tools/precommit.py（语法 + JSON + 全部单测），
+# 和本地 commit 时跑的完全同一份脚本 —— 避免出现「CI 绿、本地红」两套标准。
+#
+# 刻意**不跑 E2E**：E2E 需要有头浏览器 + 完整 chromium，在这个 job 里跑不动。
+# E2E 闸门是本地的，命令见 README。
+#
+# 绿灯本身不算证据 —— 想知道这个 job 会不会红，故意改坏一个单测推一次。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: 提交前闸门
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法 + JSON + 全部单测
+        run: python tools/precommit.py --all
+
+  privacy:
+    name: 隐私闸门
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 必须带完整历史：闸门要遍历所有 ref 可达的 blob，
+          # 默认的 shallow clone 只有一个提交，查不出历史里是否残留真数据。
+          fetch-depth: 0
+
+      - name: 扫所有将推送的 blob 是否含敏感串
+        run: python tools/privacy_gate.py

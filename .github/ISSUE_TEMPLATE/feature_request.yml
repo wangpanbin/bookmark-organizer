@@ -1,0 +1,44 @@
+name: 功能建议
+description: 想要新能力，或对现有行为有改进想法
+title: "[feature] "
+labels: ["needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么
+      description: |
+        描述**场景**而不是解决方案。「我想整理 3000 条书签但预览卡住」
+        比「加个虚拟列表」有用得多。
+      placeholder: |
+        我有 3000+ 条书签，点「读取并预览」要转十几秒，
+        而且中途看不出进度，只能干等。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你想到的解法
+      description: 可选。跳过也没关系，上面那栏说清场景更重要。
+
+  - type: dropdown
+    id: touches-constraints
+    attributes:
+      label: 这个改动会不会碰到下面的硬约束？
+      description: |
+        点开看 `AGENTS.md`。这三条是产品的安全承诺，动它们需要额外论证。
+      options:
+        - 不确定
+        - 会碰 plan.js 的零写入性质
+        - 会碰 storage.js 的临界区
+        - 会碰去重的 hash 路由保留
+        - 都不碰
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过什么
+      description: 有没有绕过去的办法？绕过去的东西后来碍事吗？

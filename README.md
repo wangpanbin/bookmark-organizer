@@ -1,5 +1,9 @@
 # 书签整理助手
 
+[![CI](https://github.com/wangpanbin/bookmark-organizer/actions/workflows/ci.yml/badge.svg)](https://github.com/wangpanbin/bookmark-organizer/actions/workflows/ci.yml)
+[![Chrome 116+](https://img.shields.io/badge/Chrome-116%2B-4285F4?logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 Chrome MV3 扩展。按「功能」把已收集的书签自动归类到两层中文文件夹，**先预览、确认后再写入**，全程可回滚。
 
 零构建：原生 ES Module，不引打包器。`load unpacked` 直接跑。
@@ -122,6 +126,17 @@ DeepSeek 官方格式是 `https://api.deepseek.com`（不带 `/v1` 也能通）�
 
 书签没搬成时，失败原因会记到本机 **`F:\logs\bookmark-organizer\<日期>.jsonl`**，
 一行一条（JSON Lines，方便 `grep` 或直接喂 Python）。
+
+> **⚠️ `F:\logs\...` 是作者本机的默认路径，多数人没有 F 盘。**
+> 换一个目录即可，接收器起动时会用 `--dir`：
+>
+> ```bash
+> python tools/fail_log_sink.py --dir "D:\某目录\bookmark-organizer-logs"
+> ```
+>
+> 目录不存在会自动创建；指定路径所在盘不可用时**启动即报错退出**并说清原因，
+> 不会静默换个地方写。不需要日志功能就整个别起接收器 ——
+> 扩展在没拿到授权时不会往外发任何东西。
 
 ### 为什么需要「本机接收器」
 
@@ -328,6 +343,7 @@ tests/
 tools/
   verify_all.py       全套验证（单测 + 证伪 + E2E）
   precommit.py        提交前闸门（语法/JSON + 单测），已接成 .git/hooks/pre-commit
+  privacy_gate.py     隐私闸门：扫所有将推送的 blob，查真 key / 真实书签数据
   package.py          打包产物
   inject_key.py       从本机环境变量把 API key 注入 src/llm-key.local.js（已 gitignore）
   fail_log_sink.py    失败日志接收器：接住扩展 POST，写 F:\logs\bookmark-organizer\<日期>.jsonl
@@ -442,3 +458,14 @@ import 扫描器覆盖具名/默认/namespace/**副作用导入**/re-export 五�
 | dry-run 写入量 | 0 | 0 |
 | 二次运行变更量 | 0 | 0 |
 | 回滚一致性 | 100% | 100% |
+
+## 参与
+
+- 提 issue / PR 前先看 [CONTRIBUTING.md](CONTRIBUTING.md)（含提交前闸门和三条硬约束）
+- 报告安全问题请走 [SECURITY.md](SECURITY.md) 的私密通道，**不要开公开 issue**
+- 提交前跑一次 `python tools/precommit.py`；改动 E2E 夹具后另跑
+  `python tools/privacy_gate.py`
+
+## License
+
+[MIT](LICENSE) © 2026 wangpanbin

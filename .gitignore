@@ -23,3 +23,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 本地 AI 编码工具（ZCode）的同步防护文件，内容与本文件重复，
+# 属于个人工具配置，不该进版本库
+.zcodeignore

@@ -1,0 +1,79 @@
+name: 报告 bug
+description: 扩展行为与预期不符（分类不准、面板没说清、执行失败等）
+title: "[bug] "
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **请不要在本 issue 里粘贴你真实的书签内容。**
+        书签标题和 URL 是高价值隐私，公开后无法撤回。
+        构造几条假书签复现就够了。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 实际发生了什么
+      description: 预期是什么、实际是什么，写得越具体越好
+      placeholder: |
+        点「执行整理」后确认弹窗说「新建 3 个顶层文件夹」，
+        但书签栏一个文件夹都没多出来。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 用假书签怎么一步步复现的
+      placeholder: |
+        1. load unpacked 加载本目录
+        2. 造 3 条书签：https://a.example.com/x 标题「随便」
+        3. 点「读取并预览」
+        4. 点「执行整理」
+    validations:
+      required: true
+
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome 版本
+      placeholder: "chrome://version 里那一串"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: llm
+    attributes:
+      label: LLM 兜底开了吗
+      options:
+        - 没开
+        - 开了，能正常返回
+        - 开了，报错
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target-root
+    attributes:
+      label: 面板顶部的「归入位置」选了哪个
+      options:
+        - 书签栏
+        - 其他书签
+    validations:
+      required: true
+
+  - type: textarea
+    id: fail-log
+    attributes:
+      label: 失败日志
+      description: |
+        如果起过本机接收器（`npm run log:sink`），
+        把日志里相关的几行贴过来 —— **先把里面的 URL 换成 example.com**。
+        日志格式见 README 的「移动失败日志」。
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他
+      description: 截图、控制台报错、相关代码位置
