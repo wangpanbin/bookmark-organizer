@@ -17,6 +17,11 @@ tests/.*
 dist/
 *.zip
 
+# MATT 工作流的草稿：spec.md 与 issues/*.md 是「还在讨论的东西」，
+# 不是交付物。入库会让 README 之外的读者误以为这是既定设计，
+# 也会让 git 历史里堆满改到一半的决策。定稿后再写进 docs/。
+.scratch/
+
 # 编辑器与系统
 .DS_Store
 Thumbs.db
