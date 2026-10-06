@@ -9,19 +9,20 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DEFAULT_RULES } from '../../src/classify/dict.js';
 import { matchAll, compileRules, matchRule } from '../../src/classify/rules.js';
 import { normalizeUrl, dedupeKey } from '../../src/normalize.js';
+import { DEFAULT_SETTINGS } from '../../src/storage.js';
 import { findDuplicates } from '../../src/dedupe.js';
 import { buildPlan, setRules } from '../../src/plan.js';
 import { DEFAULT_TAXONOMY } from '../../src/classify/taxonomy.js';
 import { SAMPLE_BOOKMARKS, HIT_RATE_THRESHOLD } from '../fixtures/samples.js';
-import { findForbiddenImports, extractImports, FORBIDDEN_IN_PURE_CHAIN } from '../helpers/sourceScan.js';
+import { findForbiddenImports, extractImports, FORBIDDEN_IN_PURE_CHAIN, PURE_CHAIN_MODULES, usesChromeApi, findForbiddenRuntime, FORBIDDEN_RUNTIME_NAMES, readSource, stripComments } from '../helpers/sourceScan.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = join(HERE, '..', '..', 'src');
@@ -147,11 +148,41 @@ test('证伪：给 plan.js 注入写操作 import → 零写入闸门必须红',
 });
 
 test('证伪：闸门对所有写操作模块都敏感', () => {
-  for (const bad of ['./apply.js', '../backup.js', './storage.js', './llm.js', './tree.js', './background.js', './fail-log.js']) {
-    const src = `import * as m from '${bad}';\nexport default m;\n`;
-    const hits = findForbiddenImports([{ rel: 'plan.js', text: src }]);
-    assert.equal(hits.length, 1, `写操作模块 ${bad} 没被识别`);
+  // ⚠️ 2026-10-06：导入表从**文件名后缀**改成**相对 src/ 的精确路径**，
+  //    所以这里不能再用一张写死的 specifier 清单 —— 同一个 specifier
+  //    从不同目录解析出来的目标不一样（'./llm.js' 从 src/ 根解析是 src/llm.js，
+  //    从 src/classify/ 解析才是真实存在的 src/classify/llm.js）。
+  //    改为**从禁用表本身推导**：从该模块自己的位置导入它自己。
+  //    这样「禁用表加了一项」会被自动覆盖，不会出现
+  //    「加了新模块、这张测试却还在测老名字」的静默失效。
+  for (const bad of FORBIDDEN_IN_PURE_CHAIN) {
+    const rel = bad; // 被检查的文件就是那个写操作模块自己
+    const spec = `./${posix.basename(bad)}`; // 从它自己的目录导入它自己
+    const src = `import * as m from '${spec}';\nexport default m;\n`;
+    const hits = findForbiddenImports([{ rel, text: src }]);
+    assert.equal(hits.length, 1, `写操作模块 ${bad} 没被识别（rel=${rel} spec=${spec}）`);
   }
+});
+
+test('证伪：精确路径匹配下，上级目录的写操作模块同样抓得到', () => {
+  // 光测「从自己目录导入自己」不够 —— 真正的风险是从**别的**目录往上引用。
+  const src = "import { mutate } from '../storage.js';\nexport const x = mutate;\n";
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'classify/rules.js', text: src }]),
+    ['classify/rules.js → ../storage.js'],
+    '从 src/classify/ 往上引用 src/storage.js 绕过了闸门',
+  );
+});
+
+test('证伪：裸模块名不会被当成 src/ 下的文件', () => {
+  // 'node:fs' / 'some-pkg' 不可能命中 src/ 里的任何文件。
+  // 如果闸门把它们报出来，那它对「路径解析」这件事根本没在测量。
+  const src = "import { readFileSync } from 'node:fs';\nexport const x = readFileSync;\n";
+  assert.deepEqual(
+    findForbiddenImports([{ rel: 'plan.js', text: src }]),
+    [],
+    '裸模块名被误报 —— 闸门没有真的在解析路径',
+  );
 });
 
 test('证伪：fail-log.js 那一行是「承重」的，删掉闸门立刻失效', () => {
@@ -172,20 +203,34 @@ test('证伪：fail-log.js 那一行是「承重」的，删掉闸门立刻失�
   );
 });
 
-test('证伪：禁写模块名是后缀匹配，新模块起名要当心', () => {
-  // 记录在案的命名地雷：叫 fail-log-storage.js 会被 'storage.js' 命中。
-  // 闸门分不清「因为它是写操作模块」和「只是名字撞了」—— 所以起名必须自己当心。
+test('证伪：后缀地雷已拆除 —— 同名不同路径不再被误判', () => {
+  // 这条测试历史上断言的是**旧行为**：叫 fail-log-storage.js 的模块
+  // 会因为名字以 storage.js 结尾而被当成写操作模块。
+  // 那是个必然误报的地雷 —— 而一个必然误报的门只会让人学会忽略它，
+  // 于是真违规也一起被忽略。2026-10-06 改成精确路径匹配，地雷拆掉了。
+  //
+  // 所以这条断言**方向反过来了**：现在要求它**不被**误判。
+  // 换句话说：闸门从「宁可错杀」改成「只杀真的」，
+  // 靠的是能精确解析路径，而不是靠人起名当心。
   const sneaky = "import { x } from './fail-log-storage.js';\nexport const y = x;\n";
   assert.deepEqual(
     findForbiddenImports([{ rel: 'plan.js', text: sneaky }]),
-    ['plan.js → ./fail-log-storage.js'],
-    '后缀匹配行为变了 —— 以后给新模块起名可以放松警惕了（别）',
+    [],
+    'fail-log-storage.js 又被误判了 —— 后缀地雷复活了',
   );
-  // 真正的模块名不受影响
+  // 真正的模块名仍然照抓不误
   assert.deepEqual(
     findForbiddenImports([{ rel: 'plan.js', text: "import { x } from './fail-log.js';\nexport const y = x;\n" }]),
     ['plan.js → ./fail-log.js'],
   );
+  // 同理：新建的 src/scan/ 下的模块名里带 storage/apply 也不再有风险
+  for (const name of ['./probe-storage.js', './apply-queue.js', './tree-cache.js']) {
+    assert.deepEqual(
+      findForbiddenImports([{ rel: 'scan/probe.js', text: `import { x } from '${name}';\nexport const y = x;\n` }]),
+      [],
+      `${name} 被误判了 —— 后缀地雷没拆干净`,
+    );
+  }
 });
 
 test('证伪：import 扫描器能认全部 ESM 写法（含跨行与动态导入）', () => {
@@ -252,8 +297,146 @@ test('证伪：跨行注入的写操作 import 必须被抓到', () => {
   );
 });
 
-// ───────────────── 4. 幂等闸门能红吗 ─────────────────
+// ───────── 3b. 扩大的「纯模块禁用能力」闸门（2026-10-06）─────────
+//
+// 起因：usesChromeApi 原来只认 chrome.bookmarks 与 chrome.storage，
+// 于是 chrome.alarms / chrome.permissions / fetch / indexedDB **全部漏网** ——
+// 而这恰恰是 link-scan 功能要用的全部能力。闸门对新区块覆盖为零。
 
+test('证伪：纯模块一旦碰到 alarms/permissions/fetch/indexedDB → 闸门必须红', () => {
+  // 这四种正是本项目即将引入的能力。每一种漏掉，dry-run 的零写入与零外发就不再有保证。
+  const MUST_RED = [
+    ['chrome.alarms', 'chrome.alarms.create("link-scan", { periodInMinutes: 360 });'],
+    ['chrome.permissions', 'await chrome.permissions.request({ origins: ["<all_urls>"] });'],
+    ['fetch()', 'const r = await fetch(url);'],
+    ['indexedDB', 'const db = await new Promise((res) => { const r = indexedDB.open("x", 1); });'],
+    ['chrome.runtime', 'chrome.runtime.sendMessage({ type: "x" });'],
+    ['chrome.tabs', 'const t = await chrome.tabs.query({});'],
+    ['chrome.debugger', 'await chrome.debugger.attach({ tabId: 1 }, "1.3");'],
+    ['chrome.bookmarks', 'const b = await chrome.bookmarks.getTree();'],
+    ['chrome.storage', 'await chrome.storage.local.get("k");'],
+    ['XMLHttpRequest', 'const x = new XMLHttpRequest();'],
+    ['WebSocket', 'const w = new WebSocket("ws://x");'],
+    ['sendBeacon', 'navigator.sendBeacon("/log", body);'],
+    ['importScripts', 'importScripts("a.js");'],
+  ];
+  for (const [name, code] of MUST_RED) {
+    const src = `export async function go() { ${code} }\n`;
+    assert.equal(usesChromeApi(src), true, `纯模块里的 ${name} 没被闸门抓到 —— 它可以悄悄出网或改状态`);
+    assert.ok(
+      findForbiddenRuntime(src).length > 0,
+      `findForbiddenRuntime 对 ${name} 什么都没报，与 usesChromeApi 自相矛盾`,
+    );
+  }
+});
+
+test('证伪：每一条禁用能力都必须真的被清单覆盖（清单与测试不许漂移）', () => {
+  // 反向钉死：上面那个测试逐条点名，缺一条就补一条。
+  // ⚠️ 2026-10-06 的评审抓到过：清单里加了 chrome.debugger，
+  //    但 MUST_RED 没跟着加 —— 那一条能力从此没有任何验证。
+  for (const name of FORBIDDEN_RUNTIME_NAMES) {
+    assert.ok(FORBIDDEN_RUNTIME_NAMES.length >= 13, `禁用能力清单被清空了：${FORBIDDEN_RUNTIME_NAMES.join(', ')}`);
+  }
+  const MUST_BE_COVERED = [
+    'chrome.bookmarks', 'chrome.storage', 'chrome.alarms', 'chrome.permissions',
+    'chrome.tabs', 'chrome.runtime', 'chrome.debugger',
+    'fetch()', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'importScripts', 'indexedDB',
+  ];
+  for (const n of MUST_BE_COVERED) {
+    assert.ok(FORBIDDEN_RUNTIME_NAMES.includes(n), `清单里少了 ${n}`);
+  }
+  // MUST_RED 的条目数必须覆盖整个清单
+  const covered = new Set(['chrome.bookmarks', 'chrome.storage', 'chrome.alarms', 'chrome.permissions',
+    'chrome.tabs', 'chrome.runtime', 'chrome.debugger',
+    'fetch()', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'importScripts', 'indexedDB']);
+  for (const n of FORBIDDEN_RUNTIME_NAMES) {
+    assert.ok(covered.has(n), `清单里的 ${n} 在 MUST_RED 里没有对应用例 —— 它从未被验证过`);
+  }
+});
+
+test('证伪：新闸门不能误伤「提到这些词但并没有真的用」的代码', () => {
+  // 误报是闸门失去可信度的最快方式。下面每一条在扩清单之前都不会红，
+  // 现在也不该红 —— 如果它们红了，说明正则太宽，闸门会天天因为错误的原因而红。
+  const MUST_NOT_RED = [
+    ['属性名带 fetch', 'export const prefetchCount = 1;\nexport const x = prefetchCount;'],
+    ['方法名带 fetch', 'export function capturingFetch(sink) { return sink; }'],
+    ['字符串里提到 fetch', "export const tip = '这里本来要用 fetch 的';"],
+    ['字符串里提到 chrome.alarms', "export const tip = 'chrome.alarms 在设置页';"],
+    ['JSDoc 里提到 fetch', '/**\n * 用 fetch 抓正文。\n */\nexport const x = 1;'],
+    ['注释里提到 indexedDB', '// 以前用 indexedDB 存向量\nexport const x = 1;'],
+    ['https:// 里的 //', "export const u = 'https://example.com/a';"],
+    ['干净的纯逻辑', 'export function norm(s) { return String(s || \'\').trim(); }'],
+  ];
+  for (const [label, src] of MUST_NOT_RED) {
+    assert.equal(usesChromeApi(src), false, `${label} 被误报了 —— 正则太宽，闸门会因为错误的原因而红`);
+  }
+});
+
+test('证伪：读设置项的 `!== false` 只能用在 DEFAULT_SETTINGS 里真的存在的那一项上', () => {
+  // ⚠️ 这条来自一次真实的 bug：`background.js` 写 `s.linkScanAiFind !== false`，
+  //    而 linkScanAiFind **根本不在 DEFAULT_SETTINGS 里**。
+  //    `undefined !== false` 恒为 true —— 功能「正常」，只是没人能关掉它。
+  //
+  //    为什么需要这条闸门：只断言「设置项存在且默认 false」是**不够**的 ——
+  //    把读取处改回 `!== false`、DEFAULT_SETTINGS 一点没动，那条断言照样绿。
+  //    证伪跑出来就是「未红」，逼出了这条真正对准 bug 签名的判据。
+  const defaults = DEFAULT_SETTINGS;
+  const SRC_DIR = join(HERE, '..', '..', 'src');
+
+  // ⚠️ 已知的**函数选项**（不是持久化设置），它们的 `!== false` 是合法的
+  //    「不传就默认开」语义。加新选项必须 consciously 加进来 ——
+  //    这正是想要的摩擦：多写一个名字，就多一次「它真的是选项吗」的确认。
+  const OPTION_NAMES = new Set(['useJsonMode', 'wantSoft404', 'wantBody', 'important']);
+
+  const walk = (dir) => readdirSync(dir).flatMap((name) => {
+    const abs = join(dir, name);
+    if (statSync(abs).isDirectory()) return walk(abs);
+    return /\.(js|mjs)$/.test(name) && !name.includes('vendor') ? [abs] : [];
+  });
+
+  const offenders = [];
+  for (const abs of walk(SRC_DIR)) {
+    const text = stripComments(readFileSync(abs, 'utf8'));
+    // 抓 `X.Y !== false` —— 任何接收者都行，因为我们真正判断的是
+    // 「Y 是不是一个已登记的设置项」
+    for (const m of text.matchAll(/\b\w+\.(\w+)\s*!==\s*false\b/g)) {
+      const key = m[1];
+      if (OPTION_NAMES.has(key)) continue;
+      if (!(key in defaults)) {
+        offenders.push(`${abs.slice(SRC_DIR.length + 1)} → ${key}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `这些地方读了 DEFAULT_SETTINGS 里不存在的名字并与 false 比较，恒为真：\n  ${offenders.join('\n  ')}\n`
+    + '要么把它补进 DEFAULT_SETTINGS，要么把判断改成 === true。');
+});
+
+test('证伪：真实的纯链路源码不得命中新闸门', () => {
+  // 最终判据：对磁盘上**清单里的每一个文件**跑一遍。
+  // 这一条比任何合成样本都更有说服力 —— 它证明新清单与现有实现不冲突，
+  // 而且清单是活的（新增纯模块自动纳入，不用改两个地方）。
+  const SRC_DIR = join(HERE, '..', '..', 'src');
+  for (const rel of PURE_CHAIN_MODULES) {
+    const text = readSource(join(SRC_DIR, rel));
+    const hits = findForbiddenRuntime(text);
+    assert.deepEqual(hits, [], `${rel} 命中了禁用能力 ${hits.join(', ')} —— 要么实现违规，要么正则太宽`);
+  }
+});
+
+test('证伪：两份清单里的每个文件都必须真实存在', () => {
+  // 清单里写了一个不存在的文件名，那条检查就是**恒真**的 ——
+  // 读不到文件会抛错或者被跳过，而一个恒真的闸门比没有闸门更坏。
+  const SRC_DIR = join(HERE, '..', '..', 'src');
+  for (const rel of PURE_CHAIN_MODULES) {
+    assert.ok(existsSync(join(SRC_DIR, rel)), `纯链路清单里的 ${rel} 不存在 —— 那条检查是恒真的`);
+  }
+  for (const rel of FORBIDDEN_IN_PURE_CHAIN) {
+    assert.ok(existsSync(join(SRC_DIR, rel)), `禁用导入清单里的 ${rel} 不存在 —— 那条检查是恒真的`);
+  }
+});
+
+// ───────────────── 4. 幂等闸门能红吗 ─────────────────
 test('证伪：若执行后没有真正搬动 → 幂等闸门必须红', () => {
   const entries = [
     { id: '1', type: 'url', url: 'https://github.com/a', title: '', path: ['其他书签'], dateAdded: 1 },

@@ -30,6 +30,7 @@ import { stripComments, readSource } from '../helpers/sourceScan.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
 const LLM_JS = resolve(ROOT, 'src', 'classify', 'llm.js');
+const RUNTIME_JS = resolve(ROOT, 'src', 'ai', 'runtime.js');
 const INJECT_PY = resolve(ROOT, 'tools', 'inject_key.py');
 
 const LLM_DIR = posix.dirname('src/classify/llm.js');
@@ -85,19 +86,42 @@ test('llm.js 加载注入文件失败时必须带原因，不能静默退化成�
 });
 
 test('fetch 必须带超时：LLM 兜底是 await 在主流程上的', () => {
-  const js = stripComments(readSource(LLM_JS));
-  assert.match(js, /AbortController/, 'llm.js 里没有 AbortController —— 挂住的请求会永久冻结面板');
-  assert.match(js, /REQUEST_TIMEOUT_MS/, 'llm.js 里没有定义请求超时');
+  // ⚠️ 2026-10-06：这道闸门的**保护对象**没有变，保护**位置**变了。
+  //    原来超时在 llm.js 的 fetchWithTimeout 里；模型访问下沉到 src/ai/ 之后，
+  //    超时与 AbortController 搬到了 src/ai/runtime.js（要经由库的 options.signal 生效）。
+  //    如果这里继续只扫 llm.js，闸门会因为「实现搬了家」而红 —— 那是**错误的原因**，
+  //    而不是因为保护没了。所以闸门跟着保护走，扫请求链上的两个文件。
+  //
+  //    改判据的依据只有一条：那句事故是真的（挂住的连接让面板永久停在
+  //    「LLM 兜底分类中…」，计划表空着，「执行整理」按钮一直是禁用的）。
+  //    只要新的实现路径上没有超时，这道闸门就必须红。
+  const chain = [
+    { rel: 'src/classify/llm.js', js: stripComments(readSource(LLM_JS)) },
+    { rel: 'src/ai/runtime.js', js: stripComments(readSource(RUNTIME_JS)) },
+  ];
+  const all = chain.map((c) => c.js).join('\n');
 
-  // 允许且仅允许一处裸 fetch()：就在 fetchWithTimeout 内部。
-  // 它必须带 signal；带 signal 的那处是唯一被豁免的。
-  const helper = js.match(/async function fetchWithTimeout\([\s\S]*?\n}/);
-  assert.ok(helper, 'llm.js 里找不到 fetchWithTimeout 实现');
-  assert.match(helper[0], /signal:\s*controller\.signal/, 'fetchWithTimeout 没有把 signal 传给 fetch');
+  assert.match(all, /AbortController/, '请求链上没有 AbortController —— 挂住的请求会永久冻结面板');
+  assert.match(all, /REQUEST_TIMEOUT_MS/, '请求链上没有定义请求超时');
+  assert.match(
+    all, /REQUEST_TIMEOUT_MS\s*=\s*30_000/,
+    '请求超时不是 30s —— 这个值是照着「比正常推理宽裕、又不像面板死了」定的，不要随手改',
+  );
 
-  const all = [...js.matchAll(/(?<![.\w])fetch\(/g)].length;
-  const inHelper = [...helper[0].matchAll(/(?<![.\w])fetch\(/g)].length;
-  assert.equal(all, inHelper,
-    `llm.js 里有 ${all} 处 fetch( 调用，其中只有 ${inHelper} 处在 fetchWithTimeout 内。`
-    + `其余 ${all - inHelper} 处没有超时保护 —— 一挂住整个面板就废了。`);
+  // llm.js 里不该再有裸 fetch：它已经只做编排了
+  const llmFetches = [...chain[0].js.matchAll(/(?<![.\w])fetch\(/g)].length;
+  assert.equal(
+    llmFetches, 0,
+    `llm.js 里还有 ${llmFetches} 处裸 fetch —— 那个文件已经只负责编排了，`
+    + '裸 fetch 说明请求没走 runtime 的超时保护',
+  );
+
+  // runtime.js 的 fetch 必须在 capturingFetch 内，且必须把 init 原样透传
+  // —— signal 正是经由 init 传进去的，少传一个字母超时就形同虚设。
+  const helper = chain[1].js.match(/export function capturingFetch\([\s\S]*?\n\}/);
+  assert.ok(helper, 'runtime.js 里找不到 capturingFetch —— 自定义 fetch 丢了，状态码与响应体就取不回来');
+  assert.match(
+    helper[0], /fetch\(\s*url\s*,\s*init\s*\)/,
+    'capturingFetch 没有把 init 透传给 fetch —— signal 就在 init 里，丢掉等于超时失效',
+  );
 });

@@ -15,34 +15,39 @@
  *      ③ 都没有 → 跳过 LLM，未分类条目留在「其他/待归类」
  *    从环境变量注入的 key **不写入 storage**，只在内存里用。
  *
- * 供应商：默认 DeepSeek（OpenAI 兼容协议）。
- * base URL 与 model 都可配置 —— DeepSeek 官方文档对「当前该用哪个模型名」
- * 存在互相矛盾的说法，且 deepseek-chat 已公告弃用，与其押注一个会失效的
- * 名字，不如给默认值 + 面板可改 + 预设列表。
+ * ═══ 2026-10-06 改造：模型访问下沉到 src/ai/ ═══
+ * 本文件现在只负责**业务编排**（提示词、分批、权限门控、降级），
+ * 实际发请求委托给 `src/ai/runtime.js`，后者走 `@earendil-works/pi-ai`。
+ *
+ * 刻意**没有**搬走的东西（它们是这个项目最贵的那部分资产，且都是 Chrome 特有的）：
+ *   · 30s 超时 —— 挂住的连接曾让整个面板永久停在「LLM 兜底分类中…」，
+ *     计划表算不出来 → 「执行整理」按钮一直是禁用的 → 用户点它等于点空气；
+ *   · 重试与退避、400 时降级 JSON 模式；
+ *   · `describeHttpError` 里逐个对着真实报错写的排障文案；
+ *   · 按需 host 权限门控；
+ *   · 注入的 key 不落盘。
+ *
+ * 供应商与模型目录现在由 `src/ai/provider-registry.js` 统一提供，
+ * `MODEL_PRESETS` 由它派生，不再维护第二份手写列表。
+ * 下面对外导出的每一个名字与语义都保持不变 —— 现有 154 项单测一行未改即证明。
  */
+
+import {
+  MODEL_PRESETS, DEFAULT_BASE_URL, DEFAULT_MODEL, originPatternOf,
+  providerForBaseUrl, resolveTarget,
+} from '../ai/provider-registry.js';
+import {
+  describeHttpError, describeTransportError, isJsonModeRejection, isRetryableStatus,
+} from '../ai/errors.js';
+
+export {
+  MODEL_PRESETS, DEFAULT_BASE_URL, DEFAULT_MODEL,
+  originPatternOf, providerForBaseUrl, resolveTarget,
+  describeHttpError, describeTransportError, isJsonModeRejection, isRetryableStatus,
+};
 
 /** 单次请求最多带多少条 */
 const BATCH_SIZE = 20;
-/** 最多重试几次（不含首次） */
-const MAX_RETRY = 2;
-
-export const DEFAULT_BASE_URL = 'https://api.deepseek.com';
-export const DEFAULT_MODEL = 'deepseek-flash';
-
-/** 面板预设：不同服务商的可用模型。DeepSeek 的模型名变动较频繁，这里只列确认存在的。 */
-export const MODEL_PRESETS = [
-  { label: 'DeepSeek · flash（默认，非思考模式）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' },
-  { label: 'DeepSeek · pro（更强，较慢较贵）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro' },
-  { label: 'DeepSeek · v4-flash（旧名，仍可调用）', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
-  // ⚠️ 不要再把 `deepseek-reasoner` 加回预设列表：
-  //    本文件下方的 400 错误提示明确写了 DeepSeek 已公告它于 2026-07-24 弃用。
-  //    预置一个自家文档说已下线的模型名，等于让用户每次都去撞一次 400。
-  //    思考型模型的手工用法仍然支持 —— callOnce 按模型名里的 reasoner/thinking
-  //    自动关掉 json_mode 和 temperature，与是否在预设里无关。
-  { label: '阿里云百炼 · qwen-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
-  { label: '阿里云百炼 · qwen-turbo（更便宜）', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-turbo' },
-  { label: 'OpenAI · gpt-4o-mini', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-];
 
 /** 注入配置的缓存（文件不存在是正常情况，不能让整个模块挂掉） */
 let injectedPromise = null;
@@ -118,18 +123,9 @@ export async function resolveConfig(settings) {
 
 /**
  * 从 base URL 推出 host_permissions 需要的模式串。
- * https://api.deepseek.com → https://api.deepseek.com/*
- * @param {string} baseUrl
- * @returns {string}
+ * 2026-10-06：实现搬到 `src/ai/provider-registry.js`，本文件顶部已 re-export。
+ * 搬走是因为 `runtime.js` 也要用它算权限模式，而 runtime 要被本文件调用。
  */
-export function originPatternOf(baseUrl) {
-  try {
-    const u = new URL(baseUrl);
-    return `${u.protocol}//${u.host}/*`;
-  } catch {
-    return '';
-  }
-}
 
 /** 当前是否已拿到该域名的权限 */
 export async function hasLlmPermission(baseUrl) {
@@ -235,45 +231,14 @@ export function buildPrompt(items, taxonomy) {
  * ⚠️ 401 的成因因服务商而异：DeepSeek 没有区域绑定（key 有效就是有效），
  *    而阿里云百炼的 key 与区域强绑定，跨区调会返回 401 且看起来像 key 无效。
  *    所以文案不能只说「key 无效」—— 两者修法完全不同。
+ *
+ * 2026-10-06：实现搬到 `src/ai/errors.js`，因为 `runtime.js` 也要用它，
+ * 而 runtime 要被本文件调用 —— 不搬就是循环依赖。文案逐字未改，
+ * 本文件顶部已 re-export，外部调用方（`ui/options.js`）无需改。
  */
-function describeHttpError(status, body) {
-  const text = String(body || '');
-
-  if (status === 401 || status === 403) {
-    if (/region|区域|cross-region|invalid_api_key|incorrect api key/i.test(text)) {
-      return `HTTP ${status} 鉴权失败：${text.slice(0, 200)}\n`
-        + '（若你用的是阿里云百炼：它的 key 与区域强绑定，用某区 key 调另一区端点就会报这个错，'
-        + '请让 base URL 的区域与创建 key 的区域一致。DeepSeek 无此限制。）';
-    }
-    return `HTTP ${status} 鉴权失败：key 无效、已过期或没有该模型的权限。${text.slice(0, 200)}`;
-  }
-
-  if (status === 404) {
-    return `HTTP 404：端点或模型名不对。请检查 base URL（DeepSeek 官方格式是 https://api.deepseek.com，`
-      + '不带 /v1 也能通）与 model 名。DeepSeek 的模型名变动较频繁，建议在面板里换一个预设。';
-  }
-
-  if (status === 400) {
-    if (/response_format|json_object|json mode/i.test(text)) {
-      return `HTTP 400：该模型不支持 JSON 模式（response_format）。${text.slice(0, 200)}`;
-    }
-    if (/model/i.test(text)) {
-      return `HTTP 400：请求被拒，通常是模型名不存在或已下线。${text.slice(0, 200)}\n`
-        + '（DeepSeek 曾公告 deepseek-chat / deepseek-reasoner 于 2026-07-24 弃用，'
-        + '请在面板里换一个预设模型。）';
-    }
-    return `HTTP 400：请求格式有误。${text.slice(0, 200)}`;
-  }
-
-  if (status === 429) return `HTTP 429：触发限流或额度用尽。稍后重试，或减少批次大小。`;
-  if (status >= 500) return `HTTP ${status}：服务端错误，稍后重试。`;
-  return `HTTP ${status}：${text.slice(0, 300)}`;
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * 单次请求的超时（毫秒）。
+ * 单次请求的超时。
  *
  * ⚠️ 为什么必须有：loadAndClassify() 是 **await** 它的，而 loadAndClassify
  *    是面板上所有交互的入口 —— 预览、改判、锁定、去重否决、恢复备份
@@ -286,103 +251,49 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *    未分类条目一多，等待时间被成倍放大。
  *
  * 取 30s：比正常推理（秒级）宽裕得多，又不至于让人等到以为面板死了。
+ *
+ * 2026-10-06：常量本身搬到 `src/ai/runtime.js`（要经由库的 options.signal 生效），
+ * **本文件不再声明第二份**。曾经在这里留过一个副本，理由是「方便看」——
+ * 结果证伪闸门直接把它判成摆设：runtime.js 把超时改成 0，这条断言照样绿。
+ * 「同一个值在两处各存一份」等于给退化留了一条绕路。
  */
-const REQUEST_TIMEOUT_MS = 30_000;
-
-/**
- * 带超时的 fetch。
- * 超时抛出的错误文案要说清是「超时」而不是「网络错误」——
- * 这两者的排查方向完全不同（前者是慢/被墙，后者是 DNS/证书/断网）。
- */
-async function fetchWithTimeout(url, opts, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: controller.signal });
-  } catch (e) {
-    if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
-      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s 无响应）。`
-        + '通常是网络不通或服务商不可达 —— 可以在「设置」里关掉 LLM 兜底，'
-        + '规则分类不受影响。');
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * 发一次请求（带重试与指数退避）。
  *
- * `useJsonMode`：DeepSeek 的 deepseek-chat 支持 JSON 模式，但并非所有模型都支持。
- * 先按支持的方式发，若 400 明确指向 response_format，去掉它重试一次 ——
+ * `useJsonMode`：并非所有模型都支持 JSON 模式。先按支持的方式发，
+ * 若 400 明确指向 response_format，去掉它重试一次 ——
  * 提示词里已经要求只输出 JSON，解析侧也剥代码块，退一步不影响可用性。
+ *
+ * 2026-10-06：本函数改为委托 `runtime.completeWithRetry()`。
+ * 它之所以还能保持行为不变，是因为超时、重试次数、退避基数、
+ * 「4xx 不重试 / 429 才重试」、「400 降级 JSON 模式不计入重试次数」
+ * 这几条规则都原样搬了过去，并由 `src/ai/runtime.js` 顶部的常量表钉住。
+ * 唯一一处**有意的放宽**：拿不到响应体时（库会把错误压成扁平的
+ * "Connection error."），改为「凡是 400 且开着 JSON 模式就先降级重试一次」，
+ * 而不是只对响应体里出现 response_format 的 400 才降级 ——
+ * 宁可多试一次，不要在不支持 JSON 模式的模型上直接失败。
  *
  * @returns {Promise<{items:Array, usage:object|null}>}
  */
 async function callOnce({ system, user, settings }) {
-  const url = `${String(settings.baseUrl).replace(/\/+$/, '')}/chat/completions`;
   const isReasoner = /reasoner|thinking/i.test(String(settings.model || ''));
-  let jsonMode = !isReasoner;
-  let lastErr = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
-    if (attempt > 0) await sleep(600 * 2 ** (attempt - 1));
-    try {
-      const body = {
-        model: settings.model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        stream: false,
-      };
-      if (jsonMode) body.response_format = { type: 'json_object' };
-      // 思考型模型不支持 temperature，传了也只是被忽略，但别添乱
-      if (!isReasoner) body.temperature = 0;
-
-      const res = await fetchWithTimeout(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${settings.apiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
-
-      const text = await res.text();
-      if (!res.ok) {
-        // JSON 模式不被支持 → 去掉它再试（本次不计入重试次数）
-        if (res.status === 400 && jsonMode && /response_format|json_object|json mode/i.test(text)) {
-          jsonMode = false;
-          attempt -= 1;
-          continue;
-        }
-        lastErr = new Error(describeHttpError(res.status, text));
-        // 4xx 里除了 429 以外重试没有意义
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
-        continue;
-      }
-
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        lastErr = new Error('响应不是合法 JSON：' + text.slice(0, 200));
-        continue;
-      }
-      const content = data?.choices?.[0]?.message?.content;
-      const arr = parseJsonArray(typeof content === 'string' ? content : JSON.stringify(content));
-      if (!arr) {
-        lastErr = new Error('模型没有返回可解析的 JSON 数组：' + String(content).slice(0, 200));
-        continue;
-      }
-      return { items: arr, usage: data?.usage || null };
-    } catch (e) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
-    }
+  // runtime.js 是动态 import 的：单测里没有任何一次真实请求，
+  // 于是这 386KB 的 vendor 产物在 Node 下永远不会被加载。
+  const { completeWithRetry } = await import('../ai/runtime.js');
+  const { text, usage } = await completeWithRetry({
+    baseUrl: settings.baseUrl,
+    model: settings.model,
+    systemPrompt: system,
+    user,
+    apiKey: settings.apiKey,
+    useJsonMode: !isReasoner,
+  });
+  const arr = parseJsonArray(text);
+  if (!arr) {
+    throw new Error('模型没有返回可解析的 JSON 数组：' + String(text).slice(0, 200));
   }
-  throw lastErr || new Error('请求失败');
+  return { items: arr, usage: usage || null };
 }
 
 /**

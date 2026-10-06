@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { buildPlan, setRules, selectForLlm, REASON } from '../../src/plan.js';
 import { DEFAULT_RULES } from '../../src/classify/dict.js';
 import { DEFAULT_TAXONOMY } from '../../src/classify/taxonomy.js';
-import { findForbiddenImports, usesChromeApi } from '../helpers/sourceScan.js';
+import { findForbiddenImports, usesChromeApi, PURE_CHAIN_MODULES } from '../helpers/sourceScan.js';
 
 setRules(DEFAULT_RULES);
 
@@ -21,11 +21,10 @@ const SRC = join(HERE, '..', '..', 'src');
 // ───────────────────── 静态断言：dry-run 零写入 ─────────────────────
 
 test('⚠️ plan.js 不得 import 任何写操作模块', () => {
-  const PURE_CHAIN = [
-    'plan.js', 'dedupe.js', 'normalize.js',
-    'classify/rules.js', 'classify/dict.js', 'classify/taxonomy.js',
-  ];
-  const sources = PURE_CHAIN.map((rel) => ({ rel, text: readFileSync(join(SRC, rel), 'utf8') }));
+  // ⚠️ 清单来自 sourceScan 的 PURE_CHAIN_MODULES，不再在两处各硬编码一份。
+  //    两份清单必然漂移，而漂移的表现是新模块「没人验」——
+  //    2026-10-06 那次就是这么漏掉了 9 个新写操作模块与 9 个新纯模块。
+  const sources = PURE_CHAIN_MODULES.map((rel) => ({ rel, text: readFileSync(join(SRC, rel), 'utf8') }));
   const violations = findForbiddenImports(sources);
   assert.deepEqual(violations, [], '计划/去重/归一化链路混入了写操作模块，dry-run 不再零写入');
 });

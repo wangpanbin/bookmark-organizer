@@ -75,9 +75,16 @@ def main():
         assert any(n.startswith("ui/") for n in names), "ui/ 缺失"
         assert not any(n.startswith("tests/") for n in names), "tests/ 不该进包"
         assert not any(n.startswith("node_modules/") for n in names), "node_modules 不该进包"
+        # vendor 产物是提交进版本库的构建产物，缺了它就是一个
+        # 「装上去能用、但 LLM 兜底永远静默跳过」的包 —— 症状和「没配 key」一模一样，
+        # 而用户根本不会想到是包本身少了文件。打包时拦住，别等发出去才发现。
+        assert "src/vendor/pi-ai.js" in names, (
+            "vendor 产物不在包里：先跑 npm run build:vendor 再打包"
+        )
         leaked = [n for n in names if "llm-key.local" in n]
         assert not leaked, f"注入的 API key 泄漏进了发布包：{leaked}"
-    print("  校验通过：manifest 在根、src/ui 齐全、tests 与 node_modules 已排除、注入的 key 未泄漏")
+    print("  校验通过：manifest 在根、src/ui 齐全、vendor 产物在包内、"
+          "tests 与 node_modules 已排除、注入的 key 未泄漏")
 
 
 if __name__ == "__main__":

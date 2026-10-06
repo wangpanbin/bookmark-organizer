@@ -34,9 +34,22 @@ ENV = dict(os.environ, NO_COLOR="1", NODE_DISABLE_COLORS="1")
 # --all 模式要扫的目录。暂存模式不看目录，只看暂存了哪些文件。
 # tests/ 也在内：这个模式只做**语法**检查，而 tests/ 里的坏样本都是
 # 字符串字面量（不是真的语法错），所以扫它没有误报风险。
-SOURCE_DIRS = ("src", "ui", "tools", "tests")
+SOURCE_DIRS = ("src", "ui", "tools", "tests", "docs")
 CHECK_EXT = (".js", ".mjs")
 JSON_EXT = (".json",)
+# ⚠️ 只做**编码**检查、不做语法检查的扩展名（2026-10-06 补）。
+#    早先 --all 模式只收 CHECK_EXT + JSON_EXT，于是 check_encoding 里
+#    那几行 `(".py", ".md", ".html", ".css")` 判定**永远走不到** ——
+#    死代码。而偏偏是 tools/precommit.py 自己第 210 行坏了一个字节
+#    （U+FFFD），--all 模式一路报「编码检查通过」。
+#    两道闸门同时坏：闸门自身被损坏，而闸门的覆盖面排除了损坏被发现的那种文件类型。
+#
+#    刻意**不收** .txt：tests/ 下有一堆 verify_all 写出来的诊断转储
+#    （.tap.txt / .final.txt / .revert.txt …），它们是运行产物不是源码，
+#    扫进去只会因为某次 diff 带了半个字符就红，那是误报。
+TEXT_EXT = (".py", ".md", ".html", ".css", ".yml", ".yaml", ".gitignore", ".gitattributes")
+# 编码检查要覆盖的扩展名（collect 与 check_encoding 必须用同一个常量）
+ENCODED_EXT = CHECK_EXT + JSON_EXT + TEXT_EXT
 
 
 def run(cmd, **kw):
@@ -59,7 +72,9 @@ def all_source_files():
             continue
         for dirpath, _dirs, files in os.walk(base):
             for f in files:
-                if f.endswith(CHECK_EXT + JSON_EXT) and "node_modules" not in dirpath:
+                # 收集用 ENCODED_EXT（比 CHECK_EXT 宽）：语法检查自己会按扩展名
+                # 过滤掉不认的，而编码检查必须真的拿到 .py/.md/.html/.css
+                if f.endswith(ENCODED_EXT) and "node_modules" not in dirpath:
                     rel = os.path.relpath(os.path.join(dirpath, f), ROOT)
                     out.append(rel.replace("\\", "/"))
     return sorted(out)
@@ -99,6 +114,57 @@ def check_syntax(files):
             bad += 1
     if not bad:
         print(f"[precommit] ✓ 语法/JSON 检查通过（{checked} 个文件）")
+    return bad
+
+
+def check_encoding(files):
+    """查字节损坏（U+FFFD 替换字符）。
+
+    为什么这道闸门存在
+    ------------------
+    2026-10-06 一次会话里引入了 **7 处** U+FFFD —— 写文件时中文被截断，
+    产物是 `src/scan/runner.js` / `soft404.js` / `tools/archive_sink.py` /
+    `README.md` / spec 里的注释。**全套 300+ 单测全绿**，语法检查全过，
+    是最后靠另一个 agent 做字节级扫描才发现的。
+
+    这是纯粹的机械问题：编码被截断。它不该靠人扫、更不该靠另一个 agent 扫。
+
+    ⚠️ 只查 U+FFFD，不查别的编码问题。
+        「看起来是乱码」有太多成因（终端代码页、控制台渲染），
+        而 U+FFFD 是**文件里真的存了这个字符**——零歧义、零判断成本。
+
+    ⚠️ 扩展名判定用 ENCODED_EXT，与 all_source_files() 收集时用的是**同一个常量**。
+        2026-10-06 之前这两处各写了一份，而收集的那份更窄 ——
+        于是这个 `if` 在 --all 模式下永远为真地 continue，是死代码。
+        两份硬编码清单必然漂移，漂移的表现是「闸门报告通过而它从没看过那个文件」。
+    """
+    bad = 0
+    checked = 0
+    for rel in files:
+        path = os.path.join(ROOT, rel)
+        if not os.path.isfile(path):
+            continue
+        if not rel.lower().endswith(ENCODED_EXT):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="strict") as fh:
+                text = fh.read()
+        except UnicodeDecodeError as exc:
+            print(f"[precommit] ✗ {rel} 不是合法 UTF-8：{exc}")
+            bad += 1
+            continue
+        checked += 1
+        for i, line in enumerate(text.split("\n"), 1):
+            if "\ufffd" in line:
+                col = line.index("\ufffd")
+                snippet = line.strip()
+                if len(snippet) > 70:
+                    snippet = snippet[max(0, col - 25): col + 25] + "…"
+                print(f"[precommit] ✗ {rel}:{i} 有字节损坏 U+FFFD：…{snippet}…")
+                bad += 1
+                break  # 一个文件报一次就够，全列出来会淹掉真正的信息
+    if not bad:
+        print(f"[precommit] ✓ 编码检查通过（{checked} 个文件）")
     return bad
 
 
@@ -147,10 +213,45 @@ def run_unit_tests():
     return 1
 
 
+def run_static_gates():
+    """跑两个亚秒级静态闸门：面板 DOM 契约 + 前景/背景对比度。
+
+    ⚠️ 为什么它们在**这里**而不只在 `npm run test:all`：
+        2026-10-06 之前，`ui_contract_gate.py` 与 `contrast_gate.py`
+        两个文件都存在、都能跑、都全绿，但**没接在任何地方**。
+        那是本仓库文档里记着的那个失败模式的原样复现：
+        「有闸门，但从没被要求跑过」与「没有闸门」长得一模一样。
+
+    ⚠️ 只在 `--all`（全量）模式下跑，暂存模式不跑：
+        契约闸门查的是整个面板，而提交时暂存区往往只有一两个文件；
+        对着没改动的文件报红是误报，误报的闸门会被学会忽略。
+
+    判据的形状与 `check_syntax` 一致：rc != 0 就是红，输出原样打出来。
+    """
+    red = 0
+    for label, script in (("面板契约", "ui_contract_gate.py"),
+                          ("对比度", "contrast_gate.py")):
+        p = run(["python", os.path.join("tools", script)], timeout=180)
+        if p.returncode == 0:
+            continue
+        out = (p.stdout or b"").decode("utf-8", "replace") + (p.stderr or b"").decode("utf-8", "replace")
+        print(f"[precommit] ✗ {label}闸门没过：")
+        for line in out.split("\n"):
+            s = line.strip()
+            # 只摘失败项，其余几十条 OK 是噪音
+            if s.startswith("FAIL:") or s.startswith("- ") or s.startswith("False") or "COLLISION" in s:
+                print(f"    {s}")
+        red += 1
+    if not red:
+        print("[precommit] ✓ 面板契约 + 对比度闸门通过")
+    return red
+
+
 def main():
     args = sys.argv[1:]
     tests_only = "--tests-only" in args
-    files = [] if tests_only else (all_source_files() if "--all" in args else staged_files())
+    all_mode = "--all" in args
+    files = [] if tests_only else (all_source_files() if all_mode else staged_files())
 
     red = 0
     if not tests_only:
@@ -159,6 +260,14 @@ def main():
         if red:
             print("[precommit] 语法没过就不再跑测试 —— 先把语法修对")
             return 1
+        red += check_encoding(files)
+        if red:
+            print("[precommit] 编码损坏就不往下跑测试 —— 那不是测试红，是文件本身坏了")
+            return 1
+        if all_mode:
+            red += run_static_gates()
+            if red:
+                return 1
     red += run_unit_tests()
     if red:
         print("\n[precommit] 提交被拦下。修好再提交；"

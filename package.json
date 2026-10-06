@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Chrome MV3 书签智能分类扩展（零构建：原生 ES Module）",
   "scripts": {
+    "build:vendor": "esbuild src/ai/vendor-entry.js --bundle --format=esm --platform=browser --target=chrome116 --outfile=src/vendor/pi-ai.js --minify",
     "test": "python tools/precommit.py --tests-only",
     "test:falsify": "python tests/product_falsification.py",
     "test:falsify:llm": "python tests/falsify_inject_path.py",
@@ -20,10 +21,14 @@
     "log:sink": "python tools/fail_log_sink.py",
     "log:sink:selftest": "python tools/fail_log_sink.py --selftest",
     "gate:privacy": "python tools/privacy_gate.py",
+    "gate:contrast": "python tools/contrast_gate.py",
+    "gate:ui": "python tools/ui_contract_gate.py",
     "test:all": "python tools/verify_all.py",
     "package": "python tools/package.py"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.0.4",
+    "esbuild": "^0.28.2",
     "playwright": "^1.63.0"
   }
 }

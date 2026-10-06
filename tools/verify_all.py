@@ -1,11 +1,17 @@
-"""一键全量验证：单元 + 产品级证伪 + E2E + 压缩包可加载性。
+"""一键全量验证：面板契约 + 单元 + 产品级证伪 + E2E + 压缩包可加载性。
 
 用法：python tools/verify_all.py
 结果同时写到 tests/.final.txt（本机控制台是 GBK，直接 print 中文会乱码）。
+
+⚠️ 本脚本**不要**与任何编辑或测试并发跑：`product_falsification.py` 会修改
+   真实源文件、跑一遍整套、再还原。并发时你会拿到一次假失败
+   （证伪正在给 normalize.js 注入 indexedDB，而你同时跑了单测，
+   纯链路闸门理所当然地红了）。
 """
 import os
 import re
 import shutil
+import glob
 import subprocess
 import sys
 import tempfile
@@ -38,15 +44,51 @@ def run(cmd, timeout=900):
 
 
 def main():
-    unit_ok = falsify_ok = e2e_ok = zip_ok = False
+    unit_ok = falsify_ok = e2e_ok = zip_ok = ui_ok = False
+
+    # 0) 面板 DOM 契约闸门
+    #    ⚠️ 排在**最前面**是刻意的：它是纯静态检查，零浏览器、亚秒级。
+    #       而 E2E 与证伪是分钟级。把它排在后面等于让人等两分钟才发现
+    #       「面板上那个 id 拼错了」这种一秒就能看出的事。
+    #    2026-10-06 之前它压根没接在任何地方 —— 也就是「有闸门但从没被要求跑过」，
+    #    与 precommit.py 文档里记的那个失败模式一模一样。
+    say("[0] 面板契约闸门")
+    r = run(["python", os.path.join("tools", "ui_contract_gate.py")], timeout=120)
+    out = (r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace"))
+    ui_ok = r.returncode == 0
+    for line in out.split("\n"):
+        # 只摘 False 行、PASS/FAIL 标题与 FAIL 清单，其余三十多条 True 是噪音。
+        # ⚠️ FAIL 标题在**行首**（没有缩进），False 行是**缩进**过的 ——
+        #    早先的正则 `^\s+(False|FAIL:)` 会把标题漏掉，于是失败清单
+        #    孤零零地飘出来而没有 FAIL 三个字，看起来像半截输出。
+        if re.search(r"^\s*False\b|^\s+-\s|^FAIL:|^PASS", line):
+            say(f"      {line.strip()}")
+    say(f"      exit={r.returncode}  成立={ui_ok}")
 
     # 1) 单元
-    r = run(["node", "--test", "--test-reporter=tap", "tests/unit/*.test.js"])
+    # ⚠️ 枚举出显式文件列表，**不要**把 "tests/unit/*.test.js" 当一个参数交给 node。
+    #    node 自己展开 glob 只有 Node 22+ 才认；Node 20 上它会当成一个字面文件名，
+    #    然后**静默什么都不跑**，而 `counts()` 从空输出里取不到 fail 键 → fail=None，
+    #    `None == 0` 为假 → 反而判成失败。两种结局都错：要么假红，要么（更糟）
+    #    哪天输出里恰好出现过一个 `# fail 0` 就变成假绿。
+    #    这里与 tools/precommit.py 用同一套枚举，两边不会漂移。
+    unit_files = sorted(
+        os.path.relpath(p, PROJ).replace("\\", "/")
+        for p in glob.glob(os.path.join(PROJ, "tests", "unit", "*.test.js"))
+    )
+    if not unit_files:
+        say("[1] 单元测试        一个 tests/unit/*.test.js 都没找到")
+        return 1
+    r = run(["node", "--test", "--test-reporter=tap", *unit_files])
     tap = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
     c = counts(tap)
-    unit_ok = c.get("fail") == 0 and r.returncode == 0
+    # 绿灯必须真的跑过：TAP 汇总行里的 tests 数必须等于枚举到的文件里至少 1 个用例
+    ran = c.get("tests", 0)
+    unit_ok = c.get("fail") == 0 and r.returncode == 0 and ran > 0
     say(f"[1] 单元测试        tests={c.get('tests')} pass={c.get('pass')} "
-        f"fail={c.get('fail')}  exit={r.returncode}")
+        f"fail={c.get('fail')}  exit={r.returncode}  文件数={len(unit_files)}")
+    if ran == 0:
+        say("      ⚠️ 汇总行里 tests=0 —— 什么都没跑，不能当通过")
 
     # 2) 产品级证伪：改坏真实源码，确认整套测试会红
     r = run(["python", "tests/product_falsification.py"])
@@ -107,8 +149,9 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
     say()
-    say(f"单元={unit_ok}  证伪={falsify_ok}  E2E={e2e_ok}  压缩包可加载={zip_ok}")
-    allok = unit_ok and falsify_ok and e2e_ok and zip_ok
+    say(f"面板契约={ui_ok}  单元={unit_ok}  证伪={falsify_ok}  "
+        f"E2E={e2e_ok}  压缩包可加载={zip_ok}")
+    allok = ui_ok and unit_ok and falsify_ok and e2e_ok and zip_ok
     say("总判定：" + ("全部通过" if allok else "存在失败项"))
 
     text = "\n".join(lines)

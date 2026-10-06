@@ -113,6 +113,153 @@ CASES = [
         ["归入位置", "根 id"],
         None,
     ),
+    # ─────────── AI 模型接入改造（2026-10-06）新增的 5 处 ───────────
+    (
+        "把失败当成成功读（pi-ai 失败时 resolve 而不 reject → 整套错误诊断消失）",
+        os.path.join("src", "ai", "context.js"),
+        "  if (message.stopReason === 'error') return true;",
+        "  if (message.stopReason === 'error') return false;   // ← 证伪补丁：把失败当成功",
+        ["静默", "错误诊断", "isErrorResult", "当成成功", "运行时结果"],
+        None,
+    ),
+    (
+        "去掉 30s 超时（挂住的连接会让整个面板永久冻结在「LLM 兜底分类中…」）",
+        os.path.join("src", "ai", "runtime.js"),
+        "const REQUEST_TIMEOUT_MS = 30_000;",
+        "const REQUEST_TIMEOUT_MS = 0;   // ← 证伪补丁：超时形同虚设",
+        ["超时", "AbortController", "fetch 必须带超时", "冻结"],
+        None,
+    ),
+    (
+        "capturingFetch 不透传 init（signal 就在 init 里 → 超时保护被悄悄摘掉）",
+        os.path.join("src", "ai", "runtime.js"),
+        "    const res = await fetch(url, init);",
+        "    const res = await fetch(url);   // ← 证伪补丁：把 init 丢掉，signal 没了",
+        ["capturingFetch", "signal", "超时", "init"],
+        None,
+    ),
+    (
+        "注入的 key 被写进 storage（安全不变量：环境变量密钥不得落进扩展存储）",
+        os.path.join("src", "ai", "credential-store.js"),
+        "      const envOwner = envKey ? providerForBaseUrl(injected.baseUrl)?.id : null;\n"
+        "      if (envOwner === id) return { type: 'api_key', key: envKey, source: 'env' };",
+        "      const envOwner = envKey ? providerForBaseUrl(injected.baseUrl)?.id : null;\n"
+        "      if (envOwner === id) {\n"
+        "        await this.writeManual(id, envKey);   // ← 证伪补丁：把注入的 key 落盘\n"
+        "        return { type: 'api_key', key: envKey, source: 'env' };\n"
+        "      }",
+        ["storage", "注入", "密钥", "credential", "出现在 storage"],
+        None,
+    ),
+    (
+        "百炼漏掉 regionBound（401 会给出错误排障方向：让人换 key，而真正要改的是区域）",
+        os.path.join("src", "ai", "provider-registry.js"),
+        "    regionBound: true,",
+        "    regionBound: false,   // ← 证伪补丁：区域绑定标志被抹掉",
+        ["百炼", "区域", "regionBound", "区域绑定"],
+        None,
+    ),
+    # ─────── 零写入闸门补洞（link-scan 01 号工单）新增的 3 处 ───────
+    # 这三条打的是**闸门本身**：2026-10-06 之前 chrome.alarms / chrome.permissions /
+    # fetch / indexedDB 全部逃过零写入闸门，而它们正是 link-scan 要用的全部能力。
+    # 闸门对新区块覆盖为零 = 一道看不见的网。
+    (
+        "纯模块开始用 chrome.alarms（闸门曾对定时能力零覆盖）",
+        os.path.join("src", "plan.js"),
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';",
+        "import { isExcludedUrl, dedupeKey, pathQueryOf } from './normalize.js';\n"
+        "export function schedule() { chrome.alarms.create('x', { periodInMinutes: 360 }); }",
+        ["不得命中新闸门", "纯链路源码"],
+        None,
+    ),
+    (
+        "纯模块开始 fetch 出网（闸门曾对网络能力零覆盖）",
+        os.path.join("src", "dedupe.js"),
+        "import { dedupeKey, isExcludedUrl } from './normalize.js';",
+        "import { dedupeKey, isExcludedUrl } from './normalize.js';\n"
+        "export async function ping(u) { const r = await fetch(u); return r.status; }",
+        ["不得命中新闸门", "纯链路源码"],
+        None,
+    ),
+    (
+        "纯模块开始用 indexedDB（闸门曾对异步存储零覆盖）",
+        os.path.join("src", "normalize.js"),
+        "export function parseUrl(raw) {",
+        "export function db() { return indexedDB.open('bo', 1); }\n\n"
+        "export function parseUrl(raw) {",
+        ["不得命中新闸门", "纯链路源码"],
+        None,
+    ),
+    # ─── link-scan 的 5 处（.scratch/link-scan）───
+    (
+        "死链阈值去掉「跨 24h」（alarms 会任意延迟 → 丢一轮就误杀）",
+        os.path.join("src", "scan", "dead-threshold.js"),
+        "  return t - lastOkAt >= DEAD_MIN_SPAN_MS;",
+        "  return t - lastOkAt >= 0;   // ← 证伪补丁：丢一轮探测就判死",
+        ["24h", "不得判死", "跨度不够", "dead-threshold"],
+        None,
+    ),
+    (
+        "403/429/5xx 也计入失败计数（一次网络抖动毁掉一批书签）",
+        os.path.join("src", "scan", "dead-threshold.js"),
+        "  return status === 404 || status === 410;",
+        "  return status >= 400;   // ← 证伪补丁：什么错都算「链接没了」",
+        ["403", "永不进", "failStreak", "被当成了死链", "算进去"],
+        None,
+    ),
+    (
+        "软 404 开始计入失败计数（启发式不该参与判定）",
+        os.path.join("src", "scan", "verdict.js"),
+        "  if (rec.soft404 === true) return VERDICT.SOFT404;",
+        "  if (rec.soft404 === true) { rec.failStreak = 99; return VERDICT.DEAD; }"
+        "   // ← 证伪补丁：启发式直接判死",
+        ["软 404", "启发式", "failStreak", "不许参与计数"],
+        None,
+    ),
+    (
+        "跨站重定向也允许一键采纳（写错了没法撤销）",
+        os.path.join("src", "scan", "verdict.js"),
+        "  return verdict === VERDICT.REDIRECT_SAME;",
+        "  return verdict === VERDICT.REDIRECT_SAME || verdict === VERDICT.REDIRECT_CROSS;"
+        "   // ← 证伪补丁：跨站也放行",
+        ["一键采纳", "跨站", "人工判断", "D7"],
+        None,
+    ),
+    (
+        "embedding 超过批量上限不拦（官方硬限制 10 条，超了是 400）",
+        os.path.join("src", "dedupe", "embedding-client.js"),
+        "export const MAX_BATCH = 10;",
+        "export const MAX_BATCH = 50;   // ← 证伪补丁：撞官方硬限制",
+        ["单次最多", "MAX_BATCH", "批量", "400"],
+        None,
+    ),
+    # ─── 2026-10-06 评审后的补丁（评审抓出来的两个真 bug）───
+    (
+        "某条探不到时游标不前进（800 条里卡住一条，整轮再也走不到终点）",
+        os.path.join("src", "scan", "runner.js"),
+        "    if (r) {\n      const prev = prevs.get(id) || {};",
+        "    if (false) {\n      const prev = prevs.get(id) || {};   // ← 证伪补丁：结果拿不到就跳过",
+        ["游标", "停滞", "no-result", "整轮", "走不到终点"],
+        None,
+    ),
+    (
+        "设置项没有默认值（读它并与 false 比较恒为真，功能在但没人能关）",
+        os.path.join("src", "storage.js"),
+        "  linkScanAiFind: false,",
+        "  // ← 证伪补丁：把默认值删掉，于是 s.linkScanAiFind 恒为 undefined\n"
+        "  // undefined !== false 永远为真，「AI 找新地址」无条件常开",
+        # ⚠️ 这条要同时匹配**两个**会红的测试标题。
+        #    删掉 linkScanAiFind 的默认值后：
+        #      ① semantic-archive 的「默认设置里 link-scan 与语义去重都是关的」会红
+        #         （它断言 'linkScanAiFind' in DEFAULT_SETTINGS）
+        #      ② falsification 的「读设置项的 !== false …」**不会**红
+        #         —— 因为修 bug 时已把 background.js 的读取处改成 === true，
+        #            不再存在 X.linkScanAiFind !== false 这个模式了
+        #    早先只配了 ②，证伪跑出「RED 但关键字未匹配」——
+        #    变红是真的，只是量具没对准。**红灯找对了，尺子刻错了。**
+        ["默认设置里 link-scan", "读设置项", "恒为真"],
+        None,
+    ),
 ]
 
 

@@ -7,13 +7,17 @@
   "permissions": [
     "bookmarks",
     "storage",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "favicon"
   ],
   "optional_host_permissions": [
     "https://api.deepseek.com/*",
     "https://dashscope.aliyuncs.com/*",
     "https://api.openai.com/*",
-    "http://127.0.0.1:8731/*"
+    "http://127.0.0.1:8731/*",
+    "http://127.0.0.1:8732/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "src/background.js",

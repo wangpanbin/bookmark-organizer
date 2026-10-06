@@ -6,7 +6,16 @@
 
 Chrome MV3 扩展。按「功能」把已收集的书签自动归类到两层中文文件夹，**先预览、确认后再写入**，全程可回滚。
 
-零构建：原生 ES Module，不引打包器。`load unpacked` 直接跑。
+业务源码零构建：原生 ES Module，不引打包器。`load unpacked` 直接跑。
+
+> **唯一例外是 `src/vendor/pi-ai.js`**（约 601KB），它由 `npm run build:vendor`
+> 用 esbuild 从 npm 依赖 `@earendil-works/pi-ai` 打成的一个本地文件。
+> 扩展解析不了裸模块名，这是唯一的办法。
+> **产物提交进版本库** —— CI 用 Node 20 且不装依赖，产物不进库它无从校验；
+> 另存一份目录拷到别的电脑也要能直接加载。
+> 改了 `src/ai/vendor-entry.js` **必须**重跑 `npm run build:vendor`，
+> `tests/unit/vendor-path.test.js` 会拦住「改了没重建」。
+> 除这个产物外，仓库其余部分仍然是零构建原生 ESM。
 
 ---
 
@@ -99,13 +108,45 @@ Chrome MV3 扩展。按「功能」把已收集的书签自动归类到两层中
 
 规则没命中、落进「待归类」的那一小撮才会发给云端模型 —— **不会外发整个书签列表**。
 
-- 供应商：默认 **DeepSeek**（OpenAI 兼容协议），面板里可切百炼 / OpenAI
+- 供应商：默认 **DeepSeek**（OpenAI 兼容协议），面板里可切**阿里云百炼**、**Moonshot Kimi（国内）**、**OpenAI**、**MiniMax（国内）**
+- ⚠️ **MiniMax 走的是 `anthropic-messages` 协议，不是 OpenAI 兼容**，
+  而且它的 baseUrl 是 `https://api.minimaxi.com/anthropic`（带 `/anthropic` 后缀，不是 `/v1`）。
+  因此 JSON 模式对它自动关闭 —— Anthropic 请求体里没有 `response_format` 这个字段。
+  详见 `src/ai/provider-registry.js` 与 `src/ai/vendor-entry.js` 的注释
 - 默认 `baseUrl` = `https://api.deepseek.com`，`model` = `deepseek-flash`，均可改
+- 供应商与模型目录统一由 `src/ai/provider-registry.js` 提供，面板下拉由它派生
+- 加供应商**不需要**改 `manifest.json`：`optional_host_permissions` 里已有 `https://*/*`，
+  Chrome 官方文档写明此时可以请求任意 https 来源（协议匹配即可）
 - **默认开启**（`llmEnabled: true`）。想完全不发数据，去「设置」把它关掉；
   关闭后扩展不需要任何 host 权限
 - **API key 只存本机 `chrome.storage.local`**，不进 manifest、不进代码、不进 git
 - 权限**按需申请**：点「授权访问该域名」才弹窗；host 权限是
   `optional_host_permissions`，用哪个服务商的才申请哪个
+
+### 底层换成了 `@earendil-works/pi-ai`（2026-10-06）
+
+模型访问走 `src/ai/`，实际发请求由 `src/ai/runtime.js` 委托
+`@earendil-works/pi-ai`。**你看到的行为没有变**，变的只是底下那一层：
+
+- 30 秒超时、重试与指数退避、400 时降级 JSON 模式、按需权限门控、
+  注入的 key 不落盘 —— **全部原样保留**，一条没丢
+- `src/ai/errors.js` 里的错误文案逐字未动。它们是逐个对着真实服务商报错写的：
+  百炼的 key 与区域强绑定，跨区调返回的 401 看起来和「key 无效」一模一样，
+  但修法完全相反（一个改区域，一个换 key）
+
+改动过程中实测到三件与直觉相反、且都会**静默走错**的事，都写进了代码注释：
+
+1. `models.complete()` 失败时**不 reject**，而是 resolve 一个
+   `{ stopReason:'error', content:[] }`。当成成功读，401/429/5xx 会全部退化成
+   「模型返回了空内容」，整套错误诊断整条消失。
+2. 错误被压成扁平字符串（实测就是 `"Connection error."`），**没有状态码也没有响应体**。
+   所以 `runtime.js` 注入自定义 `fetch` 把两者截下来，诊断才拿得到。
+3. `openaiProvider()` 是 `openai-responses` 而非 openai-completions；
+   `minimaxCnProvider()` 是 `anthropic-messages` 而非 OpenAI 兼容。
+   协议走错不报错，只会拿到莫名其妙的 404/400。
+
+> `minimax` 暂未接进来：它在 pi-ai 里走 Anthropic 协议，要多带一个 SDK。
+> 要接的话只改 `src/ai/vendor-entry.js` + 注册表两处。
 
 ### key 从哪来（两级，优先用面板里手填的）
 
@@ -200,6 +241,97 @@ F:\logs\bookmark-organizer\2026-10-05.jsonl
 
 ---
 
+## 链接健康（死链 / 改链 / 元数据补全）
+
+定时探你书签里的 URL，识别 404、改址与超时，并把页面的作者、发布时间、站点类型、og 图补齐。
+
+> ⚠️ **默认关闭。** 要用请在「链接健康」页点一次「授权访问网站」。
+>
+> **启用后扩展会做什么**：访问**你书签里的那些 URL**，读它们的 HTTP 状态码、跳转目标与页面头部信息；死链会去 archive.org 查有没有存档快照。
+> **不会做什么**：不向任何第三方上传你的书签数据；**不改你的书签**——任何替换都要你在面板上逐条确认后亲自执行。
+>
+> 这段话不是免责套话：扩展会在你没打开面板时访问几百个域名，
+> 用户从 Network 面板看到的就是「这扩展在偷偷联网上上下」。
+
+### 怎么算「死链」
+
+**连续 3 次 404/410，且距上次成功探测 ≥24 小时。**
+
+两条都不是随手定的：
+
+- **只有 404 与 410 算「链接没了」。** 403（要登录）、429（限流）、5xx（服务端抽风）、超时全都不算。把它们算进去，一次网络抖动就能让一批书签集体变死链。
+- **为什么是「距上次成功 ≥24h」而不是「最近 3 次」。** Chrome 的 `chrome.alarms` 官方文档写明它 "may delay them an arbitrary amount more"（[官方文档](https://developer.chrome.com/docs/extensions/reference/api/alarms)）——丢一轮时，后者的语义是错的。
+- **从来没成功打开过的链接不算死链。** 那不叫「已经死了」，叫「还没探明白」——否则你刚收藏一条拼错的 URL，它就会被建议替换。
+
+### 改址只自动建议同站的
+
+跳到**同一个站**的新路径 → 面板上给「采纳替换」按钮。
+跳到**别的站** → 一律标「需人工判断」，**不给按钮**。品牌改名和跳登录页从 URL 上完全无法区分，盲信会毁掉你真收藏的地址。
+
+**扩展永远不会替你改书签。** 同站改址那一行给你新地址，可点开、可复制，你自己决定换不换；死链那一行给存档快照与经探测验证过的候选地址。
+
+> 曾经这里有个「采纳替换」按钮，它登记一条提案、toast 还承诺「到计划明细确认后执行」——
+> 而全仓库没有任何代码读那个提案。**界面承诺一件永远不会发生的事，比功能缺失更伤。**
+> 为什么不把 URL 改写做成一种计划项接进 `plan.js`：既有 E2E 闸门断言「每条计划项都落在它承诺的文件夹里」，
+> 而 URL 改写不落文件夹。要做必须另起工单重新设计它的预览与撤销。
+
+「AI 找新地址」默认**关闭**，要在「链接健康」页手动勾选 —— 开启后会把死链的标题与地址发给你配置的模型服务商。存档快照的查询不经过模型。
+
+### 「疑似软 404」是启发式，不是判定
+
+有的站返回 200 但内容写着「页面不存在」。扩展会标出来，但**明确标注为启发式**，且**不计入失败计数**——特征串匹配一定会误伤一篇讲「HTTP 404 怎么排查」的文章。宁可多让你看一眼。
+
+### 元数据补全
+
+抓 `<title>` / `og:*` / 作者 / 发布时间，并按域名与路径规则识别站点类型（文档 / 视频 / 工具 / 论文 / 代码 / 新闻 / 网页）。**规则认不出来就说认不出来**（标「未识别」），不猜。
+
+> favicon 走 Chrome 自己的 `_favicon` 接口，不额外发请求；取不到才降级到抓 `/favicon.ico`。
+
+---
+
+## 内容归档（防链接腐烂）
+
+「重要页存永久副本，原站挂了也能读」。
+
+**为什么落本机磁盘而不是扩展存储**：扩展一卸载，扩展存储就全没了——那和「永久」在语义上直接互斥。而且 800 条 × 平均正文 100KB ≈ 80MB，本机磁盘才装得下。
+
+```bash
+python tools/archive_sink.py --selftest    # 自检：写一条再读回，证明真能落盘
+python tools/archive_sink.py              # 起接收器（前台）
+```
+
+- 端口 `8732`，**只出现在三处**（改端口要同时改）：`tools/archive_sink.py` 的 `DEFAULT_PORT`、`src/archive/client.js` 与 `src/dedupe/embedding-client.js` 的 `SINK_PORT`（后者用 `/text` 取归档正文喂 embedding）
+- 落在 `--dir` 指定的目录，默认 `F:\archive\bookmark-organizer`
+- **分级**：全部存 HTML；**只有标记为「重要」的**才额外渲染 PDF 与整页截图
+- PDF/截图由 `tools/render_archive.js` 调本机已有的 Chromium 渲染
+- ⚠️ 接收器离线时**不静默降级**——面板上直接说「没起接收器」。这与失败日志的静默降级刻意不同：日志丢了只影响排查，而归档是整个功能的全部价值
+
+---
+
+## 语义去重（不同 URL 但同内容）
+
+用 embedding 判断「同一个页面被收藏成好几个 URL」（镜像站、转载站、官方文档与它的镜像）。
+
+> ⚠️ **结果只进「建议合并」，永不进删除清单。**
+
+URL 归一化判重敢自动删，是因为同一组条目的 URL 字符串完全相同。而 embedding 判重完全不同：两篇不同文章语义相近是**常态**，而「站点不同内容同构」在真实世界大量存在。误删你真收藏的内容是这个项目里最贵的错误。
+
+> ⚠️ **默认关闭**，要在「链接健康」页手动勾选。
+> 它要把**标题 + 正文摘要**发到百炼做向量化 —— 这是比 LLM 分类更敏感的一类外发，
+> 因为向量本身就是你书签的指纹。开启时面板上会明说这一点。
+> 归档侧车没开时自动退回「只用标题」，不报错。
+
+在「链接健康」页点「跑一轮语义去重」，结果按相似度排序显示，**刻意没有「合并」「删除」按钮** —— 唯一能做的就是看一眼。
+
+- 模型：百炼 `text-embedding-v4`，1024 维
+- ⚠️ **单次最多 10 条**（官方硬限制，超了是 400）
+- 输入：**标题 + 正文摘要约 300 字**（正文来自归档侧车；侧车没开就自动退回只用标题）
+- 成本：800 条约一毛二，免费额度 100 万 token
+- 向量存 IndexedDB（`Float32Array`），**不进 `storage.local`**——后者存 800×1024 维的 JSON 数字是 8MB 字符串，每次读写都要整体序列化
+- 换了模型或维度后要点「清空向量缓存」，否则新旧向量会混在一起比
+
+---
+
 ## 开发
 
 ```bash
@@ -241,8 +373,14 @@ npm run test:scale -- 2000    # 换个规模
 
 ### 单元测试
 
-**154 项**，覆盖 URL 归一化、去重、规则匹配、计划生成、类目合并、storage 契约、去重逐条否决、失败日志降级路径。
+**308 项**，覆盖 URL 归一化、去重、规则匹配、计划生成、类目合并、storage 契约、去重逐条否决、失败日志降级路径、模型接入四层、链接健康的纯函数层与编排层、语义去重、归档客户端，以及**死代码可达性**。
 `tests/fixtures/samples.js` 是命中率闸门的输入（阈值 70%，实测 90.3%）。
+
+`tests/unit/reachability.test.js` 值得单说一句：它检查「声明为已完成的导出是否真被引用」、
+「消息处理器是否真注册进了 `HANDLERS`」、「面板引用的 DOM id 是否真在 html 里」。
+它存在是因为 2026-10-06 的评审抓到一个反复出现的失败模式：
+**模块写了、单测也绿了，但没有任何地方调用它** —— 而这看起来非常像「功能完成」。
+给一个没人调的函数写 10 条单测，证明不了任何东西。
 
 `tests/unit/inject-path.test.js` 守的是「`tools/inject_key.py` 写的路径必须是
 `llm.js` 真能读到的路径」这条**契约**。它刻意不去测「key 文件在不在」——
@@ -267,17 +405,38 @@ storage.js 是全项目最容易**静默**损坏数据的模块，之前只能�
 故意造坏实现，确认对应闸门**确实会红**。
 
 `npm run test:falsify` 会备份真实源码、打上坏补丁、跑整套测试、断言变红、再还原。
-当前覆盖 10 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
+当前覆盖 15 处退化：剥掉全部 hash、剥掉全部 query、给 `plan.js` 注入写操作 import、
 注入**跨行**写操作 import、注入**动态** import 写操作模块、字典位置参数错位、
 给 `plan.js` 注入**日志模块**、发送成功后整条清空缓冲、`recordFailure` 不再兜底、
-把「归入位置」又写死成根 id。
+把「归入位置」又写死成根 id、**把失败当成成功读**、**去掉 30s 超时**、
+**capturingFetch 不透传 init**、**注入的 key 被写进 storage**、**百炼漏掉 regionBound**。
+
+> 后 5 处是接入 pi-ai 时新增的，它们对应的是「换底层最容易悄悄坏掉」的五件事：
+> 失败不 reject、超时被摘掉、signal 断链、密钥落盘、区域诊断丢失。
+>
+> 有一条是闸门自己抓出来的：最初 `llm.js` 里留了一份 `REQUEST_TIMEOUT_MS = 30_000`
+> 的副本（只为方便看），结果 runtime.js 把真值改成 0 时那道断言照样绿 ——
+> **同一个值在两处各存一份，等于给退化留了一条绕路**。已删掉副本，闸门才变红。
 
 > 绿灯本身不算证据。一道从来没红过的闸门，和没有闸门是一样的。
 
-> 这些闸门**没有任何东西会自动调用**（本仓库没有 CI，也没有默认接线的钩子）。
+> 这些闸门**没有任何东西会自动调用**（本仓库没有 CI）。
 > 最便宜的一段已经接成本机 `.git/hooks/pre-commit`：`python tools/precommit.py`
-> 跑语法检查 + 整套单测，2 秒、零浏览器。E2E 与证伪仍需手动 `npm run test:all` ——
+> 跑语法检查 + 编码检查 + 整套单测，2 秒、零浏览器；`--all` 模式再加两个亚秒级静态闸门
+> （面板 DOM 契约 + 前景/背景对比度）。E2E 与证伪仍需手动 `npm run test:all` ——
 > 它们要开浏览器，分钟级，塞进每次提交会变成没人愿意等的门。
+>
+> ⚠️ 2026-10-06 之前，`ui_contract_gate.py` 与 `contrast_gate.py` **两个文件都存在、
+> 都能跑、都全绿，但没接在任何地方** —— 与本文档反复记着的那个失败模式原样吻合：
+> 「有闸门但从没被要求跑过」和「没有闸门」长得一模一样。现在两者都接进了
+> `precommit.py --all` 与 `npm run test:all`。
+>
+> `npm run test:all` 现在是 **5 步**，按成本从低到高排：
+> 面板契约闸门（亚秒静态）→ 单元（2 秒）→ 证伪（分钟级，会改源码）→ E2E（分钟级）→ 压缩包真加载。
+> 面板契约排在**最前**是刻意的：它亚秒级，而 E2E 与证伪是分钟级 ——
+> 排在后面等于让人等两分钟才发现「面板上那个 id 拼错了」这种一秒能看出的事。
+> 它排在最前**是 2026-10-06 才接上的**：在那之前 `tools/ui_contract_gate.py`
+> 压根没接在任何地方，也就是「有闸门但从没被要求跑过」。
 
 ### E2E 闸门（9 条）
 
@@ -323,7 +482,16 @@ src/
     taxonomy.js       类目树 + 用户覆盖合并（纯函数）
     dict.js           预置规则词典（纯数据）
     rules.js          规则匹配器（纯函数）
-    llm.js            云端兜底 + 按需权限
+    llm.js            云端兜底编排（提示词 / 分批 / 权限门控 / 降级）
+  ai/                 ← 2026-10-06 新增：模型访问分层
+    provider-registry.js  供应商与模型目录（纯数据+纯函数，MODEL_PRESETS 由它派生）
+    errors.js             HTTP 错误诊断文案（纯函数）
+    context.js            Context 构造 / 结果判定（纯函数）
+    credential-store.js   按 providerId 的凭据读写（走 storage.js 的串行锁）
+    runtime.js            ⚠️ 唯一 import vendor 产物的模块
+    vendor-entry.js       esbuild 入口
+  vendor/
+    pi-ai.js          esbuild 产物（提交进版本库，改入口后跑 npm run build:vendor）
   storage.js          storage 封装：读-改-写全程持串行锁
   tree.js             getTree 扁平化
   backup.js           快照与回滚
@@ -331,6 +499,23 @@ src/
   fail-log.js         失败记录：本机缓冲 + 送本机接收器（写操作模块）
   listener.js         变更监听（导入期抑制）
   background.js       service worker 入口
+  scan/               链接健康（死链/改链 + 元数据补全）
+    verdict.js          探测结果 → 面板状态（重定向优先于死链）
+    dead-threshold.js   死链判据：连续 3 次 404/410 且距上次成功 ≥24h
+    extract-meta.js     HTML → og:/作者/发布时间（正则，不建 DOM）
+    soft404.js          软 404 识别（只标不判）
+    classify-site.js    站点类型（规则优先，认不出来就说认不出来）
+    probe.js            单条探测 + 并发受限的批量探测
+    runner.js           扫描循环：逐条落盘、可中断可续跑
+    scheduler.js        chrome.alarms 接线
+    permission.js       <all_urls> 按需授权 + 出网说明
+    alternatives.js     Wayback 快照 + AI 候选（候选必须逐个验证）
+  dedupe/             语义去重（不同 URL 但同内容）
+    semantic.js         余弦、粗筛、建议合并（纯函数）
+    embedding-client.js 百炼 text-embedding-v4 客户端（单次最多 10 条）
+    semantic-runner.js  编排 + IndexedDB 向量存储
+  archive/
+    client.js           送正文给本机接收器（离线时明说，不静默假装）
 ui/
   options.html/js/css 主面板（全屏）
   popup.html/js       工具栏弹窗（极简）
@@ -341,8 +526,9 @@ tests/
   e2e/                Playwright（harness.js / run.js / diagnose.js）
   product_falsification.py
 tools/
-  verify_all.py       全套验证（单测 + 证伪 + E2E）
+  verify_all.py       全套验证（面板契约 + 单测 + 证伪 + E2E + 压缩包真加载）
   precommit.py        提交前闸门（语法/JSON + 单测），已接成 .git/hooks/pre-commit
+  ui_contract_gate.py 面板 DOM 契约：E2E 靠数行数/按下标读字段的隐式耦合，改 DOM 前先看它
   privacy_gate.py     隐私闸门：扫所有将推送的 blob，查真 key / 真实书签数据
   package.py          打包产物
   inject_key.py       从本机环境变量把 API key 注入 src/llm-key.local.js（已 gitignore）

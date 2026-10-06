@@ -180,6 +180,39 @@ export const K = {
   TREE_VERSION: 'tree:version',
   /** 还没成功送到本机接收器的失败记录。既是重试队列，也是「重新导出」的数据源 */
   FAIL_LOG_PENDING: 'fail:pending',
+  /**
+   * 按 providerId 分开存的模型凭据。值形如 `{ [providerId]: {type:'api_key', key} }`。
+   * ⚠️ 这里**只允许存面板手填的 key**。`src/llm-key.local.js` 注入的环境变量
+   *    key 只能在内存里参与解析，任何路径写进这里都是安全事故。
+   */
+  AI_CREDENTIALS: 'ai:credentials',
+  /**
+   * link-scan（.scratch/link-scan）的键位。
+   *
+   * ⚠️ 每条书签一个键（`link:rec:<id>`），**不要**改成一个大 map 再整份重写：
+   *    800 条 × 每条一次全量写 = O(n²)，而探测是每条都要落盘的。
+   */
+  get linkRec() {
+    return (id) => `link:rec:${id}`;
+  },
+  /** 扫描循环的游标与状态机（形状抄 task:current） */
+  LINK_STATE: 'link:state',
+  /** 待归档正文队列，由 F3（content-archive）消费 */
+  LINK_QUEUE: 'link:queue',
+  /**
+   * 被用户标成「重要」的 URL 列表（数组）。
+   *
+   * ⚠️ **存 URL，不存书签 id**，且与 `LOCKS` 刻意不合并。
+   *    LOCKS 是「不要移动这条书签」，星标是「归档时多渲染一份 PDF」——
+   *    合并的后果是用户为归档打个星就把书签锁死，而界面上看不出来。
+   *    详见 src/archive/important.js。
+   */
+  ARCHIVE_IMPORTANT: 'archive:important',
+  /**
+   * 归档循环的游标（形状抄 LINK_STATE / TASK_CURRENT）。
+   * 归档 800 条要很久，SW 必然被回收好几次，所以进度必须落盘。
+   */
+  ARCHIVE_STATE: 'archive:state',
   get snapshot() {
     return (ts) => `snapshot:${ts}`;
   },
@@ -212,6 +245,49 @@ export const DEFAULT_SETTINGS = Object.freeze({
   keepSnapshots: 10,
   /** 自动去重 */
   dedupeEnabled: true,
+
+  /**
+   * ═══ link-scan（死链/改链检测 + 元数据补全）═══
+   *
+   * ⚠️ 默认**关闭**。D3 拍板的是「一次性可选全量权限」，
+   *    不是「装上就开始联网上千个域名」。
+   *    扩展在你没打开面板时静默访问你收藏的 600 个域名，
+   *    用户从 Network 面板看到的就是「这扩展在偷偷联网上上」。
+   *    必须用户点一次「立即检测」并授予 <all_urls> 才开始。
+   */
+  linkScanEnabled: false,
+  /** 探测节奏：360=6小时 / 1440=每天 / 10080=每周 */
+  linkScanIntervalMinutes: 360,
+  /** 单条探测超时（毫秒）。太长会让一轮拖到天亮 */
+  linkScanTimeoutMs: 8000,
+  /**
+   * 并发上限。
+   * ⚠️ 6 是保守值，不要调高。再高会撞服务端连接数限制，
+   *    表现是**大面积超时** → 全被判成 net_error → 报告里一大片「可疑」，全是噪声。
+   */
+  linkScanConcurrency: 6,
+  /** 是否做软 404 检测。关掉可以省一点正文的正则开销 */
+  linkScanSoft404: true,
+  /**
+   * ⚠️ 这项曾经**根本不存在**，而 `background.js` 写的是
+   *    `s.linkScanAiFind !== false` —— undefined !== false 恒为 true，
+   *    于是「AI 找新地址」无条件常开，且没有任何开关能关它。
+   *    症状是那种最难被发现的一类：功能「正常」，只是没人能关掉它。
+   *    教训：**读一个设置项之前先确认它被定义了。**
+   */
+  linkScanAiFind: false,
+
+  /**
+   * ═══ 语义去重（F2）═══
+   * ⚠️ 默认**关闭**。它要把标题（以及归档出来的正文摘要）发给百炼做向量化，
+   *    这是比 LLM 分类更敏感的一类外发：向量本身就是你书签的指纹。
+   *    所以它必须是显式开启的，而不是「配了 key 就自动跑」。
+   */
+  semanticDedupeEnabled: false,
+  /** 相似度阈值。越高越保守 —— 默认 0.92，宁可漏判镜像站 */
+  semanticThreshold: 0.92,
+  /** embedding 端点。百炼是 OpenAI 兼容接口，dart 已在可选权限里 */
+  embeddingBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 });
 
 export async function getSettings() {
