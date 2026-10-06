@@ -25,12 +25,15 @@ import {
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot } from '../src/backup.js';
 import {
   classifyBatch, hasLlmPermission, requestLlmPermission, revokeLlmPermission,
-  validateAssignments, resolveConfig, MODEL_PRESETS,
+  validateAssignments, resolveConfig, MODEL_PRESETS, resolveTarget,
 } from '../src/classify/llm.js';
 import {
   getPending, clearPending, probeSink, toJsonl,
   requestSinkPermission, revokeSinkPermission,
 } from '../src/fail-log.js';
+import {
+  getImportantUrls, isMarkedImportant, toggleImportant, clearImportant,
+} from '../src/archive/important.js';
 
 const MAX_ROWS = 300;
 
@@ -74,6 +77,78 @@ function busy(text) {
   el.textContent = text;
 }
 
+/** 填一个组合式空状态：标记 / 主句 / 引导。
+ *
+ * ⚠️ 为什么不复述已有按钮：hero 上「读取并预览」、健康页「立即检测一次」
+ *    都已经在那儿了。空状态里再摆一个同名按钮，用户反而要犹豫点哪个。
+ *    这里只说「现在是什么状态」和「下一步会发生什么」。 */
+function fillEmpty(el, mark, title, hint) {
+  el.textContent = '';
+  const m = document.createElement('span');
+  m.className = 'empty-mark';
+  m.setAttribute('aria-hidden', 'true');
+  m.textContent = mark;
+  const t = document.createElement('span');
+  t.className = 'empty-title';
+  t.textContent = title;
+  const h = document.createElement('span');
+  h.className = 'empty-hint';
+  h.textContent = hint;
+  el.append(m, t, h);
+}
+
+/** 骨架屏。形状照着最终布局裁，不做通用转圈。
+ *  ⚠️ 骨架只填**兄弟**容器，绝不塞进 #planBody / #healthRows ——
+ *     E2E 数这两个容器的行数来判定「渲染完了」，塞占位行会假绿。 */
+function showSkeleton(hostId, rows = 6, on = true) {
+  const host = $(hostId);
+  if (!host) return;
+  host.textContent = '';
+  if (on) {
+    for (let i = 0; i < rows; i += 1) {
+      const row = document.createElement('div');
+      row.className = 'skeleton-row';
+      // 宽度按计划表的真实列比例错开，避免 6 条一模一样的横杠
+      const widths = ['c1', 'c2', 'c3', 'c1', 'c3', 'c2'];
+      for (const w of widths) {
+        const bar = document.createElement('i');
+        bar.className = `skeleton-bar ${w}`;
+        row.append(bar);
+      }
+      host.append(row);
+    }
+  }
+  host.hidden = !on;
+}
+
+/** 页签计数。非 0 才让 CSS 画药丸，0 保持纯灰字。 */
+function setTabCount(id, n) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = n;
+  el.dataset.n = String(n);
+}
+
+/** 整理进行中：把会互相打架的按钮按住。
+ *
+ * ⚠️ 为什么需要它：此前只有 #btnExecute 被 disable，「恢复备份」「立即备份」
+ *    「读取并预览」在执行循环跑着的时候仍然可点。三者都会改书签或改 task，
+ *    与执行循环并发时结果不可预期，而界面上看不出正在跑。
+ *    快照列表里的「恢复到这份 / 删除」是动态生成的，所以用 data-exec-guard
+ *    统一挂住，而不是在这里逐个 find。 */
+let execBusy = false;
+
+function setExecBusy(on) {
+  execBusy = !!on;
+  for (const id of ['btnPreview', 'btnRestore', 'btnSnapshot']) {
+    const el = $(id);
+    if (el) el.disabled = !!on;
+  }
+  for (const el of document.querySelectorAll('#snapList button')) {
+    el.disabled = !!on;
+  }
+}
+
 /** 发消息给 service worker */
 function send(type, payload) {
   return new Promise((resolve) => {
@@ -108,6 +183,13 @@ const REASON_LABEL = {
  * @param {{backup:boolean}} opts backup=false 时只重算，不再存新快照（改判/锁定后用）
  */
 async function loadAndClassify(opts) {
+  // 这一步要读整棵书签树、可能还带一次 LLM 兜底，实测能到十几秒。
+  // 表的形状是已知的（7 列），所以摆骨架；不放进 #planBody，
+  // 因为 E2E 靠数它的行数判断这一轮渲染完了没有。
+  showSkeleton('planSkeleton', 6, true);
+  $('planTable').hidden = true;
+  $('planEmpty').hidden = true;
+
   busy('正在读取书签树…');
   state.entries = await readFlatTree();
   state.byId = new Map(state.entries.map((e) => [e.id, e]));
@@ -262,9 +344,8 @@ function renderStats() {
   $('stUnclassified').textContent = plan ? (plan.stats.byReason[REASON.UNCLASSIFIED] || 0) : '—';
   $('stDup').textContent = state.groups.length ? dedupeStats(state.groups).removable : '—';
   $('stFolders').textContent = plan ? plan.newFolders.length : '—';
-  $('tabPlanCount').textContent = plan ? plan.items.length : 0;
-  $('tabDupCount').textContent = state.groups.length;
-
+  setTabCount('tabPlanCount', plan ? plan.items.length : 0);
+  setTabCount('tabDupCount', state.groups.length);
   // 语义配色只给真实数字。还没数据时那些卡里是「—」占位符，
   // 涂成琥珀/红会看着像报错（「重复项」是红的，最误导），
   // 实际上只是「还没数据」。所以给占位符打个标记，让 CSS 收成中性。
@@ -294,21 +375,45 @@ function renderPlan() {
   const body = $('planBody');
   const empty = $('planEmpty');
   const more = $('planMore');
+  const table = $('planTable');
   body.textContent = '';
+  showSkeleton('planSkeleton', 6, false);
 
   if (!state.plan || !state.plan.items.length) {
+    table.hidden = true;
     empty.hidden = false;
-    empty.textContent = state.plan ? '没有需要移动的条目 —— 书签已经在正确的位置上了。' : '还没有预览。先点「读取并预览」。';
+    if (state.plan) {
+      fillEmpty(empty, '✓', '没有需要移动的条目',
+        '书签已经在正确的位置上了。这一步不需要你做任何事。');
+    } else {
+      fillEmpty(empty, '○', '还没有预览',
+        '点上面的「读取并预览」。扩展会读一遍书签树，先给出分类方案，一条都不改。');
+    }
     more.hidden = true;
     return;
   }
   empty.hidden = true;
+  table.hidden = false;
 
   const onlyChanged = $('onlyChanged').checked;
   const onlyLow = $('onlyLow').checked;
   let rows = state.plan.items;
   if (onlyChanged) rows = rows.filter((i) => i.status === 'pending');
   if (onlyLow) rows = rows.filter((i) => i.confidence === 'low');
+
+  // 筛选后一条不剩时不能只剩一张空表头。此前这里直接往下走，
+  // 结果是一张有表头、零行的表 —— 用户看不出是筛没了还是没数据。
+  if (!rows.length) {
+    table.hidden = true;
+    empty.hidden = false;
+    fillEmpty(empty, '○', '筛选后没有匹配的条目',
+      `这份计划有 ${state.plan.items.length} 条，但当前筛选下没有一条符合。`
+      + '取消上面的「只看将要移动的」或「只看低置信」再看一次。');
+    more.hidden = true;
+    return;
+  }
+  empty.hidden = true;
+  table.hidden = false;
 
   const shown = rows.slice(0, MAX_ROWS);
   const frag = document.createDocumentFragment();
@@ -324,17 +429,28 @@ function renderPlan() {
     cb.type = 'checkbox';
     cb.checked = !!it.locked;
     cb.title = '锁定后这条不会被移动';
+    cb.setAttribute('aria-label', `锁定这条，整理时不移动：${it.title || it.url || ''}`);
     cb.addEventListener('change', () => toggleLock(it.id, cb.checked));
     tdLock.append(cb);
 
-    // 书签
+    // 书签：标题与地址都可直接点开。
+    // ⚠️ .title 挂在 <a> 本身而不是外套一层元素：E2E 有多处按
+    //    `tr.querySelectorAll('td')` 的位置取 td[1]，换结构会让断言读空。
     const tdItem = document.createElement('td');
-    const title = document.createElement('div');
+    const title = document.createElement('a');
     title.className = 'title';
     title.textContent = it.title || '(无标题)';
-    const url = document.createElement('div');
+    const url = it.url
+      ? document.createElement('a')
+      : document.createElement('div');
     url.className = 'url';
     url.textContent = it.url || '';
+    if (it.url) {
+      url.href = it.url;
+      url.target = '_blank';
+      url.rel = 'noreferrer';
+      url.title = it.url;   // 长地址被 break-all 截断时，悬停能看到完整值
+    }
     tdItem.append(title, url);
 
     // 当前位置
@@ -356,15 +472,17 @@ function renderPlan() {
 
     // 依据
     const tdWhy = document.createElement('td');
+    const why = document.createElement('span');
+    why.className = 'why';
     const [label, cls] = REASON_LABEL[it.reason] || [it.reason, ''];
     const badge = document.createElement('span');
     badge.className = `badge ${cls}`;
     badge.textContent = label;
     const conf = document.createElement('span');
     conf.className = 'badge';
-    conf.style.marginLeft = '4px';
     conf.textContent = { high: '高', medium: '中', low: '低' }[it.confidence] || it.confidence;
-    tdWhy.append(badge, conf);
+    why.append(badge, conf);
+    tdWhy.append(why);
 
     // 反馈
     const tdFb = document.createElement('td');
@@ -373,10 +491,14 @@ function renderPlan() {
     const ok = document.createElement('button');
     ok.textContent = '✓';
     ok.title = '这条分得对';
+    // ⚠️ 光有 title 不算数：title 不是可访问名，图标按钮的读屏文本经常是空的。
+    //    这两个按钮的可见文案只有符号，必须补 aria-label。
+    ok.setAttribute('aria-label', '这条分得对，标记为正确');
     ok.addEventListener('click', () => markRight(it.id));
     const bad = document.createElement('button');
     bad.textContent = '✗ 改';
     bad.title = '分错了，选正确分类';
+    bad.setAttribute('aria-label', '这条分错了，选正确分类');
     bad.addEventListener('click', () => openPicker(it.id));
     fb.append(ok, bad);
     tdFb.append(fb);
@@ -394,7 +516,23 @@ function renderDup() {
   const box = $('dupList');
   const empty = $('dupEmpty');
   box.textContent = '';
-  if (!state.groups.length) { empty.hidden = false; return; }
+  // 三态：没检测过 / 检测过且一个没有 / 有结果。
+  // ⚠️ 此前只要 state.groups 为空就显示「没有发现重复项」，而 state.groups
+  //    在用户点「读取并预览」之前本来就是空的。于是每次打开面板都先被告知
+  //    一个根本没跑出来的结论 —— 比没有空状态更糟，用户会以为已经查过了。
+  if (!state.plan) {
+    empty.hidden = false;
+    fillEmpty(empty, '○', '还没检测',
+      '点上面的「读取并预览」，去重会跟着一起跑，重复的书签会列在这里等你逐条确认。');
+    return;
+  }
+  if (!state.groups.length) {
+    empty.hidden = false;
+    fillEmpty(empty, '✓', '没有发现重复项',
+      '每条书签的归一化地址都不重复。归一化只剥「纯顶部锚点」白名单里的 hash，'
+      + 'SPA 路由（#/a 与 #/b）一律保留，不会误判。');
+    return;
+  }
   empty.hidden = true;
 
   const frag = document.createDocumentFragment();
@@ -408,7 +546,7 @@ function renderDup() {
 
     const liKeep = document.createElement('li');
     liKeep.className = 'keep';
-    liKeep.textContent = `保留：${g.keeper.title || g.keeper.url} — ${displayPath(g.keeper.path)}`;
+    liKeep.textContent = `保留：${g.keeper.title || g.keeper.url}（${displayPath(g.keeper.path)}）`;
     ul.append(liKeep);
 
     for (const d of g.duplicates) {
@@ -428,8 +566,8 @@ function renderDup() {
       const label = document.createElement('span');
       label.className = 'label';
       label.textContent = vetoed
-        ? `不删：${d.title || d.url} — ${displayPath(d.path)}`
-        : `删除：${d.title || d.url} — ${displayPath(d.path)}`;
+        ? `不删：${d.title || d.url}（${displayPath(d.path)}）`
+        : `删除：${d.title || d.url}（${displayPath(d.path)}）`;
 
       li.append(cb, label);
       ul.append(li);
@@ -457,8 +595,13 @@ async function renderSnapshots() {
   const box = $('snapList');
   const empty = $('snapEmpty');
   box.textContent = '';
-  $('tabSnapCount').textContent = snaps.length;
-  if (!snaps.length) { empty.hidden = false; return; }
+  setTabCount('tabSnapCount', snaps.length);
+  if (!snaps.length) {
+    empty.hidden = false;
+    fillEmpty(empty, '○', '还没有快照',
+      '每次预览和执行前都会自动存一份。Chrome 没有原生撤销，快照是唯一的退路。');
+    return;
+  }
   empty.hidden = true;
 
   const frag = document.createDocumentFragment();
@@ -477,9 +620,11 @@ async function renderSnapshots() {
     const restore = document.createElement('button');
     restore.className = 'danger-ghost';
     restore.textContent = '恢复到这份';
+    restore.disabled = execBusy;   // 整理进行中不让它和执行循环抢书签
     restore.addEventListener('click', () => doRestore(s));
     const del = document.createElement('button');
     del.textContent = '删除';
+    del.disabled = execBusy;
     del.style.marginLeft = '8px';
     del.addEventListener('click', async () => {
       if (!confirm(`删除这份快照？\n\n${s.at ? new Date(s.at).toLocaleString() : s.ts}\n\n删掉之后就无法回到那个时间点了。`)) return;
@@ -583,7 +728,7 @@ async function renderReport() {
     for (const f of task.failed.slice(0, 20)) {
       const li = document.createElement('li');
       li.style.fontSize = '12px';
-      li.textContent = `${f.url} — ${f.error}`;
+      li.textContent = `${f.url}：${f.error}`;
       ul.append(li);
     }
     box.append(h, ul);
@@ -775,6 +920,7 @@ async function doExecute() {
   if (!confirm(msg)) return;
 
   $('btnExecute').disabled = true;
+  setExecBusy(true);
   execBarReset = false;   // 新任务从 0 开始，撤掉上一轮的完成凭据
   const res = await send('startExecution', {
     plan,
@@ -783,6 +929,7 @@ async function doExecute() {
   });
   if (!res.ok) {
     toast(`启动失败：${res.error}`, true);
+    setExecBusy(false);
     syncExecuteButton();
     return;
   }
@@ -792,6 +939,7 @@ async function doExecute() {
   //    都会弹「已开始执行」，然后什么都不发生 —— 从用户看就是「点了没反应」。
   if (res.result && res.result.started === false) {
     toast(`没有开始整理：${res.result.reason || '未知原因'}`, true);
+    setExecBusy(false);
     syncExecuteButton();
     return;
   }
@@ -819,6 +967,9 @@ async function pollProgress() {
     if (task.status !== TASK_STATUS.RUNNING) break;
     await new Promise((r) => setTimeout(r, 400));
   }
+  // 循环结束（无论 DONE / FAILED / PAUSED）就松开按钮组。
+  // 放在两个提前 return 之前，否则中断和失败两条路会一直按着不放。
+  setExecBusy(false);
   // 跑完重新读树，刷新计划视图
   await safeReload();
   const task = await getTask();
@@ -848,7 +999,7 @@ async function pollProgress() {
   if (failN > 0) {
     toast(`整理结束：成功 ${doneN} 条，失败 ${failN} 条`
       + (notes.length ? `（${notes.join('；')}）` : '')
-      + ' —— 失败原因见下方红色明细', true);
+      + '失败原因见下方红色明细', true);
     renderFailures(items, task);
     return;
   }
@@ -868,7 +1019,7 @@ function renderFailures(items, task) {
   if (!host) return;
   const rows = (task.failed || [])
     .slice(0, 10)
-    .map((f) => `<li>${escapeHtml(f.title || f.url || f.id)} —— ${escapeHtml(String(f.error || ''))}</li>`)
+    .map((f) => `<li>${escapeHtml(f.title || f.url || f.id)}：${escapeHtml(String(f.error || ''))}</li>`)
     .join('');
   const more = (task.failed || []).length > 10 ? `<li>…共 ${task.failed.length} 条</li>` : '';
   host.innerHTML =
@@ -1004,7 +1155,7 @@ function renderPresetSelect() {
   sel.textContent = '';
   const custom = document.createElement('option');
   custom.value = '';
-  custom.textContent = '— 自定义（在下面手填 base URL 与模型）—';
+  custom.textContent = '自定义（在下面手填 base URL 与模型）';
   sel.append(custom);
   for (const p of MODEL_PRESETS) {
     const o = document.createElement('option');
@@ -1061,6 +1212,23 @@ async function loadSettingsUi() {
   const match = MODEL_PRESETS.find((p) => `${p.baseUrl}::${p.model}` === cur);
   $('llmPreset').value = match ? cur : '';
 
+  // 当前 base URL 落在哪一家 —— 说清楚是为了排障，不是装饰。
+  // 百炼的 key 与区域强绑定，跨区调返回的 401 看起来和「key 无效」一模一样，
+  // 看到「自定义端点」就能立刻排除「是不是服务商搞错了」这个方向。
+  const provEl = $('llmProviderState');
+  const target = resolveTarget({ baseUrl: s.baseUrl, model: s.model });
+  if (target.isCustom) {
+    provEl.textContent = `当前服务商：自定义端点（${target.baseUrl || '未填写'}）`
+      + '，按 OpenAI 兼容协议调用。若它其实是一家已登记的服务商，把 base URL 改成下拉里的写法，'
+      + '错误提示会更准。';
+    provEl.classList.add('warn-text');
+  } else {
+    const models = MODEL_PRESETS.filter((p) => p.providerId === target.providerId).map((p) => p.model);
+    provEl.textContent = `当前服务商：${target.providerId}`
+      + `（可选模型：${models.join('、') || '可自由填写'}）`;
+    provEl.classList.remove('warn-text');
+  }
+
   // key 来源要说清楚：手填 / 环境变量注入 / 没有
   const cfg = await resolveConfig(s);
   const stateEl = $('llmKeyState');
@@ -1083,7 +1251,7 @@ async function loadSettingsUi() {
   try { host = new URL(cfg.baseUrl).host; } catch { /* 保持原样 */ }
   $('llmPermState').textContent = granted
     ? `已授权访问：${host}`
-    : `尚未授权访问 ${host}。启用 LLM 前需要先点「授权访问该域名」—— 权限是按需申请的，不开 LLM 就不需要。`;
+    : `尚未授权访问 ${host}。启用 LLM 前需要先点「授权访问该域名」。权限是按需申请的，不开 LLM 就不需要。`;
 }
 
 // ───────────────────── 移动失败日志 ─────────────────────
@@ -1106,13 +1274,13 @@ async function refreshSinkState() {
   const p = await probeSink();
   const el = $('sinkState');
   if (p.state === 'no-permission') {
-    el.textContent = '接收器状态：未授权 —— 点下面的「授权本机日志接收器」一次即可。';
+    el.textContent = '接收器状态：未授权。点下面的「授权本机日志接收器」一次即可。';
     el.classList.add('warn-text');
   } else if (p.state === 'online') {
     el.textContent = `接收器状态：在线（本次会话已写入 ${p.lines} 条）→ ${p.dir}`;
     el.classList.remove('warn-text');
   } else {
-    el.textContent = '接收器状态：离线 —— 先在本机开 npm run log:sink。'
+    el.textContent = '接收器状态：离线。先在本机开 npm run log:sink。'
       + '这不影响整理，失败记录会存在扩展里，随时可以「重新导出」。';
     el.classList.add('warn-text');
   }
@@ -1175,18 +1343,704 @@ async function exportPendingFailures() {
   toast(`已导出 ${pending.length} 条失败记录`);
 }
 
-// ───────────────────────── 启动 ─────────────────────────
+// ───────────────────────── 链接健康（死链/改链 + 元数据补全）─────────────────────────
+//
+// ⚠️ 本节的三条纪律来自 spec，E2E 要按 **DOM** 断言它们，不看内部状态：
+//   1. 跨站重定向的行里**不许有**「采纳替换」按钮
+//   2. 软 404 的行必须标出「启发式」
+//   3. 出网范围说明常驻，折叠别处也不消失
 
-async function init() {
-  // 标签页
-  for (const btn of $('tabs').querySelectorAll('button')) {
-    btn.addEventListener('click', () => {
-      for (const b of $('tabs').querySelectorAll('button')) b.classList.toggle('active', b === btn);
-      for (const p of document.querySelectorAll('.panel')) {
-        p.classList.toggle('active', p.dataset.panel === btn.dataset.tab);
+import { VERDICT, VERDICT_LABEL, canAutoReplace } from '../src/scan/verdict.js';
+import { KIND_LABEL } from '../src/scan/classify-site.js';
+import { OUTBOUND_DISCLOSURE } from '../src/scan/permission.js';
+import { faviconUrlFor } from '../src/scan/extract-meta.js';
+
+let linkState = null;
+let linkIndex = null;
+let linkRecords = [];
+/** 被标成「重要」的 URL。面板渲染时同步查表，不逐行 await storage。 */
+let importantUrls = [];
+/** 链接健康页的监听器是否已挂过。见 initLinkHealth 里的说明。 */
+let linkHealthWired = false;
+
+async function refreshLinkHealth() {
+  const res = await send('linkState');
+  if (!res || res.ok === false) return;
+  const data = res.result || {};
+  linkState = data.state;
+  linkIndex = data.index;
+  // 星标与探测记录是两份独立数据，都要从 storage 恢复（不是内存态）
+  importantUrls = await getImportantUrls();
+  renderImportantCount();
+
+  // 逐条读记录可能要几百次 storage 往返，这一秒里表是空的。
+  // 摆骨架而不是留白，形状照着真实表格裁。
+  showSkeleton('healthSkeleton', 5, true);
+  $('healthTable').hidden = true;
+  $('healthEmpty').hidden = true;
+
+  const ids = (linkState && linkState.ids) || [];
+  linkRecords = [];
+  for (const id of ids) {
+    const r = await send('linkRecord', { id });
+    if (r && r.ok && r.result) linkRecords.push(r.result);
+  }
+  renderLinkHealth();
+}
+
+function renderLinkHealth() {
+  $('healthDisclosureText').textContent = OUTBOUND_DISCLOSURE;
+
+  const st = linkState || {};
+  const unfinished = st.status === 'running' || st.status === 'paused';
+  $('btnLinkResume').hidden = st.status !== 'paused';
+  $('btnLinkPause').hidden = !unfinished;
+
+  const total = linkIndex ? linkIndex.total : 0;
+  const done = (st && st.cursor) || 0;
+  $('healthProgress').textContent = total
+    ? (st.status === 'done' ? `已扫完 ${done}/${total}` : `已扫 ${done}/${total}`)
+    : '尚未检测';
+  setTabCount('tabHealthCount', linkIndex ? linkIndex.actionable : 0);
+
+  // 汇总卡
+  const sum = $('healthSummary');
+  sum.textContent = '';
+  if (linkIndex) {
+    const cards = [
+      ['总数', linkIndex.total],
+      ['正常', linkIndex.byVerdict[VERDICT.OK] || 0],
+      ['可疑', linkIndex.byVerdict[VERDICT.SUSPECT] || 0],
+      ['死链', linkIndex.byVerdict[VERDICT.DEAD] || 0],
+      ['已改址', linkIndex.byVerdict[VERDICT.REDIRECT_SAME] || 0],
+      ['跳到别处', linkIndex.byVerdict[VERDICT.REDIRECT_CROSS] || 0],
+      ['需你看一眼', linkIndex.actionable],
+    ];
+    for (const [label, n] of cards) {
+      const div = document.createElement('div');
+      div.className = 'card';
+      const b = document.createElement('b');
+      b.textContent = String(n);
+      div.append(b, document.createTextNode(label));
+      sum.append(div);
+    }
+  }
+
+  // 明细表
+  const tbody = $('healthRows');
+  const empty = $('healthEmpty');
+  const table = $('healthTable');
+  tbody.textContent = '';
+  showSkeleton('healthSkeleton', 5, false);
+
+  const interesting = linkRecords
+    .filter((r) => r.verdict !== VERDICT.OK && r.verdict !== VERDICT.UNCHECKED)
+    .sort((a, b) => String(a.verdict).localeCompare(String(b.verdict)));
+
+  // 三态，别让空表头说话：
+  //   没扫过 → 从没跑过检测
+  //   扫过但全正常 → 明确说「都活着」，这是个好消息，值得说
+  //   有可疑项 → 列表
+  if (!linkRecords.length) {
+    table.hidden = true;
+    empty.hidden = false;
+    fillEmpty(empty, '○', '还没有检测结果',
+      '点上面「立即检测一次」。扩展会逐条读你书签里那些 URL 的状态码，'
+      + '结果只摆在这里等你判断，不会自动改任何书签。');
+    return;
+  }
+  if (!interesting.length) {
+    table.hidden = true;
+    empty.hidden = false;
+    fillEmpty(empty, '✓', '扫完了，没有发现问题',
+      `已检查 ${linkRecords.length} 条书签，没有死链，也没有需要改址的跳转。`);
+    return;
+  }
+  empty.hidden = true;
+  table.hidden = false;
+
+  for (const r of interesting) {
+    const tr = document.createElement('tr');
+    tr.dataset.verdict = r.verdict;
+
+    const v = document.createElement('td');
+    v.textContent = VERDICT_LABEL[r.verdict] || r.verdict;
+    tr.append(v);
+
+    const t = document.createElement('td');
+    // favicon 走 Chrome 自己的图标缓存，不发请求；加载失败时静默退化成标题文字
+    if (r.url) {
+      const box = document.createElement('div');
+      box.className = 'row-title';
+      const img = document.createElement('img');
+      img.className = 'favicon';
+      img.width = 16;
+      img.height = 16;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.src = faviconUrlFor(r.url, chrome.runtime.id);
+      img.addEventListener('error', () => img.remove(), { once: true });
+      box.append(img, document.createTextNode(r.pageTitle || r.url));
+      t.append(box);
+    } else {
+      t.textContent = r.pageTitle || '';
+    }
+    tr.append(t);
+
+    const u = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = r.url;
+    a.textContent = r.url;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    u.append(a);
+    tr.append(u);
+
+    const k = document.createElement('td');
+    k.textContent = (KIND_LABEL[r.kind] || r.kind) + (r.provider ? ` · ${r.provider}` : '');
+    tr.append(k);
+
+    const w = document.createElement('td');
+    w.textContent = r.checkedAt ? new Date(Number(r.checkedAt)).toLocaleString() : '—';
+    tr.append(w);
+
+    tr.append(linkSuggestionCell(r));
+    // 「重要」列放最后：前面的 td 下标有 E2E 在按位读，插在中间会静默读错字段
+    tr.append(importantCell(r));
+    tbody.append(tr);
+  }
+}
+
+/** 标题旁的标记计数。 */
+function renderImportantCount() {
+  const n = importantUrls.length;
+  $('importantCount').textContent = n ? `已标记 ${n} 页为重要` : '还没标记任何页';
+  $('btnImportantClear').disabled = n === 0;
+}
+
+/**
+ * 「重要」列：每行一颗星。
+ *
+ * ⚠️ 星标**不是锁**。「不要移动这条书签」是计划表里那个锁（存书签 id），
+ *    这里存的是 URL，语义是「归档时多渲染一份 PDF」。
+ *    两者合并过一次的后果是用户为归档打个星、那条书签从此不敢动，而界面上看不出来。
+ *
+ * 点一下切换，不弹窗：这是高频轻操作，弹窗会把标记变成负担。
+ */
+function importantCell(r) {
+  const td = document.createElement('td');
+  td.className = 'c-star';
+  const on = isMarkedImportant(r.url, importantUrls);
+  const btn = document.createElement('button');
+  btn.className = 'star';
+  btn.type = 'button';
+  btn.textContent = on ? '★' : '☆';
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.setAttribute('aria-label', on ? `取消标记 ${r.url} 为重要页` : `标记 ${r.url} 为重要页`);
+  btn.title = on ? '已标记：归档时额外存 PDF 与截图' : '标记为重要页：归档时额外存 PDF 与截图';
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      const res = await toggleImportant(r.url);
+      importantUrls = res.urls || [];
+      renderImportantCount();
+      renderLinkHealth();
+    } catch (e) {
+      toast('标记没存上：' + (e && e.message ? e.message : e), true);
+      btn.disabled = false;
+    }
+  });
+  td.append(btn);
+  return td;
+}
+
+/**
+ * 「建议」列。
+ *
+ * ⚠️ 这里**曾经**有一个「采纳替换」按钮，它写一条 `link:proposal:<id>` 提案，
+ *    toast 还跟用户承诺「到计划明细预览确认后才会真正改书签」。
+ *    而全仓库**没有任何代码读那个键** —— 承诺了一件永远不会发生的事。
+ *    界面骗人比功能缺失更伤，所以撤掉了。
+ *
+ * 为什么不把 URL 改写做成一种计划项接进 plan.js：
+ * 那会动到 dry-run 的结构 —— 既有 E2E 闸门断言「每条计划项都落在它承诺的文件夹里」，
+ * 而 URL 改写不落文件夹。这是本项目自己的红线：不为塞功能去改闸门。
+ * 真要做，必须另起一个工单专门设计它的预览与撤销。
+ *
+ * 现在给的是**真能用的东西**：新地址可直接点开、可复制。
+ */
+function linkSuggestionCell(r) {
+  const td = document.createElement('td');
+
+  if (r.verdict === VERDICT.REDIRECT_SAME && r.finalUrl && r.finalUrl !== r.url) {
+    const wrap = document.createElement('div');
+    const a = document.createElement('a');
+    a.href = r.finalUrl;
+    a.textContent = r.finalUrl;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    const copy = document.createElement('button');
+    copy.className = 'link';
+    copy.textContent = '复制新地址';
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(r.finalUrl);
+        toast('已复制新地址');
+      } catch {
+        toast('复制失败，地址已在上面，手动选中即可', true);
       }
     });
+    const note = document.createElement('span');
+    note.className = 'hint';
+    note.textContent = '同站改址 · 需你自己替换';
+    wrap.append(a, document.createElement('br'), copy, ' ', note);
+    td.append(wrap);
+    return td;
   }
+
+  if (r.verdict === VERDICT.DEAD || r.verdict === VERDICT.SUSPECT || r.verdict === VERDICT.REDIRECT_CROSS) {
+    const btn = document.createElement('button');
+    btn.textContent = r.verdict === VERDICT.DEAD ? '找替代（存档快照 / 新地址）' : '查一下';
+    btn.addEventListener('click', () => loadAlternatives(r));
+    td.append(btn);
+    return td;
+  }
+
+  const span = document.createElement('span');
+  span.className = 'hint';
+  // 软 404 必须写明这是启发式（spec 的硬要求）
+  span.textContent = r.verdict === VERDICT.SOFT404
+    ? '启发式判断，仅供参考，不做任何改动'
+    : '—';
+  td.append(span);
+  return td;
+}
+
+/**
+ * 加载一条的替代方案。
+ *
+ * ⚠️ 分组是硬要求：可采纳区只放**已验证**的候选。
+ *    AI 没有联网能力，它给的候选是猜的；未验证的直接换上去，
+ *    就是把用户真收藏的地址换成一个 404。
+ */
+async function loadAlternatives(rec) {
+  const box = $('healthAlt');
+  box.textContent = '';
+  box.hidden = false;
+  // 骨架而不是一行「正在查…」。这块的结果形状本来就是「若干条链接 + 一句判据」，
+  // 摆三条不同宽度的横杠，用户能预期接下来会看到什么。
+  const sk = document.createElement('div');
+  sk.className = 'skeleton';
+  for (const w of ['c1', 'c3', 'c2']) {
+    const row = document.createElement('div');
+    row.className = 'skeleton-row';
+    const bar = document.createElement('i');
+    bar.className = `skeleton-bar ${w}`;
+    row.append(bar);
+    sk.append(row);
+  }
+  box.append(sk);
+
+  const res = await send('linkAlternatives', { url: rec.url, title: rec.pageTitle || '' });
+  box.textContent = '';
+  box.append(renderAlternatives(rec, res && res.ok ? res.result : null));
+}
+
+function renderAlternatives(rec, alt) {
+  const frag = document.createDocumentFragment();
+  const h = document.createElement('h3');
+  h.textContent = `${rec.pageTitle || rec.url} 的替代方案`;
+  frag.append(h);
+
+  if (!alt) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '查不到替代方案。若是没授权、或网络不通，错误会在下面说明。';
+    frag.append(p);
+    return frag;
+  }
+
+  // 存档快照
+  if (alt.snapshot) {
+    const p = document.createElement('p');
+    const a = document.createElement('a');
+    a.href = alt.snapshot.url;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    a.textContent = alt.snapshot.url;
+    p.append(document.createTextNode('存档快照：'), a);
+    // ⚠️ 必须说清「怎么来的」：api 查出来的与 magic URL 跳过来的可靠性不同
+    p.append(document.createElement('br'));
+    const note = document.createElement('span');
+    note.className = 'hint';
+    note.textContent = alt.snapshot.method === 'api'
+      ? `来自 archive.org 查询（时间戳 ${alt.snapshot.ts}）`
+      : 'archive.org 查询接口没通，这是靠 web.archive.org 的跳转链接拿到的，可靠性略低';
+    p.append(note);
+    frag.append(p);
+  } else {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = 'archive.org 上没有这个 URL 的快照。';
+    frag.append(p);
+  }
+
+  // 已验证的候选 —— 唯一可以放心用的区
+  if (alt.adoptable && alt.adoptable.length) {
+    const p = document.createElement('p');
+    p.textContent = '候选新地址（已验证能打开）：';
+    const ul = document.createElement('ul');
+    for (const c of alt.adoptable) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = c.url;
+      a.target = '_blank';
+      a.rel = 'noreferrer';
+      a.textContent = c.url;
+      li.append(a, document.createTextNode(` · HTTP ${c.status}`));
+      ul.append(li);
+    }
+    p.append(ul);
+    frag.append(p);
+  }
+
+  // 未验证的默认折叠 —— 展示，但不诱导
+  if (alt.unverified && alt.unverified.length) {
+    const d = document.createElement('details');
+    const s = document.createElement('summary');
+    s.textContent = `${alt.unverified.length} 个未验证的候选（AI 猜的，展开看看）`;
+    const ul = document.createElement('ul');
+    for (const c of alt.unverified) {
+      const li = document.createElement('li');
+      li.textContent = `${c.url} · ${c.note || '打不开'}`;
+      ul.append(li);
+    }
+    d.append(s, ul);
+    frag.append(d);
+  }
+
+  if (alt.aiReason) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = `AI 找新地址：${alt.aiReason}`;
+    frag.append(p);
+  }
+
+  const p = document.createElement('p');
+  p.className = 'hint';
+  p.textContent = '这些都只是建议。扩展不会替你改书签。换不换、换成哪条，你自己定。';
+  frag.append(p);
+  return frag;
+}
+
+async function initLinkHealth() {
+  const perm = await send('linkPerm', {});
+  const has = perm && perm.ok && perm.result && perm.result.has;
+  $('healthPermState').textContent = has ? '已授权' : '未授权，此时不会发出任何请求';
+  $('btnLinkGrant').hidden = !!has;
+  $('btnLinkRevoke').hidden = !has;
+
+  const s = (await getSettings()) || {};
+  $('linkInterval').value = String(s.linkScanIntervalMinutes ?? 360);
+  $('linkAiFind').checked = s.linkScanAiFind === true;
+
+  // ⚠️ 这些监听器**只挂一次**。
+  //    早先每次切到「链接健康」页签都重挂一遍，于是切 3 次页签后
+  //    点一下「立即检测一次」会同时触发 3 次 —— 表现是「点了没反应」或
+  //    「跑了两遍」，而代码里看不出任何问题。
+  //    数据刷新（上面那段 + 末尾的 refreshLinkHealth）每次都要跑，挂载不要。
+  if (linkHealthWired) {
+    await refreshLinkHealth();
+    return;
+  }
+  linkHealthWired = true;
+
+  $('btnLinkGrant').addEventListener('click', async () => {
+    // ⚠️ 必须由用户手势直接触发，否则 Chrome 直接拒绝且不报错
+    const r = await send('linkPerm', { action: 'request' });
+    toast(r && r.result && r.result.has ? '已授权' : '未授权', !(r && r.result && r.result.has));
+    await initLinkHealth();
+  });
+  $('btnLinkRevoke').addEventListener('click', async () => {
+    await send('linkPerm', { action: 'revoke' });
+    toast('已撤销');
+    await initLinkHealth();
+  });
+
+  $('btnLinkRun').addEventListener('click', async () => {
+    toast('开始检测…');
+    const r = await send('linkStart');
+    if (r && r.result && r.result.started === false) {
+      toast(r.result.reason || '无法开始', true);
+    }
+    await refreshLinkHealth();
+  });
+  $('btnLinkResume').addEventListener('click', async () => {
+    await send('linkResume');
+    await refreshLinkHealth();
+  });
+  $('btnLinkPause').addEventListener('click', async () => {
+    await send('linkPause');
+    await refreshLinkHealth();
+  });
+
+  $('linkInterval').addEventListener('change', async (e) => {
+    const minutes = Number(e.target.value) || 0;
+    await updateSettings({ linkScanIntervalMinutes: minutes, linkScanEnabled: minutes > 0 });
+    const r = await send('linkSyncAlarm');
+    toast(r && r.result ? r.result.reason : '已更新');
+    await refreshLinkHealth();
+  });
+
+  $('linkAiFind').addEventListener('change', async (e) => {
+    await updateSettings({ linkScanAiFind: e.target.checked === true });
+    toast(e.target.checked
+      ? '已开启：死链的标题与地址会发给你配置的模型服务商'
+      : '已关闭：不再向模型发任何死链数据');
+  });
+
+  $('btnImportantClear').addEventListener('click', async () => {
+    importantUrls = await clearImportant().then((r) => r.urls);
+    renderImportantCount();
+    renderLinkHealth();
+    toast('已取消全部标记');
+  });
+
+  await refreshLinkHealth();
+}
+
+// ───────────────────────── 语义去重（F2）─────────────────────────
+//
+// ⚠️ D6：**结果只进「建议合并」，永不进删除清单。**
+//    本节刻意**没有**「合并」「删除」按钮 —— 唯一能做的就是看一眼。
+//    URL 归一化去重那一套是另一回事，两者互不替代。
+
+async function initSemantic() {
+  const s = (await getSettings()) || {};
+  $('semanticEnabled').checked = s.semanticDedupeEnabled === true;
+  $('semanticThreshold').value = String(s.semanticThreshold ?? 0.92);
+
+  const r = await send('semanticSuggestions');
+  const list = (r && r.ok && r.result && r.result.suggestions) || [];
+  renderSemantic(list);
+
+  $('semanticEnabled').addEventListener('change', async (e) => {
+    await updateSettings({ semanticDedupeEnabled: e.target.checked === true });
+    toast(e.target.checked
+      ? '已启用：标题与正文摘要会发到百炼做向量化'
+      : '已关闭：不再向百炼发送任何书签数据');
+  });
+  $('semanticThreshold').addEventListener('change', async (e) => {
+    const v = Number(e.target.value);
+    if (!Number.isFinite(v) || v < 0.5 || v > 1) {
+      toast('阈值要在 0.5 ~ 1 之间', true);
+      e.target.value = String(s.semanticThreshold ?? 0.92);
+      return;
+    }
+    await updateSettings({ semanticThreshold: v });
+  });
+  $('btnSemanticRun').addEventListener('click', async () => {
+    $('semanticState').textContent = '正在算…（800 条要分 80 批，请稍候）';
+    const res = await send('semanticRun');
+    if (!res || res.ok === false) { $('semanticState').textContent = '失败'; return; }
+    const d = res.result || {};
+    $('semanticState').textContent = d.reason
+      || `新增向量 ${d.embedded || 0} 条，建议合并 ${(d.suggestions || []).length} 对`;
+    renderSemantic(d.suggestions || []);
+  });
+  $('btnSemanticClear').addEventListener('click', async () => {
+    await send('semanticClear');
+    renderSemantic([]);
+    $('semanticState').textContent = '已清空。换过模型或维度后必须清，否则新旧向量会混在一起比。';
+  });
+}
+
+function renderSemantic(list) {
+  const tbl = $('semanticTable');
+  const tbody = $('semanticRows');
+  tbody.textContent = '';
+  if (!list || !list.length) { tbl.hidden = true; return; }
+  tbl.hidden = false;
+
+  for (const s of list) {
+    const tr = document.createElement('tr');
+    const cells = [
+      String(s.score),
+      s.keeper ? (s.keeper.title || s.keeper.url) : '',
+      s.loser ? (s.loser.title || s.loser.url) : '',
+    ];
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.append(td);
+    }
+    // 判据要能一眼看懂：光一个 0.93 的数字对用户毫无意义
+    const why = document.createElement('td');
+    why.textContent = [
+      s.evidence && s.evidence.sameTitle ? '标题完全相同' : null,
+      s.evidence && s.evidence.fromText ? '含正文比对' : '仅标题比对',
+    ].filter(Boolean).join(' · ');
+    tr.append(why);
+    tbody.append(tr);
+  }
+
+  const note = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = 4;
+  td.className = 'hint';
+  td.textContent = '这些只是建议。扩展不会替你合并或删除任何书签。要处理请自己动手，或用现有的 URL 去重功能。';
+  note.append(td);
+  tbody.append(note);
+}
+
+// ───────────────────────── 内容归档（F3）─────────────────────────
+
+let archiveWired = false;
+let archiveBusy = false;
+
+function paintSinkStatus(s) {
+  $('archiveState').textContent = s.online
+    ? `接收器在线（已写入 ${s.written || 0} 条）`
+    : '接收器离线';
+  $('archiveState').classList.toggle('warn-text', !s.online);
+  $('archiveNote').textContent = s.online
+    ? `目录：${s.dir || '未知'}`
+    : '先在项目目录跑 python tools/archive_sink.py，再点「检查接收器」。'
+      + '离线时扩展不会假装存了：归档是「防链接腐烂」的全部价值所在。';
+}
+
+async function refreshSinkStatus() {
+  const r = await send('archiveStatus');
+  paintSinkStatus((r && r.ok && r.result) || { online: false });
+}
+
+/**
+ * 跑归档。
+ *
+ * ⚠️ 循环在**这个页面**里，不在 service worker 里。
+ *    一次 `archiveRun` 只处理一个切片（游标落盘），800 条必然跨过好几次 SW 回收；
+ *    而 options 页面是真页面，不会被回收。形状与 link-scan 的 linkStart/linkStep 一致。
+ *
+ * 四类结果分开报，不合并成一个数字：合并就等于把「重新抓取失败」
+ * 藏进「已归档 200/800」里，而那正是「以为存了其实没存」的老坑。
+ */
+async function runArchive() {
+  if (archiveBusy) return;
+  archiveBusy = true;
+  const btn = $('btnArchiveRun');
+  btn.disabled = true;
+  try {
+    // guard 只是防跑飞：正常路径在队列跑完时 finished 置位并 break
+    for (let guard = 0; guard < 1000; guard++) {
+      const r = await send('archiveRun');
+      if (!r || r.ok === false) {
+        $('archiveState').textContent = `失败：${(r && r.error) || '后台无响应'}`;
+        $('archiveState').classList.add('warn-text');
+        return;
+      }
+      const d = r.result || {};
+      if (d.reason) {
+        $('archiveState').textContent = d.reason;
+        $('archiveState').classList.add('warn-text');
+        return;
+      }
+      if (!d.finished) {
+        $('archiveState').textContent = `归档中… 已落盘 ${d.done}，队列共 ${d.total}`;
+        $('archiveState').classList.remove('warn-text');
+        continue;
+      }
+      const bad = [];
+      if (d.fetchFailed) bad.push(`归档时重新抓取失败 ${d.fetchFailed} 条`);
+      if (d.postFailed) bad.push(`接收器拒收 ${d.postFailed} 条`);
+      if (d.skipped) bad.push(`无正文跳过 ${d.skipped} 条`);
+      $('archiveState').textContent =
+        `归档完成：${d.done}/${d.total} 条落盘`
+        + (d.rendered ? `，${d.rendered} 条额外出了 PDF 与截图` : '')
+        + (bad.length ? `。${bad.join('，')}` : '');
+      $('archiveState').classList.toggle('warn-text', bad.length > 0);
+      toast(bad.length ? '归档完成，但有没能存上的' : '归档完成');
+      break;
+    }
+  } finally {
+    archiveBusy = false;
+    btn.disabled = false;
+    await refreshSinkStatus();
+  }
+}
+
+async function initArchive() {
+  // 监听器只挂一次，理由同 initLinkHealth
+  if (archiveWired) {
+    await refreshSinkStatus();
+    return;
+  }
+  archiveWired = true;
+
+  await refreshSinkStatus();
+
+  $('btnArchiveProbe').addEventListener('click', refreshSinkStatus);
+  $('btnArchiveRun').addEventListener('click', runArchive);
+  $('btnArchiveReset').addEventListener('click', async () => {
+    await send('archiveReset');
+    $('archiveState').textContent = '进度已清空，下次点「归档队列里的正文」从头开始';
+    $('archiveState').classList.remove('warn-text');
+    toast('已清空归档进度（磁盘上已有的文件不受影响）');
+  });
+}
+
+// ───────────────────────── 启动 ─────────────────────────
+
+/** 切到某个页签。
+ *
+ * 此前只 toggle 一个 .active class：没有 role="tab"、没有 aria-selected、
+ * 也没有方向键。读屏用户听到的是 5 个互不相关的按钮。
+ * 改法照 WAI-ARIA 的 tabs 模式，但**保留 data-tab 与 click 触发** ——
+ * E2E 是按 `#tabs button[data-tab="dup"]` 点的，不能改成别的入口。
+ */
+function selectTab(btn, { focus = false } = {}) {
+  for (const b of $('tabs').querySelectorAll('button')) {
+    const on = b === btn;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;      // 漫游 tabindex：一组里只有一个可 Tab 到
+  }
+  for (const p of document.querySelectorAll('.panel')) {
+    p.classList.toggle('active', p.dataset.panel === btn.dataset.tab);
+  }
+  // hero 只在计划明细页 sticky：它有 250px 高且 z-index 高于卡片，
+  // 钉在别的页上会一直压住设置区那几张卡的上沿。CSS 靠这个属性判。
+  document.body.dataset.tab = btn.dataset.tab;
+  if (focus) btn.focus();
+
+  // 切到链接健康时按需加载一次 —— 那个面板要逐条读记录，
+  // 没必要在启动时就把几百条读进内存
+  if (btn.dataset.tab === 'health') {
+    initLinkHealth().catch(() => {});
+    initSemantic().catch(() => {});
+    initArchive().catch(() => {});
+  }
+}
+
+async function init() {
+  // 页签：点击 + 方向键（Left/Right 移动，Home/End 跳首尾）
+  const tabBtns = [...$('tabs').querySelectorAll('button')];
+  // 先落定默认页签，不等用户点一下。CSS 靠 body[data-tab] 决定 hero 钉不钉，
+  // 缺这个属性时设置页一打开 hero 就是 sticky 的，正好把卡片上沿盖掉。
+  selectTab(tabBtns.find((b) => b.classList.contains('active')) || tabBtns[0]);
+  tabBtns.forEach((btn, i) => {
+    btn.tabIndex = btn.classList.contains('active') ? 0 : -1;
+    btn.addEventListener('click', () => selectTab(btn));
+    btn.addEventListener('keydown', (e) => {
+      const map = { ArrowRight: 1, ArrowLeft: -1 };
+      let next = null;
+      if (e.key in map) next = tabBtns[(i + map[e.key] + tabBtns.length) % tabBtns.length];
+      else if (e.key === 'Home') next = tabBtns[0];
+      else if (e.key === 'End') next = tabBtns[tabBtns.length - 1];
+      if (!next) return;
+      e.preventDefault();
+      selectTab(next, { focus: true });
+    });
+  });
 
   $('btnPreview').addEventListener('click', async () => {
     // 新计划出来了，上一次的执行凭据就作废了 —— 否则用户会盯着一条满格进度条
@@ -1199,6 +2053,14 @@ async function init() {
       else toast(`预览完成：${state.plan.items.length} 条待移动，${state.dupPayload.length} 条重复`);
     } catch (e) {
       busy('');
+      // 骨架屏只在 render() 里收。loadAndClassify 抛错时走不到那里，
+      // 不显式撤掉的话，计划表会一直停在六条灰杠上，比报错还让人困惑。
+      showSkeleton('planSkeleton', 6, false);
+      $('planTable').hidden = true;
+      $('planEmpty').hidden = false;
+      fillEmpty($('planEmpty'), '○', '预览没跑起来',
+        '读书签树时出错了。点上面的「读取并预览」重试一次；'
+        + '如果反复失败，到 chrome://extensions 重新加载扩展。');
       toast(`预览失败：${e.message || e}`, true);
     } finally {
       $('btnPreview').disabled = false;
@@ -1279,7 +2141,7 @@ async function init() {
   $('btnGrantSink').addEventListener('click', async () => {
     const ok = await requestSinkPermission();
     toast(
-      ok ? '已授权本机日志接收器' : '未授权（需要在弹窗里点允许）—— 失败记录会存在扩展里，可随时重新导出',
+      ok ? '已授权本机日志接收器' : '未授权（需要在弹窗里点允许）。失败记录会存在扩展里，可随时重新导出',
       !ok,
     );
     await renderFailLogUi();
