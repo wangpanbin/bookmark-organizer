@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked` 直接跑。
+Chrome MV3 书签整理扩展。业务源码（`src/` 与 `ui/`）是原生 ES Module，`load unpacked` 直接跑。
 
 唯一例外：`src/vendor/pi-ai.js`（约 601KB）由 `npm run build:vendor` 用 esbuild
 从 `@earendil-works/pi-ai` 打成并**提交进版本库**。改 `src/ai/vendor-entry.js`
@@ -24,6 +24,12 @@ Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked
 > | 要改闸门 / 加判据 | `docs/testing.md` |
 > | 要改任何阈值 | `docs/acceptance-thresholds.md` |
 > | 要动语义去重阈值 | `docs/semantic-calibration.md` |
+> | 要改面板上给用户看的说明 | `docs/panel-help.md` —— **它就是面板「帮助」页签的内容**，见下面「面板」一节 |
+| **改面板的 DOM id** | 两份白名单要同步：`tools/ui_contract_gate.py` 的 `GATED` 与 `tests/unit/reachability.test.js` 的 `NEW`。漏改的后果是**点按钮没反应、且没有任何报错** |
+| **改配色** | 一份色板有**四处副本**：`ui/options.css` 的亮色块、`ui/options.css` 的**两块**暗色块（手动切换 / 系统偏好，逐字相同）、`ui/popup.html` 的内联 `:root`、`tools/contrast_gate.py` 的 `INK`/`BASE`。`ui_contract_gate.py` 会逐项对拍，四处任何一处漂了都会红 |
+>
+> 还在讨论的 spec / issue 草稿在 `.scratch/`（已 gitignore）。**别把它们当既定设计引用**，
+> 也不必为「文档缺失」报问题 —— 定稿后才进 `docs/`。
 >
 > 本文件（硬约束）与 `docs/testing.md`（闸门体系）是**两份不同职责的权威**，
 > 别把同一条规则抄到第三个地方 —— 已经开始沉积过一轮了。
@@ -37,11 +43,13 @@ Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked
 |---|---|
 | `npm run build:vendor` | 重建 `src/vendor/pi-ai.js`。**改了 `src/ai/vendor-entry.js` 就必须跑** |
 | `python tools/archive_sink.py --selftest` | 归档接收器自检：写一条再读回，判据是磁盘上真的多出文件、**且文件名跨进程稳定** |
-| `npm test` | 单元测试（Node 内置 test runner；需 Python 做文件枚举） |
+| `npm test` | 单元测试（Node 内置 test runner；需 Python 做文件枚举）。⚠️ **不跑静态闸门**，见下 |
+| `npm run gate:ui` | 面板 DOM 契约（`tools/ui_contract_gate.py`），亚秒静态 |
+| `npm run gate:contrast` | 前景/背景对比度（`tools/contrast_gate.py`），亚秒静态 |
 | `npm run test:falsify` | 产品级证伪：备份源码、打坏补丁、跑整套、断言变红、再还原。⚠️ **不是只读**，不能与任何编辑/测试并发 |
 | `npm run test:e2e` | E2E（**默认 headless，不弹窗**；需要开窗调试用 `BO_E2E_HEADED=1`，见约束 12） |
 | `npm run test:scope` | 手动指定书签范围的 E2E：两组对照 + 确认弹窗文案 + 失效不按 URL 认领（同样默认 headless） |
-| `npm run test:all` | 全套验证 |
+| `npm run test:all` | 全套验证。⚠️ **不含** `test:scope`，也**不含**对比度闸门 |
 | `npm run package` | 打包产物 |
 | `npm run gate:privacy` | 隐私闸门：扫所有将推送的 blob，查真 key / 真实书签数据 |
 
@@ -50,18 +58,25 @@ Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked
   只有 Node 22+ 认，Node 20 上会静默地什么都不跑，退出码还可能是 0。CI 首次实跑就是这么红的。
 - **别传目录**（`node --test tests/unit`）—— 本机会报 `MODULE_NOT_FOUND`。
 
-`python tools/precommit.py` 是**提交前闸门**：暂存区的 `.js`/`.mjs` 过 `node --check`、`.json` 过 parse，再跑一遍单测（2 秒、零浏览器）。
-`--all` 模式额外跑**两个亚秒级静态闸门**（面板 DOM 契约 + 前景/背景对比度）。
+`python tools/precommit.py` 是**提交前闸门**：暂存区的 `.js`/`.mjs` 过 `node --check`、`.json` 过 parse，
+**再查一遍编码损坏（U+FFFD）**，然后跑两个亚秒级静态闸门，最后跑一遍单测（2 秒、零浏览器）。
+开关只有两个：`--all` 查 `src/ ui/ tests/ tools/ docs/` 全部文件（CI 走这条），
+`--fast` 跳过静态闸门。⚠️ **`npm test` 走的是 `--tests-only`，它把静态闸门整段跳过** ——
+于是「单测全绿」与「面板契约和对比度都过」是两件事，只跑 `npm test` 时面板可以烂着。
 已接成本机 `.git/hooks/pre-commit`，每次 `git commit` 自动跑。
 ⚠️ `.git/` 不进版本库，所以**每台机器要装一次**：把下面这行写成 `.git/hooks/pre-commit` 并 `chmod +x`（Windows 用 Git 自带的 bash）——
 `exec python "$(git rev-parse --show-toplevel)/tools/precommit.py"`
-不接线的代价是实测过的：170 条单测与 10 处证伪点从来没被要求跑过，于是「全绿」和「没跑」长得一模一样。
-E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞进每次提交会变成没人愿意等的门。
-（E2E 现在是 headless 的，「要开浏览器」指它仍然是分钟级的真实浏览器流程，不是启动开销。）
+不接线的代价是实测过的：单测与十几处证伪点从来没被要求跑过，于是「全绿」和「没跑」长得一模一样。
+E2E 与证伪**故意不**进钩子——它们是分钟级的真实浏览器流程，塞进每次提交会变成没人愿意等的门。
+
+那道 U+FFFD 检查不是洁癖：一次会话里写文件把中文截断出 7 处 `�`，
+**全套单测全绿、语法检查全过**，靠另一个 agent 做字节级扫描才发现。写完中文注释别指望肉眼。
 
 本机 `node --test <目录>` 会把目录当模块解析报 `MODULE_NOT_FOUND`，脚本里已改用 glob。
+**条数别写进任何文档** —— `docs/testing.md` 明写「写死的数字会变成没人更新的谎话」，
+要当前条数看闸门自己的输出。
 
-## 三条不可破的约束
+## 不可破的约束（编号 0–12）
 
 0. **`fail-log.js` 同属写操作模块。** 它会发网络请求（本机接收器），
    被纯链路 import 就意味着 dry-run 不再零外发。已进 `FORBIDDEN_IN_PURE_CHAIN`。
@@ -80,8 +95,8 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
      报红 —— 误报是闸门失去可信度的最快方式：大家只会学会忽略它，真违规也一起被忽略。
 1b. **纯模块不得触碰的能力不止 chrome.bookmarks / storage**（2026-10-06 扩）。
    `chrome.alarms` / `chrome.permissions` / `chrome.tabs` / `chrome.runtime` /
-   `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon` / `importScripts` /
-   `indexedDB` 全部在禁用清单里。理由：link-scan 要用的恰好就是这批能力，
+   `chrome.debugger` / `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon` /
+   `importScripts` / `indexedDB` 全部在 `FORBIDDEN_RUNTIME` 里。理由：link-scan 要用的恰好就是这批能力，
    而旧清单对它们**覆盖为零** —— 一道看不见的网等于没有网。
    加新能力时同步在 `falsification.test.js` 补「会红」与「不误报」两个方向的用例。
 2. **`storage.js` 的读-改-写在同一个串行临界区内。** 不采用「内存累积 + hydrate」，那种写法要防的竞态恰是它自己引入的。
@@ -117,6 +132,9 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
 7. **「声明完成」的东西必须真的可达。** 闸门在 `tests/unit/reachability.test.js`：
    导出是否被引用、消息处理器是否真注册进了 `HANDLERS`、面板引用的 DOM id 是否真在 html 里。
    **加新功能时把新导出登记进 `MUST_BE_REACHABLE`** —— 登记了才有保护，不登记下次照样靠评审才发现。
+   ⚠️ 表里的路径**相对仓库根**解析（2026-10-07 起，之前一律 `join(SRC, rel)`），
+   所以 `ui/` 的模块也登记得进来。写 `ui/markdown.js` 时就是照旧写法只填了文件名，
+   规则说「要登记」而登记入口对 `ui/` 是不开的，于是帮助页签的渲染器就漏出去了。
 
    ⚠️ 这道闸门查的是「名字在别的文件里出现过」，**不是「被调用过」**。
    一行 `import { foo } from './x.js'` 就足以满足它，于是「import 了但没人调」照样全绿
@@ -129,7 +147,9 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
    记着「采纳替换」按钮为什么必须拿掉。**界面承诺一件永远不会发生的事，比功能缺失更伤** ——
    用户会据此安排自己的工作。宁可没有那个按钮，并把缺口写进文档。
    （能自动化的那部分已经自动化了：`ui_contract_gate.py` 禁止「采纳替换」类按钮回来，
-   并禁止文案里再出现「逐条确认」这个不存在的步骤。）
+   并禁止文案里再出现「逐条确认」这个不存在的步骤。
+   ⚠️ 扫描范围含 **`docs/panel-help.md`** —— 那份文档在运行时被渲染进 `options.html`，
+   它就是面板内容本身；只扫 `ui/` 等于给承诺留了一条侧门。）
 9. **读一个设置项之前先确认它被定义了。** `s.linkScanAiFind !== false` 在
    `DEFAULT_SETTINGS` 里没有该项时是**恒真**的 —— 功能「正常」，只是没人能关掉它。
    `tests/unit/falsification.test.js` 现在扫全 `src/` 找这种读法。
@@ -169,7 +189,7 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
 
    `tests/e2e/harness.js` 走 `channel`（系统 Chrome/Edge），
    `headless: true` 用的是**真实浏览器的新 headless 模式**，扩展照常工作
-   （本机 Edge 154 实测 service worker 正常出现，主干 9/9 + 手动范围 3/3 全绿且不弹窗）。
+   （本机 Edge 154 实测 service worker 正常出现，主干与手动范围两套全绿且不弹窗）。
 
    ⚠️ 曾经有一阵规则写着「扩展类 E2E 必须有头模式」，理由是
    `chromium_headless_shell` 不支持加载扩展。**那条限制只对 Playwright 自带的
@@ -190,19 +210,63 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
      「跑一半关浏览器、同 profile 重开继续跑」会读到**空的 `task:current`**，
      症状是「执行记录整个消失了」，而真因是一个没人会想到的临时目录名。
 
+## 面板（`ui/`）：颜色、归属、运行时文档
+
+面板重排在 2026-10-07 之后，下面几件事**改一处会漏另一处**，且漏了往往不报任何错。
+
+- **改一个颜色要动三个文件。** `ui/options.css`（真源）、`ui/popup.html`（**手工副本** ——
+  它不引 options.css，漏了不会有任何报错，只是主面板和工具栏弹窗成了两个色系）、
+  `tools/contrast_gate.py` 的 `INK` / `BASE`（**纯字面量，不读任何文件** ——
+  「改 CSS 不改它」时它照样 PASS，一道量着自己字面量的闸门对真实色板一行都量不到）。
+  `ui_contract_gate.py` 三处互校，`_sync_map` 就是那张对照表。
+  ⚠️ 从 CSS 里删掉一个 token 时，`_sync_map` 里那一行也要删 ——
+  两边都读不到时它只报 `None/None`，那不是「不一致」。
+- **暗色调色板写了两遍，必须逐字相同**（`:root:not([data-theme="light"])` 与
+  `:root[data-theme="dark"]`）—— CSS 没有「媒体查询 + 属性覆盖」的组合选择器。
+- **`#hero`（整理栏）只属于「计划明细」页，`#busy` 是全局浮层、不属于任何页。**
+  归属靠 `<section>` 的**配对扫描**判定，不能用非贪婪正则 ——
+  `#panel-plan` 里有嵌套 `<section>`，非贪婪会在内层 `</section>` 处截断。
+  E2E 直接断言「其余页签上这几个 id 一个都不可见」，所以改 DOM 形状前先读
+  `ui_contract_gate.py` 里 `_section_span` / `hero_is_inside_plan` / `busy_outside_plan` 三段自检。
+- **`ui/theme-boot.js` 必须是 `<head>` 里的经典同步脚本。** MV3 扩展页 CSP 是
+  `script-src 'self'`，行内脚本被直接拦掉；而 `options.js` 是 `type="module"`（天生 defer），
+  等它跑完第一屏已经用系统偏好画完了，再切暗色就是一次白闪。
+  它刻意用 `localStorage` 而不是 `storage.js`：`chrome.storage.local` 是异步的，来不及。
+- **`ui/markdown.js` 不碰任何 chrome API**，`document` 是注入参数 —— 这样 Node 下能直接单测。
+  它已经因此抓到过两个「浏览器里只表现为排版有点怪」的 bug。一律用 DOM API 拼节点，**禁止 innerHTML**。
+- **`docs/panel-help.md` 在运行时被 fetch**，路径写死三处：
+  `ui/options.js` 的 `HELP_DOC_URL`、`tools/package.py` 的 `INCLUDE_DOCS`、
+  `tests/e2e/harness.js` 的 `RUNTIME_DOCS`。`ui_contract_gate.py` 校这三处一致 ——
+  漂了的症状统一是「帮助页签空白」，但会被分别归因到三个不相干的地方。
+  另外两处必须同时改，否则症状一样但没人想得到：**打包白名单**（`docs/` 只放行这一个文件，
+  多漏一个工程文档就等于发给终端用户）与 **E2E 副本过滤**
+  （`cpSync` 的 filter 里 `docs/` **目录本身**必须返回 true，否则整棵子树被剪掉，文件根本没机会被访问）。
+  文风也受限：渲染器只认一个 Markdown 子集（**不许表格、不许引用块、不许嵌套列表**，链接只放行 https），
+  写在 `docs/panel-help.md` 头部。改它等于改界面文案，要过约束 8 那道承诺闸门。
+
 > ⚠️ **`npm run test:falsify` 不是只读的。** 它会**修改真实源文件**、跑一遍整套、
 > 再还原。所以它**不能和任何编辑或测试并发** —— 你今天已经因此拿到过一次假失败
 > （证伪正在给 `normalize.js` 注入 `indexedDB`，而你同时跑了 `npm test`，
 > 纯链路闸门理所当然地红了）。
 >
 > 跑它的时候：**什么都不做，等它自己结束。** 它的单次运行是分钟级。
-> 另外它结束时**必须 rc=0**：25 处退化全红但有一处关键字没匹配上时，
+> 另外它结束时**必须 rc=0**：退化全红但有一处关键字没匹配上时，
 > 脚本同样返回 1 —— 那不是「闸门失灵」，是**量具没对准**，
 > 看输出里的「实际标题」那一行去改关键字。
 
 > 绿灯本身不算证据。一道从来没红过的闸门，和没有闸门是一样的。
 > 改闸门时至少跑一次 `npm run test:falsify`，确认它确实会红。
 >
+13. **闸门自持的副本，必须由另一道检查去比对。**
+    `contrast_gate.py` **不读任何文件**，它的色值是硬编码字面量 —— 于是
+    「改了 CSS 没改它」时它照样 PASS，一道量着自己字面量的闸门对真实色板
+    一行都量不到，而**没有任何东西会红**。症状不是某个对比度超标，
+    是整个对比度体系悄悄失效。
+    同形的还有色板在 `popup.html` 的手工副本、运行时文档在
+    `package.py` / `harness.js` 两份白名单。
+    **判据**：凡是「闸门读的不是被闸的那个文件」的复制品，要么让闸门真去读，
+    要么由**另一道**检查比对两者。抄进闸门的常量不算保护，只算自我担保。
+
 > **放宽判据要双向证伪。** 收紧容易，**放宽**才是真正危险的那一半 ——
 > 删掉一条断言就能让自己「变绿」，而删断言永远不会被任何东西拦。
 > 所以每次放宽（改语义正则、删字面量、把「某句话」换成「某个性质」），
@@ -220,21 +284,12 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
 
 ## Agent skills
 
-### Issue tracker
+本仓库配了 skills 工作流，细节在 `docs/agents/`。只有两条是代码工作用得上的：
 
-Issue 走 **GitHub Issues**（`gh` CLI，仓库 `wangpanbin/bookmark-organizer`）。
-五个 triage label 在远端**已存在**，`triage` 直接 `--add-label`，不必新建。
-`.github/ISSUE_TEMPLATE/*.yml` 只对**网页端人工填报**生效；`gh issue create` 会**绕过**模版，
-所以 agent 建 issue 必须自己带 `--label`。
-⚠️ 仓库是 **public**：issue 正文里**绝不**贴真实书签标题/URL、key、token、本机绝对路径。
-`Status:` 行约定随本地 markdown 一同退役，见 `docs/agents/issue-tracker.md`。
+- **Issue 走 GitHub Issues**（`gh` CLI，仓库 `wangpanbin/bookmark-organizer`）。
+  `.github/ISSUE_TEMPLATE/*.yml` 只对网页端人工填报生效，`gh issue create` 会**绕过**模版，
+  所以 agent 建 issue 必须自己带 `--label`；五个 triage label 在远端**已存在**，直接 `--add-label`，不要新建。
+- ⚠️ 仓库是 **public**：issue 正文里**绝不**贴真实书签标题/URL、key、token、本机绝对路径。
 
-### Triage labels
-
-Five canonical roles kept as-is: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: 词汇表在根 `CONTEXT.md`，决策记录在 `docs/adr/`。
-**这两个都还不存在** —— 按 `docs/agents/domain.md` 的约定，「不存在就静默跳过」，
+`CONTEXT.md` 与 `docs/adr/` **都还不存在** —— 按 `docs/agents/domain.md` 的约定「不存在就静默跳过」，
 既不要报缺失，也不要预先创建。改 `src/` 之前先读 `README.md`，那里已有全部领域知识。

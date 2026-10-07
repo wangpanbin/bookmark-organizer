@@ -177,7 +177,7 @@ function setExecBusy(on) {
   execBusy = !!on;
   // ⚠️ 手动整理的按钮也要按住。执行期间清单若被改动，用户会以为
   //    「我刚移除的那条不会被动了」，而执行器跑的是**启动时**那份快照。
-  for (const id of ['btnPreview', 'btnRestore', 'btnSnapshot',
+  for (const id of ['btnPreview', 'btnDupPreview', 'btnRestore', 'btnSnapshot',
     'btnScopeRetry', 'btnScopeClearDone', 'btnScopeClearAll',
     'btnScopeAddPicked', 'btnScopePick', 'btnScopePreview']) {
     const el = $(id);
@@ -496,16 +496,42 @@ function renderStats() {
     b.parentElement.dataset.empty = b.textContent === '—' ? '1' : '0';
   }
 
-  // 展示管线：把「整理完成度」发布给 hero 环。
-  // 不参与任何状态机 / 消息协议 / 持久化，删掉它只影响一个圆环。
-  const ring = $('heroRing');
-  if (ring) {
+  // 展示管线：把「整理完成度」发布给窄栏顶部那条进度脊线。
+  // 不参与任何状态机 / 消息协议 / 持久化，删掉它只影响那一条 3px 的线。
+  //
+  // ⚠️ 一个 `--pct`、两种语义：
+  //   静止时 = 已在位 / 书签总数（累计），标题「整理完成度」
+  //   执行时 = 当前 / 本次总数，标题「本次进度」—— 由 renderReport() 接管
+  // 两种语义共用一根变量，标题必须跟着变；标题不变就是界面上放了一个
+  // 「说谎的数字」，而数字本身永远是对的。
+  const spine = $('planSpine');
+  if (spine) {
     const inPlace = plan ? (plan.stats.byReason[REASON.IN_PLACE] || 0) : null;
     const pct = (inPlace === null || !urls.length) ? null : Math.round((inPlace / urls.length) * 100);
-    ring.style.setProperty('--pct', String(pct ?? 0));
-    // 没预览过就显示「未预览」而不是 0% —— 0% 会被读成「一条都没整理好」。
-    ring.dataset.state = pct === null ? 'unknown' : 'ready';
-    $('heroRingVal').textContent = pct === null ? '未预览' : `${pct}%`;
+    setSpine(pct, null);
+  }
+}
+
+/**
+ * 写脊线。
+ * @param {number|null} pct  百分比；null = 尚无数据（整条收成轨道色）
+ * @param {'exec'|null} mode 'exec' 时切到「本次进度」口径
+ */
+function setSpine(pct, mode) {
+  const spine = $('planSpine');
+  if (!spine) return;
+  spine.style.setProperty('--pct', String(pct ?? 0));
+  // 没预览过就显示「未预览」而不是 0% —— 0% 会被读成「一条都没整理好」。
+  spine.dataset.state = pct === null ? 'unknown' : 'ready';
+  spine.dataset.mode = mode || 'done';
+  const cap = document.querySelector('.plan-side-cap > span');
+  if (cap) cap.textContent = mode === 'exec' ? '本次进度' : '整理完成度';
+  const val = $('spineVal');
+  if (val) {
+    const txt = $('execBarText');
+    val.textContent = pct === null
+      ? '未预览'
+      : (mode === 'exec' && txt ? txt.textContent.replace(/^.*?·\s*/, '') : `${pct}%`);
   }
 }
 
@@ -549,7 +575,11 @@ function renderScopeReady() {
   el.hidden = false;
   $('scopeReadyText').textContent =
     `预览已生成：清单里的 ${runnable} 条待移动，清单之外的书签不会被动。`
-    + '点右边去「计划明细」页核对，再点「执行整理」开始。';
+    // ⚠️ 2026-10-07 原文写的是「点右边去」——那是指向整理栏里的执行按钮。
+    //    整理栏收进「计划明细」页之后，本页根本没有那个按钮，
+    //    方位词就变成了界面在指一条不存在的路（AGENTS.md 约束 8）。
+    //    E2E 只断言「不会被动」这几个字（scope-run.js），所以改后半句是安全的。
+    + '切到「计划明细」页核对，再点「执行整理」开始。';
 }
 
 function renderPlanScopeChip() {
@@ -986,7 +1016,9 @@ function renderPlan() {
         '书签已经在正确的位置上了。这一步不需要你做任何事。');
     } else {
       fillEmpty(empty, '○', '还没有预览',
-        '点上面的「读取并预览」。扩展会读一遍书签树，先给出分类方案，一条都不改。');
+        // ⚠️ 不带方位词：整理栏 2026-10-07 之后是左边的窄栏，
+        //    「上面」/「下面」在窄屏塌成单列时立刻失效。
+        '点「读取并预览」。扩展会读一遍书签树，先给出分类方案，一条都不改。');
     }
     more.hidden = true;
     return;
@@ -1007,7 +1039,7 @@ function renderPlan() {
     empty.hidden = false;
     fillEmpty(empty, '○', '筛选后没有匹配的条目',
       `这份计划有 ${state.plan.items.length} 条，但当前筛选下没有一条符合。`
-      + '取消上面的「只看将要移动的」或「只看低置信」再看一次。');
+      + '取消「只看将要移动的」或「只看低置信」再看一次。');
     more.hidden = true;
     return;
   }
@@ -1121,15 +1153,17 @@ function renderDup() {
   //    一个根本没跑出来的结论 —— 比没有空状态更糟，用户会以为已经查过了。
   if (!state.plan) {
     empty.hidden = false;
+    // ⚠️ 「逐条确认」是 ui_contract_gate.py 第 11 条的禁用词：界面上没有
+    //    「逐条确认删除」这一步，写它就是在承诺一件做不到的事。
+    //    重复项是在「执行整理」那一步一起提交的，不是在这里逐条过。
     fillEmpty(empty, '○', '还没检测',
-      '点上面的「读取并预览」，去重会跟着一起跑，重复的书签会列在这里等你逐条确认。');
+      '点「重新预览」，去重会跟着一起跑，重复的书签会列在这里。');
     return;
   }
   if (!state.groups.length) {
     empty.hidden = false;
     fillEmpty(empty, '✓', '没有发现重复项',
-      '每条书签的归一化地址都不重复。归一化只剥「纯顶部锚点」白名单里的 hash，'
-      + 'SPA 路由（#/a 与 #/b）一律保留，不会误判。');
+      '每条书签的归一化地址都不重复。');
     return;
   }
   empty.hidden = true;
@@ -1294,6 +1328,12 @@ async function renderReport() {
       : broke ? `中断 · ${done}/${total} · 点「继续」接着跑`
       : missed ? `${done}/${total} · ${missed} 条未成功`
       : `${done}/${total}`;
+
+    // 窄栏顶部那条脊线在**执行期间**改显这一次执行的进度。
+    // 静止时它答的是「整理完成度」（累计已归位 / 总数），
+    // 执行时答的是「这一轮跑到哪了」—— 两种语义不能共用一个标签，
+    // 所以标题也跟着切，否则就变成一个说谎的数字。
+    setSpine(running || paused ? pct : null, running || paused ? 'exec' : null);
   }
 
   box.textContent = '';
@@ -1882,9 +1922,10 @@ async function loadSettingsUi() {
     stateEl.textContent = 'API key：使用上面输入框里的值（保存在本机 chrome.storage.local）。';
     stateEl.classList.remove('warn-text');
   } else {
-    stateEl.textContent = 'API key：没有。设环境变量 DEEPSEEK_API_KEY 后跑 '
-      + '`python tools/inject_key.py` 注入，或在上面手填。'
-      + '没有 key 时 LLM 兜底会自动跳过，未分类条目留在「其他/待归类」。';
+    // 只说「没有」和后果。注入步骤是开发文档的活，已经搬进
+    // docs/panel-help.md —— 界面上写命令，用户在面板里也跑不了。
+    stateEl.textContent = 'API key：没有。LLM 兜底会自动跳过，未分类条目留在「其他 / 待归类」。'
+      + '配置方法见「帮助」页签。';
     stateEl.classList.add('warn-text');
   }
 
@@ -1922,7 +1963,7 @@ async function refreshSinkState() {
     el.textContent = `接收器状态：在线（本次会话已写入 ${p.lines} 条）→ ${p.dir}`;
     el.classList.remove('warn-text');
   } else {
-    el.textContent = '接收器状态：离线。先在本机开 npm run log:sink。'
+    el.textContent = '接收器状态：离线。启动方法见「帮助」页签。'
       + '这不影响整理，失败记录会存在扩展里，随时可以「重新导出」。';
     el.classList.add('warn-text');
   }
@@ -1995,6 +2036,7 @@ async function exportPendingFailures() {
 import { VERDICT, VERDICT_LABEL, canAutoReplace } from '../src/scan/verdict.js';
 import { KIND_LABEL } from '../src/scan/classify-site.js';
 import { OUTBOUND_DISCLOSURE } from '../src/scan/permission.js';
+import { renderMarkdown } from './markdown.js';
 import { faviconUrlFor } from '../src/scan/extract-meta.js';
 
 let linkState = null;
@@ -2368,10 +2410,17 @@ function renderAlternatives(rec, alt) {
     frag.append(p);
   }
 
-  const p = document.createElement('p');
-  p.className = 'hint';
-  p.textContent = '这些都只是建议。扩展不会替你改书签。换不换、换成哪条，你自己定。';
-  frag.append(p);
+  // 免责那句收进 <details>：它是必要的信任声明（AGENTS.md 约束 8），
+  // 但它不该以三行正文的形式压在每一条替代方案下面。
+  const disc = document.createElement('details');
+  disc.className = 'alt-disclosure';
+  const sum = document.createElement('summary');
+  sum.textContent = '这些都是建议，扩展不会替你改书签';
+  const body = document.createElement('p');
+  body.className = 'hint';
+  body.textContent = '换不换、换成哪条，你自己定。';
+  disc.append(sum, body);
+  frag.append(disc);
   return frag;
 }
 
@@ -2482,7 +2531,9 @@ async function initSemantic() {
     await updateSettings({ semanticThreshold: v });
   });
   $('btnSemanticRun').addEventListener('click', async () => {
-    $('semanticState').textContent = '正在算…（800 条要分 80 批，请稍候）';
+    // ⚠️ 原文写死了「800 条要分 80 批」。那是设计时的规模假设，不是当前值：
+//    条数与批大小都由设置决定，写死等于界面在报一个自己都不知道的数字。
+    $('semanticState').textContent = '正在算，请稍候…';
     const res = await send('semanticRun');
     if (!res || res.ok === false) { $('semanticState').textContent = '失败'; return; }
     const d = res.result || {};
@@ -2547,8 +2598,9 @@ function paintSinkStatus(s) {
   $('archiveState').classList.toggle('warn-text', !s.online);
   $('archiveNote').textContent = s.online
     ? `目录：${s.dir || '未知'}`
-    : '先在项目目录跑 python tools/archive_sink.py，再点「检查接收器」。'
-      + '离线时扩展不会假装存了：归档是「防链接腐烂」的全部价值所在。';
+    // 「不会假装存了」这句是信任声明，必须留在界面上；
+    // 「怎么把接收器开起来」是开发文档的活，已经搬进 docs/panel-help.md。
+    : '接收器离线：扩展不会假装存了。启动方法见「帮助」页签。';
 }
 
 async function refreshSinkStatus() {
@@ -2630,6 +2682,114 @@ async function initArchive() {
   });
 }
 
+// ───────────────────────── 亮/暗切换 ─────────────────────────
+/**
+ * 用户指定的品牌色 #26ba82 在**暗色**下是正文墨色（6.88:1），
+ * 在**亮色**下当文字色只有 2.49:1 —— 于是「哪个好看」这件事，
+ * 在没有手动开关之前是被系统偏好替用户定的。
+ *
+ * 主题写 localStorage 而不是 chrome.storage：
+ *  ① 只需要 setItem，没有「读-改-写同一个键」，所以不碰 storage.js
+ *     那个串行临界区（约束 2）—— 这一条是判断依据，不是随手选的。
+ *  ② localStorage 按源隔离，而扩展页的源就是扩展 id：它天然跟着扩展走，
+ *     换 profile 不会串。
+ * ③ 首绘前那次写入由 ui/theme-boot.js 同步完成，不经过 service worker。
+ */
+const THEME_KEY = 'bo-theme';
+
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t === 'light' || t === 'dark') return t;
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === 'light' || theme === 'dark') {
+    root.dataset.theme = theme;
+  } else {
+    delete root.dataset.theme;     // 回到「跟随系统」
+  }
+  try {
+    if (theme === 'light' || theme === 'dark') localStorage.setItem(THEME_KEY, theme);
+    else localStorage.removeItem(THEME_KEY);
+  } catch (e) {
+    // 隐私模式下 localStorage 会抛。主题只是偏好，存不住不该阻断任何功能。
+  }
+  // color-scheme 要跟着走，否则 select / checkbox / 滚动条仍按系统偏好画，
+  // 暗色页面里会出现一块亮色原生控件。
+  root.style.colorScheme = theme === 'light' || theme === 'dark'
+    ? theme
+    : 'light dark';
+  syncThemeButton();
+}
+
+function syncThemeButton() {
+  const btn = $('btnTheme');
+  const icon = $('themeIcon');
+  if (!btn || !icon) return;
+  const isDark = currentTheme() === 'dark';
+  // 画的是**点下去会变成的那个**主题，不是当前的主题
+  icon.textContent = isDark ? '☀' : '☾';
+  btn.setAttribute('aria-label', isDark ? '切换到亮色主题' : '切换到暗色主题');
+  btn.title = isDark ? '切换到亮色主题' : '切换到暗色主题';
+}
+
+// ───────────────────────── 帮助页签 ─────────────────────────
+/**
+ * 把 docs/panel-help.md 渲染进面板。
+ *
+ * 为什么是运行时读取而不是把文案再抄一份进 HTML：
+ * 2026-10-07 之前，界面上有 30 多段说明性小字，其中大半讲的是
+ * 「这个功能怎么部署、边界在哪」——那是文档的活。用户来面板是为了看结果。
+ * 抄一份进 HTML 等于让两份文档各自漂移，半年后没人说得清界面在说哪一版。
+ *
+ * ⚠️ 渲染一律用 DOM API，**禁止 innerHTML**。
+ *    文档是仓库里的内容，但 innerHTML 会把它当 HTML 解析：
+ *    一个笔误的尖括号就能把整个面板的结构改掉，而症状是「某一页整个空了」。
+ */
+const HELP_DOC_URL = '../docs/panel-help.md';
+let helpLoaded = false;
+
+async function loadHelp({ force = false } = {}) {
+  const body = $('helpBody');
+  const err = $('helpError');
+  const empty = $('helpEmpty');
+  if (!body) return;
+  if (helpLoaded && !force) return;
+  helpLoaded = true;
+
+  if (empty) empty.hidden = true;
+  if (err) { err.hidden = true; err.textContent = ''; }
+
+  let text;
+  try {
+    const res = await fetch(HELP_DOC_URL, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    text = await res.text();
+  } catch (e) {
+    // ⚠️ 绝不允许「点了帮助页签，什么都没有」。
+    //    最可能的成因是这个文件没被打进包里（tools/package.py 的 INCLUDE_DOCS），
+    //    所以提示里直接点名那一步 —— 界面要能回答「为什么没有」。
+    helpLoaded = false;
+    if (err) {
+      err.hidden = false;
+      err.textContent =
+        `读不到 ${HELP_DOC_URL}（${e.message}）。`
+        + '这份文档需要打进扩展包里：确认 tools/package.py 的 INCLUDE_DOCS 列了它，'
+        + '然后重新 load unpacked。';
+    }
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = '帮助文档没读出来。';
+    }
+    return;
+  }
+
+  body.textContent = '';
+  renderMarkdown(text, body);
+}
+
 // ───────────────────────── 启动 ─────────────────────────
 
 /** 切到某个页签。
@@ -2649,8 +2809,9 @@ function selectTab(btn, { focus = false } = {}) {
   for (const p of document.querySelectorAll('.panel')) {
     p.classList.toggle('active', p.dataset.panel === btn.dataset.tab);
   }
-  // hero 只在计划明细页 sticky：它有 250px 高且 z-index 高于卡片，
-  // 钉在别的页上会一直压住设置区那几张卡的上沿。CSS 靠这个属性判。
+  // 整理栏现在是 #panel-plan 的子节点，非活动面板整棵 display:none，
+  // sticky 由祖先接管。body[data-tab] 仍然写着：它是给 E2E 与调试看的
+  // 「当前在哪一页」的唯一痕迹，删掉只会让排查少一根线。
   document.body.dataset.tab = btn.dataset.tab;
   if (focus) btn.focus();
 
@@ -2669,13 +2830,16 @@ function selectTab(btn, { focus = false } = {}) {
       renderScope();
     }).catch(() => {});
   }
+  // 帮助页签懒加载一次：读一份 markdown，重复切页不再发请求。
+  if (btn.dataset.tab === 'help') {
+    if (!helpLoaded) loadHelp();
+  }
 }
 
 async function init() {
   // 页签：点击 + 方向键（Left/Right 移动，Home/End 跳首尾）
   const tabBtns = [...$('tabs').querySelectorAll('button')];
-  // 先落定默认页签，不等用户点一下。CSS 靠 body[data-tab] 决定 hero 钉不钉，
-  // 缺这个属性时设置页一打开 hero 就是 sticky 的，正好把卡片上沿盖掉。
+  // 先落定默认页签，不等用户点一下。
   selectTab(tabBtns.find((b) => b.classList.contains('active')) || tabBtns[0]);
   tabBtns.forEach((btn, i) => {
     btn.tabIndex = btn.classList.contains('active') ? 0 : -1;
@@ -2692,11 +2856,17 @@ async function init() {
     });
   });
 
-  $('btnPreview').addEventListener('click', async () => {
+  // 「读取并预览」与「重新预览」是**同一个动作**：全量读树 + 分类 + 去重。
+  // 2026-10-07 之后「重复项」页也有一个入口（btnDupPreview），
+  // 两个按钮共用一个 handler —— 同一个动作两个实现，早晚会长出两套行为。
+  const runPreview = async () => {
     // 新计划出来了，上一次的执行凭据就作废了 —— 否则用户会盯着一条满格进度条
     // 以为已经整理过，其实那是上一轮的结果。
     execBarReset = true;
-    $('btnPreview').disabled = true;
+    for (const id of ['btnPreview', 'btnDupPreview']) {
+      const b = $(id);
+      if (b) b.disabled = true;
+    }
     try {
       await loadAndClassify({ backup: true });
       if (state.llmErrors.length) toast(state.llmErrors[0], true);
@@ -2709,17 +2879,36 @@ async function init() {
       $('planTable').hidden = true;
       $('planEmpty').hidden = false;
       fillEmpty($('planEmpty'), '○', '预览没跑起来',
-        '读书签树时出错了。点上面的「读取并预览」重试一次；'
+        '读书签树时出错了。点「读取并预览」重试一次；'
         + '如果反复失败，到 chrome://extensions 重新加载扩展。');
       toast(`预览失败：${e.message || e}`, true);
     } finally {
-      $('btnPreview').disabled = false;
+      for (const id of ['btnPreview', 'btnDupPreview']) {
+        const b = $(id);
+        if (b) b.disabled = false;
+      }
     }
-  });
+  };
+  $('btnPreview').addEventListener('click', runPreview);
+  const dupPreviewBtn = $('btnDupPreview');
+  if (dupPreviewBtn) dupPreviewBtn.addEventListener('click', runPreview);
 
   $('btnExecute').addEventListener('click', doExecute);
   $('btnPause').addEventListener('click', () => send('pauseExecution').then(() => renderReport()));
   $('btnResume').addEventListener('click', () => send('resumeExecution').then(() => pollProgress()));
+
+  // ── 帮助 ──
+  const helpReload = $('btnHelpReload');
+  if (helpReload) helpReload.addEventListener('click', () => loadHelp({ force: true }));
+
+  // ── 亮/暗切换 ──
+  applyTheme(document.documentElement.dataset.theme || '');
+  const themeBtn = $('btnTheme');
+  if (themeBtn) {
+    themeBtn.addEventListener('click', () => {
+      applyTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+    });
+  }
 
   // ── 手动整理（F4）──
   $('btnScopePick').addEventListener('click', () => openScopePicker().catch((e) => {

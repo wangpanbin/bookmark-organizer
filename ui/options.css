@@ -1,50 +1,61 @@
 /* 书签整理助手 · 主面板样式
-   淡绿主题。破坏性动作（执行/删除/恢复）用暖色区分，绝不因主题变绿而转绿。
-   命名空间：.topbar / .hero-* / .tabs / .card / .exec-bar-* / .panel-* / .stat-row / table.grid
+   中性底 + 单一品牌绿。破坏性动作（执行/删除/恢复）用暖色区分，绝不因主题变绿而转绿。
+   命名空间：.topbar / .plan-side / .tabs / .card / .exec-bar-* / .panel-* / .stat-row / table.grid
 
    ── 令牌约定（改色前先读这段）──────────────────────────────────
-   强调色只有一个：绿。但它有两个角色，所以拆成两个变量：
-     --accent      填充色。只用在**上面没有文字**的地方：进度环、进度条、focus 环。
-     --accent-ink  墨色。用在文字与描边上：当前页签、徽章、主指标数字、
-                   以及「按钮底色 + 白字」这种需要文字的填充。
-   两者不能互换。拿 --accent 去写字会得到 3.40:1，拿 --accent-ink 去画进度环
-   会显得发闷。同理 --warn / --danger / --ok 在本文件里都已是「墨色」，
-   白字按钮要用的深色版本是 --on-* 配 --*-deep（见按钮段）。
+   品牌绿只有一个色相，但**必须拆成三个变量**，因为同一个色值没法同时满足
+   三种对比度门槛（实测数据见 tools/contrast_gate.py）：
 
-   全部前景/背景组合都经 WCAG AA 校验（4.5:1 正文 / 3:1 大字），
-   亮暗两套模式各自独立取色，不是自动反色。
-   校验脚本：tools/contrast_gate.py
+     --accent       品牌色本体。亮色下对白底只有 2.49:1，所以只准用在
+                    **大面积 / 装饰性**的地方：soft 底、图表、色块。
+                    ⛔ 禁止用于文字、描边、1~3px 的细线 —— 那三处要 ≥3:1。
+     --accent-line  线性元素专用：focus 环、进度脊线、进度条、hover 下划线。
+                    门槛是 WCAG 1.4.11 的非文字对比度 ≥3:1，不是 4.5:1。
+     --accent-ink   墨色：当前页签、徽章、主指标数字、勾选框，以及
+                    「按钮底色 + 白字」这种需要文字的填充。门槛 4.5:1。
+
+   三者不能互换。拿 --accent 去写字会得到 2.49:1；拿 --accent-ink 去画进度
+   脊线虽然对比度够但会显得发闷。同理 --warn / --danger / --ok 在本文件里
+   都已是「墨色」，白字按钮要用的深色版本是 --on-* 配它们（见按钮段）。
+
+   ⚠️ 中性色一律不带绿相（bg / surface / sunken / border / muted / text）。
+      底一旦泛绿，--accent 就不再是画面里唯一的绿，整页会发「旧」。
+
+   全部前景/背景组合都经 WCAG AA 校验（4.5:1 正文 / 3:1 非文字），亮暗两套
+   各自独立取色，不是自动反色。校验脚本：tools/contrast_gate.py
+   ⚠️ 那道闸门**不读这个文件**，色值硬编码在它的 INK/BASE/ON 三个 dict 里。
+      改这里而不改那里，它照样 PASS，新色板一行都没被量 —— 那是假绿，
+      比没有闸门更危险（大家只会学会忽略它，真违规也一起被忽略）。
    ─────────────────────────────────────────────────────────── */
 
 :root {
   color-scheme: light dark;
 
-  /* 底与面 */
-  --bg: #f1f5ee;
+  /* 底与面：一律不带绿相，让 --accent 成为画面里唯一的绿 */
+  --bg: #f4f5f4;
   --surface: #ffffff;
-  --sunken: #e9f0e5;
-  --border: #dce5d7;
-  --ring-track: #e2e9de;
-  --exec-track: #e4ebe0;
+  --sunken: #eceeed;
+  --border: #dfe1e0;
+  --exec-track: #e6e8e7;
 
   /* 字 */
-  --text: #1e2a22;
-  --muted: #5c6a60;        /* 5.16:1 on bg / 4.90:1 on sunken */
+  --text: #1c1f1d;
+  --muted: #5b625e;        /* 5.73:1 on bg / 6.26:1 on surface / 5.37:1 on sunken */
 
-  /* 强调色：填充与墨色分开，见文件头 */
-  --accent: #2f9e5e;       /* 填充：无文字处（进度环 / 进度条 / focus 环） */
-  --accent-ink: #1c6b40;   /* 墨色：6.51:1 on surface, 5.60:1 on sunken */
-  --on-accent: #ffffff;    /* 压在 --accent-ink 上的文字：6.51:1 */
-  --accent-soft: #e2f1e6;
+  /* 品牌绿：三个角色，见文件头。全部由 #26ba82 按比例推出来，色相不变。 */
+  --accent: #26ba82;       /* 品牌本体。主按钮底色 + 选区。⛔禁用于细线与 12px 以下的文字 */
+  --accent-line: #1e9568; /* 线性：focus 环 / 进度脊线 / 进度条。3.46:1 on bg（门槛 3.0） */
+  --accent-ink: #17704e;   /* 墨色：文字 / 徽章 / 描边。5.55:1 on bg, 6.06:1 on surface */
+  --on-accent: #0d1a14;    /* 压在 --accent 上的近黑字：7.17:1 */
+  --accent-soft: #e0f2ea;
 
   /* 语义色（全部是墨色，文字与描边通用） */
-  --warn: #8a5a10;         /* 5.91:1 on surface, 5.09:1 on sunken */
+  --warn: #8a5a10;         /* 5.41:1 on bg, 5.91:1 on surface, 5.07:1 on sunken */
   --warn-soft: #fbf3e0;
-  --danger: #a32d24;       /* 7.10:1 on surface, 6.11:1 on sunken */
+  --danger: #a32d24;       /* 6.50:1 on bg, 7.10:1 on surface */
   --danger-soft: #fbeeec;
   --on-danger: #ffffff;
   --ok: #16663f;           /* 6.99:1 on surface */
-  --ok-soft: #e6f3ea;
   --on-ok: #ffffff;
 
   /* 容器宽度：宽屏不再把表格拉到 2500px */
@@ -70,7 +81,6 @@
 
   /* 层级刻度。此前是 1/2/9/10/100 五个魔法值 */
   --z-sticky: 2;
-  --z-hero: 9;
   --z-topbar: 10;
   --z-toast: 100;
 
@@ -88,36 +98,84 @@
   --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
 }
 
+/* ── 暗色调色板 ───────────────────────────────────────────────
+   同一个色板写了两个选择器，因为 CSS 没有「媒体查询 + 属性覆盖」的组合写法，
+   而暗色令牌有二十多个：
+
+     A. 系统偏好暗，且用户**没有**显式选亮（data-theme 为空）
+     B. 用户显式选了暗（不管系统是什么）
+
+   ⚠️ 两块必须逐字相同。漂了不会报错、不会红在任何单测上，
+      症状是「手动切到暗色」和「系统本来就是暗色」长得不一样 ——
+      一个没人会归因到 CSS 的差异。tools/ui_contract_gate.py 会逐字比对，
+      改色的时候两块一起改。 */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121813;
-    --surface: #1a211c;
-    --sunken: #222a24;
-    --border: #2c362e;
-    --ring-track: #29322b;
-    --exec-track: #2a332c;
+  :root:not([data-theme="light"]) {
+    --bg: #121413;
+    --surface: #1a1c1b;
+    --sunken: #222423;
+    --border: #2c2e2d;
+    --exec-track: #2a2c2b;
 
-    --text: #e7ede8;
-    --muted: #9aac9f;        /* 6.87:1 on surface, 6.16:1 on sunken */
+    --text: #e9ebe9;
+    --muted: #a0a4a1;        /* 7.33:1 on bg / 6.79:1 on surface */
 
-    --accent: #4fbf88;       /* 进度环 / 进度条填充 */
-    --accent-ink: #7fd6a8;   /* 9.46:1 on surface, 8.48:1 on sunken */
-    --on-accent: #0f1712;    /* 压在浅绿填充上的近黑字：10.50:1 */
-    --accent-soft: #1c2e23;
+    /* 暗色下角色对调：用户指定的 #26ba82 在这里正好是「墨色」，
+       对 surface 有 6.88:1，是全页最显眼的绿。
+       --accent 在暗色底上提亮到 #2f9d6c，是纯装饰填充，⛔同样不承载文字。 */
+    --accent: #2f9d6c;       /* 品牌本体（暗色下提亮）。主按钮底色 + 选区 */
+    --accent-line: #56c99e; /* 线性：8.36:1 on surface */
+    --accent-ink: #26ba82;   /* 墨色：6.88:1 on surface, 6.27:1 on sunken */
+    --on-accent: #0d1a14;    /* 压在 --accent 上的近黑字：5.24:1 */
+    --accent-soft: #1a2b23;
 
-    --warn: #e5bd66;         /* 8.28:1 on sunken */
+    --warn: #e5bd66;         /* 10.40:1 on bg */
     --warn-soft: #332a15;
-    --danger: #f2907f;       /* 7.10:1 on surface */
+    --danger: #f2907f;       /* 7.40:1 on surface */
     --danger-soft: #3a201d;
     --on-danger: #0f1712;    /* 7.88:1 */
-    --ok: #4fbf88;           /* 与 --accent 同色是有意的：见徽章段 */
-    --ok-soft: #16301f;
-    --on-ok: #0f1712;
+    --ok: #5cc79a;           /* 8.23:1 on surface。刻意与 --accent 拉开，
+                                否则「高置信」与「已归位」两个徽章分不出来 */
+    --on-ok: #0d1a14;        /* 8.59:1 */
 
     --shadow-1: 0 1px 2px rgba(0, 0, 0, .32);
     --shadow-2: 0 2px 8px rgba(0, 0, 0, .38);
     --shadow-3: 0 8px 28px rgba(0, 0, 0, .52);
   }
+}
+
+/* 与上面那块逐字相同，理由见注释。不要单独改这一块。 */
+:root[data-theme="dark"] {
+    --bg: #121413;
+    --surface: #1a1c1b;
+    --sunken: #222423;
+    --border: #2c2e2d;
+    --exec-track: #2a2c2b;
+
+    --text: #e9ebe9;
+    --muted: #a0a4a1;        /* 7.33:1 on bg / 6.79:1 on surface */
+
+    /* 暗色下角色对调：用户指定的 #26ba82 在这里正好是「墨色」，
+       对 surface 有 6.88:1，是全页最显眼的绿。
+       --accent 在暗色底上提亮到 #2f9d6c，是纯装饰填充，⛔同样不承载文字。 */
+    --accent: #2f9d6c;       /* 品牌本体（暗色下提亮）。主按钮底色 + 选区 */
+    --accent-line: #56c99e; /* 线性：8.36:1 on surface */
+    --accent-ink: #26ba82;   /* 墨色：6.88:1 on surface, 6.27:1 on sunken */
+    --on-accent: #0d1a14;    /* 压在 --accent 上的近黑字：5.24:1 */
+    --accent-soft: #1a2b23;
+
+    --warn: #e5bd66;         /* 10.40:1 on bg */
+    --warn-soft: #332a15;
+    --danger: #f2907f;       /* 7.40:1 on surface */
+    --danger-soft: #3a201d;
+    --on-danger: #0f1712;    /* 7.88:1 */
+    --ok: #5cc79a;           /* 8.23:1 on surface。刻意与 --accent 拉开，
+                                否则「高置信」与「已归位」两个徽章分不出来 */
+    --on-ok: #0d1a14;        /* 8.59:1 */
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .32);
+    --shadow-2: 0 2px 8px rgba(0, 0, 0, .38);
+    --shadow-3: 0 8px 28px rgba(0, 0, 0, .52);
 }
 
 * { box-sizing: border-box; }
@@ -147,14 +205,21 @@ body {
   border-radius: var(--radius-sm); text-decoration: none;
   transform: translateY(-200%);
 }
-.skip-link:focus-visible { transform: translateY(0); outline: 2px solid var(--accent); outline-offset: 2px; }
+.skip-link:focus-visible { transform: translateY(0); outline: 2px solid var(--accent-line); outline-offset: 2px; }
 
 /* ── 链接 ──────────────────────────────────────────────────────
    此前全文件没有一条 a 规则，暗色模式下浏览器默认的 #0000EE
-   落在 #1a211c 上只有 1.75:1，整张健康表的地址基本看不见。 */
+   落在 #1a1c1b 上只有 1.75:1，整张健康表的地址基本看不见。 */
+/* 选区高亮：品牌色作为**纯装饰**的第二个正当用途（WCAG 不对装饰提要求），
+   但被选中的正文仍要可读，所以底色必须配得上 --text。 */
+::selection { background: var(--accent); color: var(--text); }
+/* 暗色下换用软底：正文色 #e9ebe9 压在 #2f9d6c 上只有 2.84:1 */
+:root:not([data-theme="light"]) ::selection,
+:root[data-theme="dark"] ::selection { background: var(--accent-ink); color: #0d1a14; }
+
 a { color: var(--accent-ink); text-underline-offset: 2px; }
-a:hover { color: var(--accent); }
-a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+a:hover { color: var(--accent-ink); }
+a:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; border-radius: 2px; }
 a:active { color: var(--accent-ink); }
 
 /* ── 顶栏：品牌 · 导航 · 归入位置 ── */
@@ -177,6 +242,19 @@ a:active { color: var(--accent-ink); }
 }
 .brand .ver { font-size: 11px; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: 0; }
 .brand .sub { color: var(--muted); font-size: 12px; }
+
+/* ── 亮/暗切换 ──────────────────────────────────────────────────
+   用户指定的品牌色 #26ba82 在暗色下是正文墨色，在亮色下对比度不够当文字色（2.49:1）。
+   于是「亮色好看还是暗色好看」本来被系统偏好替用户定了；这个按钮把它变回一个决定。
+   图标画的是**点下去会变成的那个**主题，不是当前主题。 */
+.theme-toggle {
+  flex: none;
+  width: 34px; height: 34px; padding: 0;
+  display: grid; place-items: center;
+  font-size: 15px; line-height: 1;
+  border-radius: var(--radius-pill);
+}
+.theme-toggle:hover:not(:disabled) { background: var(--accent-soft); }
 
 .topbar-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 
@@ -216,7 +294,7 @@ a:active { color: var(--accent-ink); }
 .field.compact select { min-width: 120px; }
 .field:not(.compact) input, .field:not(.compact) select { min-width: 260px; }
 .field input:focus-visible, .field select:focus-visible {
-  outline: 2px solid var(--accent); border-color: var(--accent-ink);
+  outline: 2px solid var(--accent-line); border-color: var(--accent-ink);
 }
 
 /* ── 按钮 ── */
@@ -229,12 +307,20 @@ button {
 button:hover:not(:disabled) { border-color: var(--accent-ink); color: var(--accent-ink); }
 button:active:not(:disabled) { transform: translateY(1px); }   /* 触觉反馈：只动 transform */
 button:disabled { opacity: .45; cursor: not-allowed; }
-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+/* 主按钮是品牌色唯一「该出现」的地方。
+   ⚠️ 底色用 --accent 而**不是** --accent-ink，配的是近黑字而不是白字：
+      白字压 #26ba82 只有 2.49:1，而近黑字有 7.17:1。
+      这不是妥协 —— 「主操作 = 品牌色」本来就该是这个关系，
+      之前用「深绿底白字」是反过来把品牌色当成了墨色。
+      校验：tools/contrast_gate.py 的 FILL_PAIRS 量的是 on-accent 压 accent。 */
 button.primary {
-  background: var(--accent-ink); border-color: var(--accent-ink);
+  background: var(--accent); border-color: var(--accent);
   color: var(--on-accent); font-weight: 600;
 }
-button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+/* hover 提亮而不是换色：换色会把文字对比度一起换掉，
+   而提亮在两个方向上都只改善。 */
+button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { background: none; }
 button.danger-ghost { color: var(--danger); border-color: var(--danger); }
 button.danger-ghost:hover:not(:disabled) { background: var(--danger-soft); color: var(--danger); }
@@ -264,55 +350,85 @@ table.grid th:last-child, table.grid td.c-star { width: 44px; }
    滚动条仍是亮色，浏览器自己画的那部分跟页面是两套颜色。 */
 input, select, textarea, dialog { color-scheme: light dark; }
 
-.busy { color: var(--accent-ink); font-size: 13px; }
-.busy::before { content: "◐ "; animation: spin 1s linear infinite; display: inline-block; }
+/* #busy 是全局浮层（2026-10-07 从整理栏搬出来）。
+   它要出现在**任何一页**：勾选区读树、快照恢复、展开全部都从别的页触发。
+   钉在左下角，避开右下角的 toast，两者不会互相盖住。 */
+.busy {
+  position: fixed; left: var(--sp-5); bottom: var(--sp-5);
+  z-index: var(--z-toast);
+  display: inline-flex; align-items: center;
+  padding: 7px var(--sp-4);
+  background: var(--text); color: var(--bg);
+  border-radius: var(--radius-pill); box-shadow: var(--shadow-3);
+  font-size: 12.5px;
+}
+.busy::before { content: "◐"; margin-right: 6px; animation: spin 1s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── hero 卡 ── */
-.hero {
-  margin-block: var(--sp-4);
-  margin-inline: max(var(--gutter), calc((100% - var(--container)) / 2));
+/* ── 计划页：左栏右表 ────────────────────────────────────────────
+   这一页真正要看的东西是一张**宽表**，而控制项是**窄而深**的一列。
+   把它们塞进同一个横向流（此前的「环在左、6 张卡横排」），
+   结果是 250px 的控制区常驻视口，而表只拿到剩下的那点宽度。 */
+.plan-grid {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: var(--sp-5);
+  align-items: start;
+  padding-block: var(--sp-4);
+}
+.plan-main { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+
+.plan-side {
+  position: sticky; top: calc(var(--topbar-h) + var(--sp-4));
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  padding: var(--sp-4);
   background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--radius);
-  overflow: hidden; box-shadow: var(--shadow-1);
 }
-@media (min-width: 960px) {
-  /* 原工具条是 sticky 的；按钮搬进 hero 后保留这个行为，
-     执行期间按钮和进度条不会滚出视野。
-     ⚠️ 但**只在计划明细页** sticky。hero 有 250px 高且 z-index 高于卡片，
-        滚到设置/链接健康页时它会一直压在那几张卡的顶部，把它们的上沿盖掉。
-        那三页压根没有执行发生，钉着它只是白占 250px 视口。
-        判据是 body[data-tab]，由 selectTab() 写。 */
-  body[data-tab="plan"] .hero { position: sticky; top: var(--topbar-h); z-index: var(--z-hero); }
-}
-.hero-main { display: flex; align-items: center; gap: var(--sp-7); padding: var(--sp-5) var(--sp-6); }
-.hero-gauge { display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); flex: none; }
-.hero-ring-cap { font-size: 12px; color: var(--muted); }
-.hero-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 
-/* ── 进度环：整理完成度（已在位 / 书签总数），与执行进度条语义分离 ── */
-.hero-ring {
+/* ── 进度脊线：这一页的签名元素 ──────────────────────────────────
+   它替代原来那个 132px 的圆环。环是「仪表盘模板」里最容易被认出来的
+   通用件，而它占掉的那一屏恰好是这张计划表最需要的垂直空间。
+   3px 的脊线同样能回答「已经归位多少」，还顺带成了 sticky 栏的分界线。 */
+.spine {
   --pct: 0;
-  width: 132px; height: 132px; border-radius: 50%;
-  display: grid; place-items: center;
-  background: conic-gradient(var(--accent) calc(var(--pct) * 1%), var(--ring-track) 0);
-  transition: background .3s ease;
+  height: 3px; border-radius: 2px;
+  background: var(--exec-track); overflow: hidden;
 }
-.hero-ring::before {
-  content: ''; grid-area: 1 / 1; width: 76%; aspect-ratio: 1;
-  border-radius: 50%; background: var(--surface);
+.spine-fill {
+  display: block; height: 100%; width: calc(var(--pct) * 1%);
+  background: var(--accent-line);
+  transition: width .3s ease;
 }
-.hero-ring-val {
-  grid-area: 1 / 1; position: relative; z-index: var(--z-sticky);
-  font-family: var(--font-display); font-size: 30px; font-weight: 650;
+/* 没预览过时整条收成轨道色：0% 的绿条会被读成「一条都没整理好」。 */
+.spine[data-state="unknown"] .spine-fill { width: 0; }
+
+.plan-side-cap {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2);
+}
+.plan-side-cap span { font-size: 12px; color: var(--muted); }
+.plan-side-cap b {
+  font-family: var(--font-display); font-size: 22px; font-weight: 650;
   font-variant-numeric: tabular-nums; letter-spacing: -.01em;
 }
-.hero-ring[data-state="unknown"] { background: var(--ring-track); }
-.hero-ring[data-state="unknown"] .hero-ring-val { font-size: 14px; font-weight: 600; color: var(--muted); }
 
-/* ── 指标条：6 个数字排成一行，不再是「三张一样的卡」 ──────────
-   VISUAL_DENSITY 7：数据指标靠留白与字重呼吸，不靠卡片边框。
-   所以这里去掉描边，只给真正要看的那一个加左侧色条。 */
+/* ── 指标：窄栏里竖排成「标签左 / 数字右 + 发丝分隔线」─────────────
+   ⚠️ 必须用 .plan-side 限定作用域：.card 类被链接健康页那 7 张汇总卡
+      复用了（options.js 里 div.className = 'card'），改 .card 本身会
+      连带改掉它们，那一屏会跟着塌。
+   ⚠️ 嵌套结构不能动：options.js 用 `.stats .card > b` 取占位符，
+      <b> 一旦被包一层，中性色会静默失效（查不到元素，不报错）。 */
+.plan-side .stats { display: flex; flex-direction: column; gap: 0; }
+.plan-side .stats .card {
+  flex-direction: row; align-items: baseline; justify-content: space-between;
+  gap: var(--sp-3);
+  background: none; border: 0; border-radius: 0;
+  padding: var(--sp-2) 0;
+}
+.plan-side .stats .card + .card { border-top: 1px solid var(--border); }
+.plan-side .stats .card > span { font-size: 12.5px; }
+.plan-side .stats .card > b { font-size: 15px; font-weight: 650; }
+
 .stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--sp-2); }
 .card {
   background: var(--sunken);
@@ -327,7 +443,7 @@ input, select, textarea, dialog { color-scheme: light dark; }
   font-family: var(--font-display); font-size: 24px; font-weight: 650;
   font-variant-numeric: tabular-nums; line-height: 1.2;
 }
-.card.c-move { border-left-color: var(--accent); }
+.card.c-move { border-left-color: var(--accent-line); }
 .card.c-move b { color: var(--accent-ink); }
 .card.c-inplace b, .card.c-total b, .card.c-folders b { color: var(--muted); }
 .card.c-uncat b, .card.warn b { color: var(--warn); }
@@ -336,12 +452,17 @@ input, select, textarea, dialog { color-scheme: light dark; }
    放在语义色规则之后 —— 同特异性靠源码顺序取胜，不需要 !important。 */
 .card[data-empty="1"] b { color: var(--muted); }
 
-.hero-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.plan-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+/* 窄栏里按钮撑满整行宽度：300px 的一栏里，两个并排的按钮每个不到 130px，
+   「读取并预览」五个字会被挤成两行。竖排反而更稳。 */
+.plan-side .plan-actions { flex-direction: column; align-items: stretch; }
+.plan-side .plan-actions button { width: 100%; }
 
-/* ── 执行进度条：贴在 hero 卡底边，所有标签页可见 ── */
+/* ── 执行进度条：贴在窄栏底边，随窄栏一起 sticky ─────────────── */
 .exec-bar {
-  display: flex; align-items: center; gap: 14px;
-  padding: 10px var(--sp-6); border-top: 1px solid var(--border); background: var(--bg);
+  display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+  padding-top: var(--sp-3); margin-top: auto;
+  border-top: 1px solid var(--border);
 }
 .exec-bar-label {
   font-size: 12px; color: var(--muted); white-space: nowrap;
@@ -351,10 +472,13 @@ input, select, textarea, dialog { color-scheme: light dark; }
   font-size: 12.5px; color: var(--muted);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.exec-bar-track { flex: 1; height: 8px; border-radius: 4px; background: var(--exec-track); overflow: hidden; }
+.exec-bar-track { flex: 1 1 100%; height: 8px; border-radius: 4px; background: var(--exec-track); overflow: hidden; }
 .exec-bar-fill {
   display: block; height: 100%; width: 0; border-radius: 4px;
-  background: var(--accent); transition: width .25s ease;
+  /* ⚠️ 用 --accent-line 而不是 --accent：进度条填充是 WCAG 1.4.11
+     意义上的「有意义的图形」，门槛 3:1。--accent 在亮色白底上只有 2.49:1，
+     压在它自己的轨道上更是只有 2.02:1。 */
+  background: var(--accent-line); transition: width .25s ease;
 }
 .exec-bar[data-state="paused"] .exec-bar-fill { background: var(--warn); }
 .exec-bar[data-state="paused"] .exec-bar-text { color: var(--warn); }
@@ -364,7 +488,7 @@ input, select, textarea, dialog { color-scheme: light dark; }
 .exec-bar[data-state="failed"] .exec-bar-text { color: var(--danger); }
 
 @media (prefers-reduced-motion: reduce) {
-  .hero-ring, .exec-bar-fill, .busy::before { transition: none; animation: none; }
+  .spine-fill, .exec-bar-fill, .busy::before { transition: none; animation: none; }
   button, .tabs button, .field input, .field select, a { transition: none; }
   button:active:not(:disabled) { transform: none; }
   .skeleton-bar { animation: none; opacity: .6; }
@@ -373,28 +497,41 @@ input, select, textarea, dialog { color-scheme: light dark; }
 /* ── 面板 ── */
 .panel { display: none; padding-block: var(--sp-1) var(--sp-9); }
 .panel.active { display: block; }
-/* 宽屏容器约束：此前 .panel / .hero 只有 margin 与 padding，
-   1920px 以上内容会横跨整个屏幕，表格列被拉到没人读得完的宽度。
+/* 宽屏容器约束：内容不横跨整个屏幕，表格列会被拉到没人读得完的宽度。
    做法是两侧对称 padding，而不是 max-width + margin:auto：
-   后者会和 sticky 的 .hero 抢定位上下文，前者对两个都能用。 */
+   后者会和 sticky 的 .plan-side 抢定位上下文，前者对两个都能用。 */
 .panel { padding-inline: max(var(--gutter), calc((100% - var(--container)) / 2)); }
 
 .panel-head {
-  display: flex; justify-content: space-between; align-items: flex-start;
+  display: flex; justify-content: space-between; align-items: baseline;
   gap: var(--sp-4); margin: var(--sp-4) 0 var(--sp-3); flex-wrap: wrap;
 }
 .panel-actions { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
-/* 78ch 在中文下约等于每行 39 个汉字，落在 25-40 的舒适阅读区间内，
-   所以这一行是刻意保留的，不要因为「78 看起来很大」就改小。 */
+/* 面板的结论句替代了此前的三段说明小字。它是**结论**，不是说明书：
+   写「只合并完全相同的地址」，不写「归一化只剥白名单里的 hash」。 */
+.panel-h {
+  margin: 0; font-family: var(--font-display); font-size: 13.5px; font-weight: 650;
+  color: var(--text); max-width: 68ch; text-wrap: pretty;
+}
+.plan-filters { padding-bottom: var(--sp-2); border-bottom: 1px solid var(--border); }
+
+/* .hint 2026-10-07 重新定义：它不再是页面的骨架，只剩下**行内标注**与
+   **状态行**两类。开发向说明已搬进 docs/panel-help.md，所以这里的行高
+   从 1.7 收到 1.6、字号收到 12px，视觉上退到「附注」的位置。 */
 .hint {
-  margin: 0; color: var(--muted); font-size: 12.5px;
-  max-width: 78ch; line-height: 1.7; text-wrap: pretty;
+  margin: 0; color: var(--muted); font-size: 12px;
+  max-width: 68ch; line-height: 1.6; text-wrap: pretty;
 }
 .warn-text { color: var(--warn); }
 .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+/* 复选框自带一段说明时（链接健康页的「死链 AI 找新地址」）：
+   复选框与说明文字必须顶对齐而不是居中 —— 居中会让两行文字骑在框上，
+   读起来像两个互不相干的控件。 */
+.chk:has(> .hint) { align-items: flex-start; max-width: 68ch; }
+.chk > .hint { flex: 1 1 240px; }
 .chk.big { font-size: 14px; color: var(--text); margin-bottom: 10px; }
 .chk input[type="checkbox"] { accent-color: var(--accent-ink); width: 15px; height: 15px; cursor: pointer; }
-.chk input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chk input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
 
 /* ── 表格：plan 与 grid 共用一套 ─────────────────────────────── */
 .table-wrap {
@@ -419,7 +556,6 @@ table.grid td:first-child { font-variant-numeric: tabular-nums; }
 tr.is-low td { background: var(--warn-soft); }
 tr.is-skipped { opacity: .55; }
 .path { font-family: var(--mono); font-size: 12px; }
-.path .dim { color: var(--muted); }
 .url { font-family: var(--mono); font-size: 11.5px; color: var(--muted); word-break: break-all; }
 .title { font-weight: 550; }
 
@@ -427,11 +563,16 @@ tr.is-skipped { opacity: .55; }
    ⚠️ .title 挂在 <a> 本身而不是外套一层 div —— E2E 有多处按
       `tr.querySelectorAll('td')` 的位置和 `tr.textContent` 取值，
       换结构会让这些断言读空。保持 class 与文本不变，只换宿主元素。 */
-a.title { color: var(--text); text-decoration: none; }
+/* ⚠️ 标题与地址必须各占一行。它们此前都是 inline，于是渲染成
+   「GitHub 某个repo https://github.com/some/repo」—— 中间没有分隔，
+   长标题会把地址顶到行尾，读起来像一条粘在一起的字符串。
+   2026-10-07 之前就是这样，不是这次重排弄坏的；但既然这一页重做了，
+   顺手改掉比留着一个「看着像 bug 的排版」划算。 */
+a.title { display: block; color: var(--text); text-decoration: none; }
 a.title:hover { color: var(--accent-ink); text-decoration: underline; }
-a.url { color: var(--muted); text-decoration: none; }
+a.url { display: block; margin-top: 1px; color: var(--muted); text-decoration: none; }
 a.url:hover { color: var(--accent-ink); text-decoration: underline; }
-a.title:focus-visible, a.url:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+a.title:focus-visible, a.url:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
 
 /* 徽章：置信度是唯一用颜色编码的东西。
    实心 = 强信号，软底 = 弱信号，描边 = 中性信息。
@@ -453,6 +594,81 @@ a.title:focus-visible, a.url:focus-visible { outline: 2px solid var(--accent); o
    此前靠 JS 写 inline style marginLeft:'4px' 排开，是全文件唯一一处
    行内样式；改成一个 flex 容器后间距走刻度，也顺手消掉这行魔法值。 */
 .why { display: flex; flex-wrap: wrap; gap: var(--sp-1); align-items: center; }
+
+/* 替代方案区由 JS 插入，用 details 收起那句免责。
+   免责本身必须留着（AGENTS.md 约束 8），但它不该以正文形态压住整块内容。 */
+.alt-disclosure { margin-top: var(--sp-2); }
+.alt-disclosure > summary {
+  cursor: pointer; color: var(--muted); font-size: 12.5px;
+  display: flex; align-items: center; gap: 6px;
+}
+.alt-disclosure > summary::before { content: '\25b8'; font-size: 10px; }
+.alt-disclosure[open] > summary::before { content: '\25be'; }
+.alt-disclosure > summary:hover { color: var(--accent-ink); }
+.alt-disclosure .hint { margin-top: var(--sp-2); }
+
+/* ── 折叠块（链接健康页的设置与运维入口）─────────────────────
+   默认只展开「结果」。折叠不是隐藏：summary 永远可见，
+   出网披露那一块额外带 open，因为它是「授权之前你有权知道什么」。 */
+.fold {
+  background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  margin-bottom: var(--sp-3);
+}
+.fold > summary {
+  cursor: pointer; list-style: none;
+  padding: var(--sp-3) var(--sp-4);
+  font-family: var(--font-display); font-size: 13.5px; font-weight: 650;
+  color: var(--text);
+  display: flex; align-items: center; gap: var(--sp-2);
+  border-radius: var(--radius);
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before {
+  content: '\25b8'; color: var(--muted); font-size: 11px;
+  transition: transform var(--t-fast) ease; display: inline-block;
+}
+.fold[open] > summary::before { transform: rotate(90deg); }
+.fold > summary:hover { color: var(--accent-ink); }
+.fold > summary:focus-visible { outline: 2px solid var(--accent-line); outline-offset: -2px; }
+.fold-body {
+  padding: 0 var(--sp-4) var(--sp-4);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+}
+.fold-body .card-block { background: none; border: 0; padding: 0; }
+.fold-body .table-wrap { max-height: 48vh; }
+
+/* ── 帮助页签：渲染 docs/panel-help.md ────────────────────── */
+.help-body { max-width: 72ch; }
+.help-body > :first-child { margin-top: 0; }
+.help-body h1 { font-family: var(--font-display); font-size: 17px; font-weight: 650; margin: var(--sp-6) 0 var(--sp-3); }
+.help-body h2 { font-family: var(--font-display); font-size: 15px; font-weight: 650; margin: var(--sp-5) 0 var(--sp-2); }
+.help-body h3 { font-family: var(--font-display); font-size: 13.5px; font-weight: 650; margin: var(--sp-4) 0 var(--sp-2); }
+.help-body p { margin: 0 0 var(--sp-3); line-height: 1.75; }
+.help-body ul, .help-body ol { margin: 0 0 var(--sp-3); padding-left: 22px; }
+.help-body li { margin: 3px 0; line-height: 1.7; }
+.help-body code {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--sunken); border-radius: var(--radius-xs);
+  padding: 1px 5px;
+}
+.help-body pre {
+  background: var(--sunken); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4);
+  overflow-x: auto; margin: 0 0 var(--sp-3);
+}
+.help-body pre code { background: none; padding: 0; font-size: 12px; line-height: 1.6; }
+.help-body hr { border: 0; border-top: 1px solid var(--border); margin: var(--sp-5) 0; }
+
+/* 读取失败要说清「为什么没有」以及「怎么办」。
+   ⚠️ 界面承诺一件永远不会发生的事，比功能缺失更伤（AGENTS.md 约束 8）：
+      一个点了没反应的「帮助」页签，是同一类问题的轻量版。 */
+.help-alert {
+  margin-bottom: var(--sp-4); padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--danger); border-left-width: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft); color: var(--text); font-size: 13px;
+}
 
 /* ── 空状态 ────────────────────────────────────────────────────
    一行灰字不算空状态：它只说了「没有」，没说「接下来做什么」。
@@ -604,7 +820,7 @@ table.grid .hint { display: inline-block; }
 .taxo-top > input:focus-visible,
 .taxo-sub input:focus-visible,
 .taxo-add input:focus-visible {
-  outline: 2px solid var(--accent); border-color: var(--accent-ink);
+  outline: 2px solid var(--accent-line); border-color: var(--accent-ink);
 }
 .taxo-subs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--sp-2); }
 .taxo-sub { display: inline-flex; align-items: center; gap: 4px; }
@@ -690,8 +906,18 @@ table.grid .hint { display: inline-block; }
   .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .stat-row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
-@media (max-width: 1080px) {
-  .hero-main { gap: var(--sp-5); }
+@media (max-width: 1100px) {
+  /* 窄屏塌成单列：窄栏在上，计划表在下。
+     ⚠️ 断点取 1080 而不是「表窄了才塌」：两栏并排时右栏只剩 740px，
+        七列表格会被挤到列宽不足。所以宁可早一点塌，也不要给一张读不动的表。 */
+  .plan-grid { grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); }
+  .plan-side { position: static; }
+  /* 塌成单列后指标横排比竖排省高度：竖着六行会把表格整个推到折线以下 */
+  .plan-side .stats { flex-direction: row; flex-wrap: wrap; gap: var(--sp-2) var(--sp-5); }
+  .plan-side .stats .card { flex: 0 0 auto; border-top: 0 !important; padding: var(--sp-1) 0; }
+  .plan-side .plan-actions { flex-direction: row; }
+  .plan-side .plan-actions button { width: auto; }
+
   /* ⚠️ 861-1080px 这一档实测需要约 844px（品牌 200 + 页签 380 + 下拉 176 + 间距）。
      上一轮把 flex-wrap 留在 ≤860px，等于这一档**根本没修**：浏览器缩放
      200% 时有效宽度减半，顶栏挤爆，「归入位置」下拉被推出可视区。
@@ -705,13 +931,7 @@ table.grid .hint { display: inline-block; }
      border-bottom 裁掉。补一档下内边距把描边让出来。 */
   .tabs { padding-bottom: 2px; }
   .topbar-right { margin-left: auto; }
-  .hero { margin-inline: var(--gutter); position: static; }
-  .hero-main { flex-direction: column; align-items: stretch; gap: 18px; padding: var(--sp-4); }
-  .hero-gauge { flex-direction: row; justify-content: center; gap: 14px; }
-  .hero-ring { width: 104px; height: 104px; }
-  .hero-ring-val { font-size: 24px; }
   .panel { padding-inline: var(--gutter); }
-  .exec-bar { padding: 10px var(--sp-4); }
   .stat-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 620px) {
@@ -719,7 +939,7 @@ table.grid .hint { display: inline-block; }
 }
 @media (max-width: 520px) {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .hero-actions button { flex: 1 1 100%; }
+  .plan-actions button { flex: 1 1 100%; }
 }
 @media (max-width: 420px) {
   .stats, .stat-row { grid-template-columns: 1fr; }
@@ -764,15 +984,6 @@ table.grid .hint { display: inline-block; }
 .scope-stat[data-k="stale"] b { color: var(--muted); }
 .scope-stat[data-zero="1"] b { color: var(--muted); }
 .scope-stat-note { flex: 1 1 100%; font-size: 12px; }
-
-/* 流程提示：说明「执行整理」在哪个页面，不是装饰 */
-.hint-flow {
-  margin-top: var(--sp-2);
-  color: var(--muted);
-  background: var(--sunken);
-  border-radius: var(--radius-sm);
-  padding: var(--sp-2) var(--sp-3);
-}
 
 /* 预览完成后的跳转条 */
 .scope-ready {

@@ -11,6 +11,8 @@
  *   7. 去重不误删 SPA 路由
  *   8. 锁定条目不进执行队列
  *   9. 去重逐条否决：勾了「不删」的条目执行后仍在，没勾的照删
+ *  10. 整理栏只属于「计划明细」页
+ *  11. 帮助页签真的读得到 docs/panel-help.md
  */
 
 import test from 'node:test';
@@ -352,6 +354,11 @@ test('去重逐条否决：勾了「不删」的条目执行后仍在，没勾�
     });
     assert.equal(dupCount, 1, `执行载荷里应只剩 1 条待删，实际 ${dupCount}`);
 
+    // ⚠️ 2026-10-07：整理栏被收进「计划明细」页，不再挂在所有页签共用的
+    //    hero 上。而此刻我们停在「重复项」页 —— 非活动面板整棵 display:none，
+    //    Playwright 点一个不可见的按钮会一直等到超时。
+    //    跨页签执行本来就得先回到计划页核对，这不是新规矩。
+    await page.click('#tabs button[data-tab="plan"]');
     await page.click('#btnExecute');
     await waitForExecutionDone(page, 90000);
 
@@ -402,6 +409,98 @@ test('去重逐条否决：勾了「不删」的条目执行后仍在，没勾�
       bSurvivors.length, 1,
       `B 组应当也删掉一条，实际剩下 ${bSurvivors.length} 条（${bSurvivors.join(' / ')}）`
       + '—— 否决被当成了全局跳过，或两条都被删了',
+    );
+  } finally {
+    await ctx.close();
+  }
+});
+
+// ───────────────────── 10. 整理栏只属于「计划明细」页 ─────────────────────
+// 2026-10-07 新增。这条闸门量的是**用户提的那件事**：
+// 读一遍计划就能看懂要动什么，不必先猜「这 45 条书签会不会动」。
+//
+// 为什么要有它：整理栏原本挂在 <main> 之下、六个面板之外，于是每一个页签
+// 顶部都顶着「执行整理」。那个状态看起来完全正常 —— 按钮能点、执行照跑，
+// 一次预览照过。所以它不会以任何报错的形式暴露出来。
+//
+// ⚠️ 判据用 **isVisible** 而不是「元素存不存在」：节点一直在 DOM 里，
+//    非活动面板只是 display:none。查存在性会对正确的代码报红 ——
+//    误报的闸门比没有闸门更糟（大家只会学会忽略它，真违规也一起被忽略）。
+test('整理栏只出现在「计划明细」页，其余页签都不许露出执行入口', async () => {
+  const { ctx, extensionId } = await launchWithExtension();
+  try {
+    const page = await openPanel(ctx, extensionId);
+    await seedBookmarks(page, makeFixtures(12));
+    await runPreview(page);
+
+    const onPlan = ['#btnExecute', '#btnPreview', '#planSpine', '#stats'];
+    for (const sel of onPlan) {
+      assert.ok(await page.isVisible(sel), `计划明细页上 ${sel} 反而不可见`);
+    }
+
+    // 每一个非计划页签：整理栏一个都不许露
+    for (const tab of ['scope', 'dup', 'health', 'snap', 'settings', 'help']) {
+      await page.click(`#tabs button[data-tab="${tab}"]`);
+      for (const sel of onPlan) {
+        assert.equal(
+          await page.isVisible(sel), false,
+          `${sel} 在「${tab}」页上仍然可见 —— 整理栏又漏回公共区域了`,
+        );
+      }
+    }
+
+    // #busy 反过来：它**必须**在每一页都可用。
+    // 它有 7 个调用点来自别的页签（勾选区读树、快照恢复、展开全部），
+    // 跟着整理栏一起被藏起来的话，症状是「点了没反应」且界面不作解释。
+    for (const tab of ['plan', 'scope', 'dup', 'health', 'snap', 'settings', 'help']) {
+      await page.click(`#tabs button[data-tab="${tab}"]`);
+      const owner = await page.evaluate(() => {
+        const el = document.getElementById('busy');
+        return el ? el.closest('.panel')?.id || 'body' : 'missing';
+      });
+      assert.equal(owner, 'body',
+        `#busy 在「${tab}」页上挂在 ${owner}，它必须是 body 的直接子级`);
+    }
+
+    // 切回计划页，一切照旧
+    await page.click('#tabs button[data-tab="plan"]');
+    assert.ok(await page.isVisible('#btnExecute'), '切回计划明细页后执行按钮不见了');
+  } finally {
+    await ctx.close();
+  }
+});
+
+// ───────────────────── 11. 帮助页签真的读得到文档 ─────────────────────
+// ⚠️ 这条同时是 fetch 方案可行性的实测。扩展页能不能 fetch 自己包里的
+//    资源，代码审查判不出来 —— 只有真跑一次浏览器才知道。
+//    若这里红了而失败原因是「读不到 docs/panel-help.md」，说明 CSP 挡住了，
+//    退路写在计划里（manifest 显式放行 connect-src，或改内联）。
+test('帮助页签读得到 docs/panel-help.md，且读不到时要说清为什么', async () => {
+  const { ctx, extensionId } = await launchWithExtension();
+  try {
+    const page = await openPanel(ctx, extensionId);
+    await page.click('#tabs button[data-tab="help"]');
+
+    await page.waitForFunction(
+      () => {
+        const err = document.getElementById('helpError');
+        const body = document.getElementById('helpBody');
+        return (err && !err.hidden) || (body && body.children.length > 0);
+      },
+      undefined,
+      { timeout: 15000 },
+    );
+
+    const failed = await page.isVisible('#helpError');
+    const text = await page.textContent('#helpBody');
+    assert.ok(
+      !failed,
+      `帮助文档读不出来：${(await page.textContent('#helpError')).trim()}`,
+    );
+    assert.match(text, /书签/, '帮助文档渲染出来了但内容是空的');
+    assert.ok(
+      (await page.$$('#helpBody h2')).length > 0,
+      '帮助文档一个二级标题都没渲染出来 —— Markdown 渲染器没生效',
     );
   } finally {
     await ctx.close();

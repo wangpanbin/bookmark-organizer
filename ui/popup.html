@@ -4,23 +4,30 @@
   <meta charset="UTF-8">
   <title>书签整理助手</title>
   <style>
-    /* 与主面板同一套淡绿令牌。破坏性动作在此不出现，但 danger 仍随主题保留。
-       ⚠️ 这份是 options.css :root 的手工副本，两边必须同步改：
-          accent（填充）拆成 accent + accent-ink（墨色），因为白字压在
-          accent 上只有 3.40:1，压在 accent-ink 上才是 6.51:1。
+    /* 与主面板同一套令牌。破坏性动作在此不出现，但 danger 仍随主题保留。
+       ⚠️ 这份是 options.css :root 的手工副本，两边必须同步改。
+          品牌绿拆成三个角色，因为同一个色值没法同时满足三种对比度门槛：
+            accent      品牌本体。主按钮底色 + 选区。⛔ 禁用于细线与小字。
+            accent-line 线性元素（focus 环、描边、进度），门槛 ≥3.0。
+            accent-ink  墨色（文字、徽章、描边），门槛 ≥4.5。
+          主按钮压的是近黑字而不是白字：#0d1a14 压 accent 是 7.17:1，
+          白字压 accent 只有 2.49:1。主面板 2026-10-07 就是这么改的。
+       ⚠️⚠️ 这份副本靠 tools/ui_contract_gate.py 的「令牌同步」断言盯着：
+          那个断言比对 options.css 与 popup.html 的取色，别绕过它。
        校验脚本：tools/contrast_gate.py */
     :root {
       color-scheme: light dark;
-      --bg: #f1f5ee;
+      --bg: #f4f5f4;
       --surface: #ffffff;
-      --sunken: #e9f0e5;
-      --border: #dce5d7;
-      --text: #1e2a22;
-      --muted: #5c6a60;
-      --accent: #2f9e5e;
-      --accent-ink: #1c6b40;
-      --on-accent: #ffffff;
-      --accent-soft: #e2f1e6;
+      --sunken: #eceeed;
+      --border: #dfe1e0;
+      --text: #1c1f1d;
+      --muted: #5b625e;
+      --accent: #26ba82;
+      --accent-line: #1e9568;
+      --accent-ink: #17704e;
+      --on-accent: #0d1a14;
+      --accent-soft: #e0f2ea;
       --danger: #a32d24;
       --danger-soft: #fbeeec;
       --radius: 14px;
@@ -29,16 +36,17 @@
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #121813;
-        --surface: #1a211c;
-        --sunken: #222a24;
-        --border: #2c362e;
-        --text: #e7ede8;
-        --muted: #9aac9f;
-        --accent: #4fbf88;
-        --accent-ink: #7fd6a8;
-        --on-accent: #0f1712;
-        --accent-soft: #1c2e23;
+        --bg: #121413;
+        --surface: #1a1c1b;
+        --sunken: #222423;
+        --border: #2c2e2d;
+        --text: #e9ebe9;
+        --muted: #a0a4a1;
+        --accent: #2f9d6c;
+        --accent-line: #56c99e;
+        --accent-ink: #26ba82;
+        --on-accent: #0d1a14;
+        --accent-soft: #1a2b23;
         --danger: #f2907f;
         --danger-soft: #3a201d;
       }
@@ -62,14 +70,19 @@
     .stat span { font-size: 12px; color: var(--muted); }
     button {
       width: 100%; padding: 8px; font: inherit; cursor: pointer;
-      border: 1px solid var(--accent-ink); background: var(--accent-ink);
+      /* 与主面板同一条规则：品牌色底 + 近黑字（7.17:1），
+         而不是「深绿底 + 白字」。后者正是主面板这次换掉的那个写法。 */
+      border: 1px solid var(--accent); background: var(--accent);
       color: var(--on-accent);
       border-radius: var(--radius-sm); font-weight: 600;
       transition: background-color var(--t-fast) ease, transform var(--t-fast) ease;
     }
-    button:hover { background: var(--accent); border-color: var(--accent); }
+    /* ⚠️ hover 刻意用 brightness 而不是换成 --accent：
+       白字压在 --accent（#26ba82）上只有 2.49:1，hover 时文字对比度会塌掉。
+       提亮同一个 --accent-ink 底色既保留反馈，对比度还比静止态更高。 */
+    button:hover { filter: brightness(1.08); }
     button:active { transform: translateY(1px); }
-    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
     @media (prefers-reduced-motion: reduce) {
       button { transition: none; }
       button:active { transform: none; }

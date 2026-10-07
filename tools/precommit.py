@@ -250,7 +250,12 @@ def run_static_gates():
 def main():
     args = sys.argv[1:]
     tests_only = "--tests-only" in args
-    all_mode = "--all" in args
+    # ⚠️ 静态闸门**默认就跑**，`--fast` 才跳过。
+    #    原来只有 `--all` 才跑，于是本机 `.git/hooks/pre-commit` 装的是
+    #    `precommit.py`（不带 --all），而 CI 跑的是 `precommit.py --all` ——
+    #    同一份脚本两套标准，本地绿而 CI 红，而且没人说得清差在哪。
+    #    两个静态闸门是亚秒级的，没有理由让人手动记得开。
+    all_mode = "--fast" not in args
     files = [] if tests_only else (all_source_files() if all_mode else staged_files())
 
     red = 0
@@ -264,10 +269,9 @@ def main():
         if red:
             print("[precommit] 编码损坏就不往下跑测试 —— 那不是测试红，是文件本身坏了")
             return 1
-        if all_mode:
-            red += run_static_gates()
-            if red:
-                return 1
+        red += run_static_gates()
+        if red:
+            return 1
     red += run_unit_tests()
     if red:
         print("\n[precommit] 提交被拦下。修好再提交；"

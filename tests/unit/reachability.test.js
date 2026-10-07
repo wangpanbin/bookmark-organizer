@@ -38,48 +38,52 @@ const UI = join(ROOT, 'ui');
  */
 const MUST_BE_REACHABLE = [
   // F2 语义去重：整条链路都曾经是孤岛
-  ['dedupe/semantic-runner.js', 'runSemanticDedupe', 'F2 的入口，用户在面板上点「跑一轮语义去重」'],
-  ['dedupe/semantic-runner.js', 'getSuggestions', '刷新面板时要读上次的建议'],
-  ['dedupe/semantic-runner.js', 'clearVectors', '换模型/维度后必须清缓存'],
-  ['dedupe/semantic.js', 'suggestMerges', '编排层的核心'],
-  ['dedupe/embedding-client.js', 'embedAll', '批量取向量'],
-  ['dedupe/embedding-client.js', 'fetchArchivedText', '取归档正文喂 embedding'],
+  ['src/dedupe/semantic-runner.js', 'runSemanticDedupe', 'F2 的入口，用户在面板上点「跑一轮语义去重」'],
+  ['src/dedupe/semantic-runner.js', 'getSuggestions', '刷新面板时要读上次的建议'],
+  ['src/dedupe/semantic-runner.js', 'clearVectors', '换模型/维度后必须清缓存'],
+  ['src/dedupe/semantic.js', 'suggestMerges', '编排层的核心'],
+  ['src/dedupe/embedding-client.js', 'embedAll', '批量取向量'],
+  ['src/dedupe/embedding-client.js', 'fetchArchivedText', '取归档正文喂 embedding'],
   // F3 归档
-  ['archive/client.js', 'archiveMany', '归档按钮背后'],
-  ['archive/client.js', 'probeSink', '面板上那行「接收器状态」'],
+  ['src/archive/client.js', 'archiveMany', '归档按钮背后'],
+  ['src/archive/client.js', 'probeSink', '面板上那行「接收器状态」'],
   // F3 归档：G4 分级（重要页多渲染 PDF/截图）的唯一入口。
   // ⚠️ 漏登记的后果是「打星按钮能显示、但归档时 important 恒为 false」，
   //    而那种功能在单测里看起来完全正常。
-  ['archive/important.js', 'getImportantUrls', '面板恢复星标状态 + 归档读它'],
-  ['archive/important.js', 'toggleImportant', '明细表里那颗星的点击'],
-  ['archive/important.js', 'clearImportant', '「全部取消标记」按钮'],
-  ['archive/run.js', 'archiveSlice', '归档循环的一整片，循环本体在面板页'],
+  ['src/archive/important.js', 'getImportantUrls', '面板恢复星标状态 + 归档读它'],
+  ['src/archive/important.js', 'toggleImportant', '明细表里那颗星的点击'],
+  ['src/archive/important.js', 'clearImportant', '「全部取消标记」按钮'],
+  ['src/archive/run.js', 'archiveSlice', '归档循环的一整片，循环本体在面板页'],
   // F1 链接健康
-  ['scan/alternatives.js', 'findAlternatives', '死链的「找替代」按钮背后'],
-  ['scan/scheduler.js', 'installAlarmListener', 'SW 启动时接闹钟'],
-  ['scan/permission.js', 'requestScanPermission', '用户点「授权访问网站」'],
-  ['scan/extract-meta.js', 'faviconUrlFor', '表格里的图标'],
-  ['scan/classify-site.js', 'classifySite', '站点类型识别'],
-  ['scan/soft404.js', 'looksLikeNotFound', '软 404'],
-  ['scan/verdict.js', 'summarize', '面板汇总卡'],
+  ['src/scan/alternatives.js', 'findAlternatives', '死链的「找替代」按钮背后'],
+  ['src/scan/scheduler.js', 'installAlarmListener', 'SW 启动时接闹钟'],
+  ['src/scan/permission.js', 'requestScanPermission', '用户点「授权访问网站」'],
+  ['src/scan/extract-meta.js', 'faviconUrlFor', '表格里的图标'],
+  ['src/scan/classify-site.js', 'classifySite', '站点类型识别'],
+  ['src/scan/soft404.js', 'looksLikeNotFound', '软 404'],
+  ['src/scan/verdict.js', 'summarize', '面板汇总卡'],
   // 之前的 AI 接入改造
-  ['ai/runtime.js', 'completeWithRetry', 'LLM 分类与找新地址都经它'],
-  ['ai/credential-store.js', 'createCredentialStore', 'runtime 解析 key 时用它'],
-  ['ai/provider-registry.js', 'resolveTarget', 'baseUrl → provider'],
+  ['src/ai/runtime.js', 'completeWithRetry', 'LLM 分类与找新地址都经它'],
+  ['src/ai/credential-store.js', 'createCredentialStore', 'runtime 解析 key 时用它'],
+  ['src/ai/provider-registry.js', 'resolveTarget', 'baseUrl → provider'],
   // ⚠️ 这个导出的价值全在**被调用**上：它是一道「别给 anthropic 协议发 response_format」
   //    的闸门。留着一个没人调用的纯函数，等于这道闸门不存在。
-  ['ai/provider-registry.js', 'resolveJsonMode', 'runtime 用它决定要不要注入 response_format'],
+  ['src/ai/provider-registry.js', 'resolveJsonMode', 'runtime 用它决定要不要注入 response_format'],
   // F4 手动指定书签范围
   // ⚠️ 登记理由不是「写完了」，而是「不接上就静默失效」：
   //    expandFolderSelection 没人调 → 勾文件夹只能勾到空，清单里什么都没有，
   //    而界面上看不出任何异常（勾选框照常亮、点「预览选中」也只是说没东西可整理）。
-  ['scope-list.js', 'expandFolderSelection', '勾文件夹时展开成可动书签；不接上则勾文件夹等于没勾'],
-  ['scope-list.js', 'prepareScope', '对账 + 裁子集，面板预览的唯一入口'],
-  ['scope-list.js', 'annotateSelectable', '勾选区标出哪些不可动，以及为什么'],
-  ['scope-list.js', 'applyRunResult', '一轮执行结束后把结果写回清单（状态机的写侧）'],
+  ['src/scope-list.js', 'expandFolderSelection', '勾文件夹时展开成可动书签；不接上则勾文件夹等于没勾'],
+  ['src/scope-list.js', 'prepareScope', '对账 + 裁子集，面板预览的唯一入口'],
+  ['src/scope-list.js', 'annotateSelectable', '勾选区标出哪些不可动，以及为什么'],
+  ['src/scope-list.js', 'applyRunResult', '一轮执行结束后把结果写回清单（状态机的写侧）'],
   // 刻意**不列**同文件内部 helper（reconcileList / buildScopeEntries / blockedReason）：
   // 它们被 prepareScope / annotateSelectable 调用，可达性是传递的。
   // 列进来只会让这道闸门天天为正确的代码报红 —— 而误报的闸门等于没有闸门。
+  // ⚠️ 2026-10-07 补 ui/ 的导出。之前这张表把路径一律 join 到 SRC（= repo/src），
+  //    所以 `ui/` 里的模块**在结构上就登记不进来** —— 规则说「加新功能要把新导出登记」，
+  //    而登记入口对 ui/ 是不开的。新增的 markdown 渲染器就是这么漏出去的。
+  ['ui/markdown.js', 'renderMarkdown', '帮助页签的 Markdown 渲染器；漏接则帮助页签空白'],
 ];
 
 /** 收集 src/ 与 ui/ 下所有源码文件的文本 */
@@ -103,7 +107,9 @@ const ALL = collectSources();
 test('⚠️ 声明为「已完成」的导出必须真的被引用（死代码闸门）', () => {
   const orphans = [];
   for (const [rel, name, why] of MUST_BE_REACHABLE) {
-    const abs = join(SRC, rel);
+    // 路径相对 repo 根解析，不是相对 src/ —— 这样 ui/ 的模块也登记得进来
+    // （2026-10-07 之前一律 join(SRC, rel)，ui/ 的导出在这张表里根本装不下）
+    const abs = join(ROOT, rel);
     assert.ok(existsSync(abs), `${rel} 不存在 —— 这张清单过期了，删掉它或补上文件`);
     const self = readFileSync(abs, 'utf8');
     // 引用必须来自**别的**文件，只在自己文件里出现不算
@@ -153,6 +159,10 @@ test('⚠️ 面板上引用的每个 DOM id 都必须真实存在', () => {
     'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
     'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
     'scopeListCount', 'planScopeChip', 'scopeReady', 'scopeReadyText', 'btnScopeGoExecute',
+    // 2026-10-07 面板重排：窄栏 + 帮助页签 + 亮暗切换
+    'hero', 'planSpine', 'spineVal', 'btnDupPreview',
+    'tab-help', 'panel-help', 'helpBody', 'helpError', 'helpEmpty', 'btnHelpReload',
+    'btnTheme', 'themeIcon',
   ];
   const missing = NEW.filter((id) => !ids.has(id));
   assert.deepEqual(missing, [],

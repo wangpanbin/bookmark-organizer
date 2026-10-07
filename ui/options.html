@@ -5,6 +5,9 @@
   <title>书签整理助手</title>
   <link rel="icon" href="icons/icon-32.png" type="image/png">
   <link rel="stylesheet" href="options.css">
+  <!-- ⚠️ 必须放在 <head> 且是**经典脚本**：它要抢在首绘之前定下亮/暗。
+       MV3 的 CSP 拦行内脚本，模块脚本又天生 defer，两者都来不及。 -->
+  <script src="theme-boot.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主内容</a>
@@ -23,8 +26,14 @@
       <button role="tab" type="button" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false">链接健康 <em id="tabHealthCount">0</em></button>
       <button role="tab" type="button" id="tab-snap" data-tab="snap" aria-controls="panel-snap" aria-selected="false">备份快照 <em id="tabSnapCount">0</em></button>
       <button role="tab" type="button" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-selected="false">设置</button>
+      <button role="tab" type="button" id="tab-help" data-tab="help" aria-controls="panel-help" aria-selected="false">帮助</button>
     </nav>
     <div class="topbar-right">
+      <!-- 亮/暗切换。用户指定的品牌色 #26ba82 在暗色下是正文墨色，
+           而在亮色下对比度不够当文字色（2.49:1）。有了这个开关，
+           「亮色和暗色哪个好看」变成一个可试的决定，而不是被系统偏好替你定了。 -->
+      <button id="btnTheme" class="theme-toggle" type="button"
+              aria-live="polite" aria-label="切换亮暗主题"><span id="themeIcon">◐</span></button>
       <label class="field compact">
         <span>归入位置</span>
         <!--
@@ -44,16 +53,26 @@
   </header>
 
   <main id="main">
-  <section class="hero" id="hero">
-    <div class="hero-main">
-      <div class="hero-gauge">
-        <div class="hero-ring" id="heroRing" data-state="unknown">
-          <span class="hero-ring-val" id="heroRingVal">未预览</span>
-        </div>
-        <span class="hero-ring-cap">整理完成度</span>
-      </div>
+  <!-- ── 计划明细 ──
+       整理栏（指标 / 预览 / 执行 / 进度条）**只属于这一页**。
+       2026-10-07 之前它挂在 <main> 之下、六个面板之外，于是每一个页签
+       顶部都顶着同一套控件：在「设置」页看见「执行整理」既没意义又吓人。
+       窄栏右表：控制项窄而深，计划表宽而长，各自拿到该有的空间。
+       ⚠️ #busy 刻意不在窄栏里：busy() 有 7 个调用点来自别的页签
+          （勾选区读树、快照恢复、展开全部），留在窄栏里那些进度提示会
+          静默消失。它是 <body> 的直接子级，见文件末尾。 -->
+  <section class="panel active" data-panel="plan" id="panel-plan" role="tabpanel" aria-labelledby="tab-plan" tabindex="-1">
+    <div class="fail-banner" id="failBanner" hidden></div>
+    <div class="plan-grid">
 
-      <div class="hero-side">
+      <aside class="plan-side" id="hero">
+        <!-- 进度脊线：替代原来那个 132px 的圆环。
+             环是「仪表盘模板」里最容易被认出来的通用件，而它占掉的那一屏
+             恰好是这张计划表最需要的垂直空间。3px 的脊线同样能回答
+             「已经归位多少」，还顺带成了 sticky 窄栏的分界线。 -->
+        <div class="spine" id="planSpine" data-state="unknown"><i class="spine-fill"></i></div>
+        <div class="plan-side-cap"><span>整理完成度</span><b id="spineVal">未预览</b></div>
+
         <div class="stats" id="stats">
           <div class="card c-total"><span>书签总数</span><b id="stTotal">—</b></div>
           <div class="card c-move"><span>本次将移动</span><b id="stMove">—</b></div>
@@ -63,46 +82,29 @@
           <div class="card c-folders"><span>将新建文件夹</span><b id="stFolders">—</b></div>
         </div>
 
-        <div class="hero-actions">
+        <div class="plan-actions">
           <button id="btnPreview" class="primary">读取并预览</button>
           <button id="btnExecute" disabled>执行整理</button>
           <button id="btnPause" hidden>暂停</button>
           <button id="btnResume" hidden>继续</button>
-          <button id="btnRestore" class="danger-ghost">恢复备份</button>
-          <span id="busy" class="busy" role="status" aria-live="polite" hidden></span>
         </div>
-        <!--
-          当前这份计划是「全量」还是「只整理清单里的那些」。
-          ⚠️ 刻意贴着「执行整理」放：两个入口写的是同一个 state.plan，
-             界面上若不区分，用户在「手动整理」勾了但没预览、
-             切过来点执行，动的就是上一次的全量计划。
-        -->
+        <!-- 范围芯片贴着「执行整理」：两个入口写的是同一份 state.plan，
+             界面上若不区分，用户在「手动整理」勾了但没预览、切过来点执行，
+             动的就是上一次的全量计划（2026-10-05 45 条书签全军覆没）。 -->
         <p class="scope-chip" id="planScopeChip" data-mode="all" hidden></p>
-      </div>
-    </div>
 
-    <!-- 执行进度条：贴在 hero 卡底边，所有标签页都可见。
-         刻意不放在 #report 里 —— E2E 的终态判定只读那个单元格。 -->
-    <div class="exec-bar" id="execBar" data-state="idle" hidden>
-      <span class="exec-bar-label">本次整理</span>
-      <span class="exec-bar-text" id="execBarText">整理中 · 0/0</span>
-      <div class="exec-bar-track"><i class="exec-bar-fill" id="execBarFill"></i></div>
-    </div>
-  </section>
+        <div class="exec-bar" id="execBar" data-state="idle" hidden>
+          <span class="exec-bar-label">本次整理</span>
+          <span class="exec-bar-text" id="execBarText">整理中 · 0/0</span>
+          <div class="exec-bar-track"><i class="exec-bar-fill" id="execBarFill"></i></div>
+        </div>
+      </aside>
 
-  <!-- ── 计划明细 ── -->
-  <section class="panel active" data-panel="plan" id="panel-plan" role="tabpanel" aria-labelledby="tab-plan" tabindex="-1">
-    <div class="fail-banner" id="failBanner" hidden></div>
-    <div class="panel-head">
-      <p class="hint">
-        这是 <b>预览</b>：还没有动过你的任何书签。逐条核对，确认无误再点上面的「执行整理」。
-        点 <b>✗ 改</b> 选正确分类，会当场改判并沉淀成规则，下次更准。
-      </p>
-      <div class="panel-actions">
-        <label class="chk"><input type="checkbox" id="onlyChanged"> 只看将要移动的</label>
-        <label class="chk"><input type="checkbox" id="onlyLow"> 只看低置信</label>
-      </div>
-    </div>
+      <div class="plan-main">
+        <div class="panel-actions plan-filters">
+          <label class="chk"><input type="checkbox" id="onlyChanged"> 只看将要移动的</label>
+          <label class="chk"><input type="checkbox" id="onlyLow"> 只看低置信</label>
+        </div>
     <div class="table-wrap">
       <!-- 骨架屏是表格的兄弟节点，不在 #planBody 里。
            E2E 有三处数 `#planBody tr` 的条数来判定「这一轮渲染完了」，
@@ -123,22 +125,16 @@
         <tbody id="planBody"></tbody>
       </table>
       <p class="empty" id="planEmpty" hidden></p>
+      </div>
+      <p class="more" id="planMore" hidden></p>
+      </div>
     </div>
-    <p class="more" id="planMore" hidden></p>
   </section>
 
   <!-- ── 手动整理（只整理清单里的书签）── -->
   <section class="panel" data-panel="scope" id="panel-scope" role="tabpanel" aria-labelledby="tab-scope" tabindex="-1">
     <div class="panel-head">
-      <p class="hint">
-        先勾选要整理的书签，再点「预览选中」。<b>清单之外的书签一条都不会被移动，也不会被删除。</b>
-        勾选一个文件夹时，它里面的书签会在这一刻展开成一张快照，之后文件夹变不变都不影响这张清单。
-        移不动的条目（移动设备书签、已锁定、浏览器内部页）会灰掉并写明原因。
-      </p>
-      <p class="hint hint-flow">
-        <b>完整流程：</b>选择书签 → 加入清单 → <b>预览选中</b> → 自动切到「计划明细」页，
-        核对无误后点那里的 <b>「执行整理」</b>。真正动书签的只有最后那一步，而它一直在上面那一排按钮里。
-      </p>
+      <h2 class="panel-h">只整理清单里的书签。清单之外的不会被移动，也不会被删除。</h2>
       <div class="panel-actions">
         <button class="primary" id="btnScopePreview" type="button">预览选中</button>
         <button class="ghost" id="btnScopePick" type="button">选择书签</button>
@@ -157,10 +153,9 @@
     </div>
 
     <!-- 预览完成后的「去执行」入口。
-         ⚠️ 为什么需要它：「执行整理」只存在于 hero 区，而 hero **只在「计划明细」页 sticky**，
-            在本页会随页面滚走。于是用户在「手动整理」勾完、预览完，
-            这一页却找不到任何通往执行的入口。
-            症状是「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
+         ⚠️ 为什么需要它：「执行整理」只存在于「计划明细」页，而本页是「手动整理」。
+            用户勾完、预览完却找不到任何通往执行的入口，症状是
+            「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
          ⚠️ 这里刻意**不**再放一个「执行整理」按钮：同一动作两个入口，
             早晚会出现「一个能点一个不能点」「一个用的范围是另一个不是」。
             只给一个跳转：切到计划明细页并滚回顶部，让那唯一的执行按钮露出来。 -->
@@ -208,12 +203,11 @@
   <!-- ── 重复项 ── -->
   <section class="panel" data-panel="dup" id="panel-dup" role="tabpanel" aria-labelledby="tab-dup" tabindex="-1">
     <div class="panel-head">
-      <p class="hint">
-        同一页面被收藏多次。保留一条、删除其余。<b>删除不可逆</b>，但可以通过「恢复备份」找回。
-        归一化只剥「纯顶部锚点」白名单里的 hash，<b>SPA 路由（#/a 与 #/b）一律保留</b>，不会误判。
-        <b>每一条都可以单独勾「不删」</b>，勾上的条目不会进删除清单。
-      </p>
-      <button class="ghost" id="btnClearVeto" type="button">清除全部「不删」标记</button>
+      <h2 class="panel-h">同一页面被收藏多次，只合并完全相同的地址。<b>删除不可逆</b>，但可以通过「备份快照」页找回。</h2>
+      <div class="panel-actions">
+        <button class="ghost" id="btnDupPreview" type="button">重新预览</button>
+        <button class="ghost" id="btnClearVeto" type="button">清除全部「不删」标记</button>
+      </div>
     </div>
     <div id="dupList" class="dup-list"></div>
     <p class="empty" id="dupEmpty" hidden></p>
@@ -222,27 +216,30 @@
   <!-- ── 链接健康（死链/改链检测 + 元数据补全） ── -->
   <section class="panel" data-panel="health" id="panel-health" role="tabpanel" aria-labelledby="tab-health" tabindex="-1">
     <div class="panel-head">
-      <p class="hint">
-        定时访问<b>你书签里的那些 URL</b>，读它们的 HTTP 状态码、跳转目标与页面头部信息。
-        <b>不会向任何第三方上传你的书签数据</b>，也<b>永远不会写入你的书签</b>。
-        检测只出建议：同站改址会把新地址摆出来（可直接点开或复制），
-        死链和跨站跳转可以去查存档快照与候选地址。改不改、怎么改，你自己动手。
-      </p>
+      <h2 class="panel-h">检测只出建议，<b>永远不会写入你的书签</b>，也不会把书签数据上传给第三方。</h2>
     </div>
 
-    <!-- ⚠️ 这段「出网范围与去向」是许可与信任之间唯一的桥，不要为了简洁而删减 -->
-    <div class="card-block" id="healthDisclosure">
-      <h2>启用前请先看这里</h2>
-      <pre class="hint" id="healthDisclosureText" style="white-space:pre-wrap"></pre>
-      <div class="panel-actions">
-        <button id="btnLinkGrant" class="primary">授权访问网站</button>
-        <button id="btnLinkRevoke">撤销授权</button>
-        <span class="hint" id="healthPermState"></span>
+    <!-- 默认只展开「结果」。另外三块是设置与运维入口，折叠起来才看得见结果本身。
+         ⚠️ 折叠不等于隐藏：授权按钮在第一块里，用户必须能一眼找到它。 -->
+    <details class="fold" open>
+      <summary>检测会发出哪些请求？</summary>
+      <div class="fold-body">
+        <!-- ⚠️ 这段「出网范围与去向」是许可与信任之间唯一的桥，不要为了简洁而删减 -->
+        <div class="card-block" id="healthDisclosure">
+          <h2>出网范围与去向</h2>
+          <pre class="hint" id="healthDisclosureText" style="white-space:pre-wrap"></pre>
+          <div class="panel-actions">
+            <button id="btnLinkGrant" class="primary">授权访问网站</button>
+            <button id="btnLinkRevoke">撤销授权</button>
+            <span class="hint" id="healthPermState"></span>
+          </div>
+        </div>
       </div>
-    </div>
+    </details>
 
-    <div class="card-block">
-      <h2>检测</h2>
+    <details class="fold">
+      <summary>检测设置：频率与死链找新地址</summary>
+      <div class="fold-body">
       <div class="panel-actions">
         <button id="btnLinkRun" class="primary">立即检测一次</button>
         <button id="btnLinkResume" hidden>继续未完成的检测</button>
@@ -261,13 +258,10 @@
       <label class="chk">
         <input type="checkbox" id="linkAiFind">
         死链「AI 找新地址」
-        <span class="hint" style="display:block">
-          ⚠️ 开启后会把<b>死链的标题与地址</b>发给你配置的模型服务商，让它猜新地址。
-          它没有联网能力，猜出来的东西必须逐个探测验证才会展示。
-          存档快照的查询不经过模型。
-        </span>
+        <span class="hint" style="display:block">开启后会把死链的标题与地址发给你配置的模型服务商，猜出来的东西必须逐个探测验证才会展示。</span>
       </label>
-    </div>
+      </div>
+    </details>
 
     <div class="card-block">
       <h2>结果</h2>
@@ -290,60 +284,54 @@
       <p class="empty" id="healthEmpty" hidden></p>
     </div>
 
-    <div class="card-block">
-      <h2>语义去重</h2>
-      <p class="hint">
-        判断「不同 URL 但同内容」：镜像站、转载站、官方文档与它的镜像。
-        <b>结果只是建议，永远不会自动删除任何书签。</b>
-        启用后会把标题（以及归档出来的正文摘要）发到百炼做向量化。
-      </p>
-      <label class="chk"><input type="checkbox" id="semanticEnabled"> 启用语义去重</label>
-      <label class="field"><span>相似度阈值</span>
-        <input type="number" id="semanticThreshold" min="0.5" max="1" step="0.01" style="width:8em">
-      </label>
-      <div class="panel-actions">
-        <button id="btnSemanticRun" class="primary">跑一轮语义去重</button>
-        <button id="btnSemanticClear">清空向量缓存</button>
-        <span class="hint" id="semanticState" aria-live="polite"></span>
+    <details class="fold">
+      <summary>语义去重：不同 URL 但同内容</summary>
+      <div class="fold-body">
+        <p class="hint">判断镜像站、转载站、官方文档与它的镜像。结果只是建议，<b>永远不会自动删除任何书签。</b></p>
+        <label class="chk"><input type="checkbox" id="semanticEnabled"> 启用语义去重</label>
+        <label class="field"><span>相似度阈值</span>
+          <input type="number" id="semanticThreshold" min="0.5" max="1" step="0.01" style="width:8em">
+        </label>
+        <div class="panel-actions">
+          <button id="btnSemanticRun" class="primary">跑一轮语义去重</button>
+          <button id="btnSemanticClear">清空向量缓存</button>
+          <span class="hint" id="semanticState" aria-live="polite"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="grid" id="semanticTable" hidden>
+            <thead><tr><th>分数</th><th>保留</th><th>建议合并</th><th>判定依据</th></tr></thead>
+            <tbody id="semanticRows"></tbody>
+          </table>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table class="grid" id="semanticTable" hidden>
-          <thead><tr><th>分数</th><th>保留</th><th>建议合并</th><th>判定依据</th></tr></thead>
-          <tbody id="semanticRows"></tbody>
-        </table>
-      </div>
-    </div>
+    </details>
 
     <div class="card-block" id="healthAlt" hidden></div>
 
-    <div class="card-block">
-      <h2>内容归档</h2>
-      <p class="hint">
-        把抓到的正文存到你本机磁盘，防链接腐烂。<b>扩展无法写任意本地路径</b>，
-        所以这一步需要一个本机进程在跑。
-      </p>
-      <p class="hint">
-        全部页面都存 HTML；上面打上<b>星标</b>的页面会额外渲染成 PDF 和整页截图。
-        正文会在你点按钮的那一刻重新抓一次，所以已经打不开的页会如实报「重新抓取失败」。
-      </p>
-      <div class="panel-actions">
-        <button id="btnArchiveRun" class="primary">归档队列里的正文</button>
-        <button id="btnArchiveProbe">检查接收器</button>
-        <button id="btnArchiveReset" class="ghost">从头再归档一遍</button>
-        <span class="hint" id="archiveState" aria-live="polite">未检查</span>
+    <details class="fold">
+      <summary>内容归档：把正文存到本机磁盘</summary>
+      <div class="fold-body">
+        <div class="panel-actions">
+          <button id="btnArchiveRun" class="primary">归档队列里的正文</button>
+          <button id="btnArchiveProbe">检查接收器</button>
+          <button id="btnArchiveReset" class="ghost">从头再归档一遍</button>
+          <span class="hint" id="archiveState" aria-live="polite">未检查</span>
+        </div>
+        <p class="hint" id="archiveNote"></p>
       </div>
-      <p class="hint" id="archiveNote"></p>
-    </div>
+    </details>
   </section>
 
   <!-- ── 备份快照 ── -->
   <section class="panel" data-panel="snap" id="panel-snap" role="tabpanel" aria-labelledby="tab-snap" tabindex="-1">
     <div class="panel-head">
-      <p class="hint">
-        每次预览和执行前都会自动存一份快照。Chrome 没有原生撤销，<b>恢复备份是唯一退路</b>。
-      </p>
+      <h2 class="panel-h">每次预览和执行前都会自动存一份。Chrome 没有原生撤销，<b>这里是唯一退路</b>。</h2>
       <div class="panel-actions">
         <button id="btnSnapshot">立即备份</button>
+        <!-- 「恢复备份」2026-10-07 从整理栏搬到这里。它恢复的是**整棵书签树**，
+             放在「执行整理」旁边既抢注意力，又让一个全树级别的破坏性动作
+             看起来像是某一次执行的回滚。 -->
+        <button id="btnRestore" class="danger-ghost">恢复最近一份</button>
       </div>
     </div>
     <div id="snapList" class="snap-list"></div>
@@ -355,7 +343,7 @@
     <div class="settings-grid">
       <div class="card-block">
         <h2>类目结构</h2>
-        <p class="hint">改名或增删子类后点「保存」。「其他 / 待归类」是给你留的归口，第一轮跑完可以把落在这里的书签归到更合适的类目。</p>
+        <p class="hint">改名或增删子类后点「保存」。「其他 / 待归类」是给你留的归口。</p>
         <div id="taxonomyEditor" class="taxo-editor"></div>
         <div class="panel-actions">
           <button id="btnSaveTaxonomy" class="primary">保存类目</button>
@@ -366,11 +354,7 @@
 
       <div class="card-block">
         <h2>LLM 兜底（默认开启）</h2>
-        <p class="hint">
-          规则没命中、落进「待归类」的那一小撮才会发给模型。不会外发整个书签列表。
-          没配 key 时自动跳过，不影响其余整理。默认服务商 <b>DeepSeek</b>；
-          预设里还有阿里云百炼、Moonshot Kimi、OpenAI，任选一家都在下拉里切。
-        </p>
+        <p class="hint">规则没命中、落进「待归类」的那一小撮才会发给模型。不会外发整个书签列表。</p>
         <label class="chk big"><input type="checkbox" id="llmEnabled"> 启用 LLM 兜底分类</label>
         <label class="field"><span>服务商 / 模型预设</span>
           <select id="llmPreset"></select>
@@ -392,29 +376,11 @@
           <button id="btnSaveLlm" class="primary">保存</button>
         </div>
         <p class="hint" id="llmPermState"></p>
-        <p class="hint warn-text">
-          扩展运行时读不到操作系统环境变量（MV3 里没有 <code>process</code> 对象），
-          所以 key 由 <code>python tools/inject_key.py</code> 在加载前从环境变量读一次，
-          写入 <code>src/llm-key.local.js</code>。该文件已在 .gitignore 排除，打包时也不会包含。
-        </p>
-        <p class="hint warn-text">
-          DeepSeek 的模型名变动较频繁（<code>deepseek-chat</code> 已公告弃用），
-          官方文档对「当前该用哪个名字」说法也不一致。若报 400/404，
-          换一个预设模型即可。
-        </p>
       </div>
 
       <div class="card-block">
         <h2>移动失败日志</h2>
-        <p class="hint">
-          书签没搬成时，把原因记到本机 <code>F:\logs\bookmark-organizer\</code>，
-          按天一个 <code>.jsonl</code>（一行一条，方便 grep 或喂脚本）。
-        </p>
-        <p class="hint">
-          扩展没法直接写本地磁盘，所以要先在本机开一个接收器：
-          <code>npm run log:sink</code>，或双击 <code>tools\start_fail_log_sink.bat</code>。
-          端口 <code>8731</code>。
-        </p>
+        <p class="hint">书签没搬成时，把原因记到本机磁盘，按天一个 <code>.jsonl</code>。接收器没开时不报错、不打断整理。</p>
         <p class="hint" id="sinkState" aria-live="polite">接收器状态：检查中</p>
         <div class="row-stat">
           <span>未送出的失败记录</span><b id="pendingCount">0</b>
@@ -431,15 +397,11 @@
             <option value="0">关闭</option>
           </select>
         </label>
-        <p class="hint">
-          接收器没开时不报错、不打断整理，失败记录会存在扩展里，
-          随时可以用上面的「重新导出」手动存一份。
-        </p>
       </div>
 
       <div class="card-block" id="manualCard">
         <h2>人工干预</h2>
-        <p class="hint">锁定按 URL 记录（不是节点 id），所以移动过位置也不会失效。</p>
+        <p class="hint">锁定按 URL 记录，所以移动过位置也不会失效。</p>
         <div class="row-stat">
           <span>已锁定条目</span><b id="lockCount">0</b>
           <button id="btnClearLocks">全部解锁</button>
@@ -456,12 +418,35 @@
 
       <div class="card-block" id="reportCard">
         <h2>执行报告</h2>
-        <p class="hint">最近一次执行的结果。</p>
         <div id="report" class="report"><p class="empty-inline">还没有执行记录。</p></div>
       </div>
     </div>
   </section>
+
+  <!-- ── 帮助 ──
+       运行时读 docs/panel-help.md 并渲染。
+       ⚠️ 为什么不直接把说明堆在页面上：2026-10-07 之前界面里有 30 多段
+          说明性小字，每一段都在讲「这个功能怎么部署、边界是什么」，
+          而用户来面板是为了看结果。说明搬进文档后，界面只留结论与状态。
+       ⚠️ 这个文件**必须**进打包白名单（tools/package.py 的 INCLUDE_DOCS），
+          漏了的话症状是「帮助页签空白」，而打包机不会报任何错。 -->
+  <section class="panel" data-panel="help" id="panel-help" role="tabpanel" aria-labelledby="tab-help" tabindex="-1">
+    <div class="panel-head">
+      <h2 class="panel-h">使用说明</h2>
+      <button class="ghost" id="btnHelpReload" type="button">重新读取</button>
+    </div>
+    <div class="help-alert" id="helpError" hidden></div>
+    <article class="help-body" id="helpBody"></article>
+    <p class="empty" id="helpEmpty" hidden>正在读取 docs/panel-help.md</p>
+  </section>
   </main>
+
+  <!-- #busy 是**全局浮层**，不是某一页的控件。
+       busy() 有 14 个调用点，其中 7 个来自别的页签：勾选区读树、scope 预览失败、
+       快照恢复（在备份快照页触发）、展开全部。它 2026-10-07 之前住在 hero 的
+       按钮行里，而 hero 又只在「计划明细」页，于是「在快照页点了恢复，一动不动」
+       且界面上没有任何解释。留在 body 上，各页共用。 -->
+  <span id="busy" class="busy" role="status" aria-live="polite" hidden></span>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 

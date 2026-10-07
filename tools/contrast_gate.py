@@ -24,47 +24,56 @@ import sys
 # ── 底色（两套模式各自独立取色，不是自动反色）────────────────────
 BASE = {
     'light': {
-        'bg': '#f1f5ee',
+        'bg': '#f4f5f4',
         'surface': '#ffffff',
-        'sunken': '#e9f0e5',
-        'ok-soft': '#e6f3ea',
+        'sunken': '#eceeed',
+        'exec-track': '#e6e8e7',
     },
     'dark': {
-        'bg': '#121813',
-        'surface': '#1a211c',
-        'sunken': '#222a24',
-        'ok-soft': '#16301f',
+        'bg': '#121413',
+        'surface': '#1a1c1b',
+        'sunken': '#222423',
+        'exec-track': '#2a2c2b',
     },
 }
 
-# ── 重构后的墨色（与 ui/options.css 的 :root 逐项对应）─────────────
+# ── 2026-10-07 换色后的墨色（与 ui/options.css 的 :root 逐项对应）────
+# ⚠️ 品牌绿拆成三个角色，因为同一个色值没法同时满足三种对比度门槛：
+#   #26ba82 在亮色白底上只有 2.49:1，当文字色是不合格的，
+#   当装饰填充又需要 ≥3:1 的非文字对比度。所以：
+#     accent      装饰填充（不进 TEXT_PAIRS，也不进 FILL_PAIRS）
+#     accent-line 线性元素，≥3.0（WCAG 1.4.11）
+#     accent-ink  文字与按钮底，≥4.5（WCAG 1.4.3）
 INK = {
     'light': {
-        'muted': '#5c6a60',
-        'accent-ink': '#1c6b40',
+        'muted': '#5b625e',
+        'accent': '#26ba82',
+        'accent-line': '#1e9568',
+        'accent-ink': '#17704e',
         'warn': '#8a5a10',
         'danger': '#a32d24',
         'ok': '#16663f',
-        'accent': '#2f9e5e',
-        'accent-soft': '#e2f1e6',
+        'accent-soft': '#e0f2ea',
         'warn-soft': '#fbf3e0',
     },
     'dark': {
-        'muted': '#9aac9f',
-        'accent-ink': '#7fd6a8',
+        'muted': '#a0a4a1',
+        'accent': '#2f9d6c',
+        'accent-line': '#56c99e',
+        'accent-ink': '#26ba82',
         'warn': '#e5bd66',
         'danger': '#f2907f',
-        'ok': '#4fbf88',
-        'accent': '#4fbf88',
-        'accent-soft': '#1c2e23',
+        'ok': '#5cc79a',
+        'accent-soft': '#1a2b23',
         'warn-soft': '#332a15',
     },
 }
 
 # 压在填充色上的文字色
+# ⚠️ on-accent 是压在 **--accent** 上的（主按钮底色），不是压在 --accent-ink 上。
 ON = {
-    'light': {'on-accent': '#ffffff', 'on-danger': '#ffffff', 'on-ok': '#ffffff'},
-    'dark': {'on-accent': '#0f1712', 'on-danger': '#0f1712', 'on-ok': '#0f1712'},
+    'light': {'on-accent': '#0d1a14', 'on-danger': '#ffffff', 'on-ok': '#ffffff'},
+    'dark': {'on-accent': '#0d1a14', 'on-danger': '#0f1712', 'on-ok': '#0d1a14'},
 }
 
 # 重构前的旧值，仅用于负控
@@ -79,6 +88,16 @@ OLD = {
         'muted': '#96a39a', 'accent-ink': '#5cc98d', 'warn': '#e0b050',
         'danger': '#ef7a6d', 'ok': '#5cc98d', 'accent': '#5cc98d',
     },
+}
+
+# ── 非文字对比度的负控样本（2026-10-07）────────────────────────
+# ⚠️ 这道判据刚加进来时**一次都没红过**。一道从来没红过的闸门等于没有闸门，
+#    所以给它配一对「拿来当线性色一定不合格」的样本，必须能红。
+# 亮色那个正是本次指定的品牌色 #26ba82：它当装饰填充很好看，
+# 但压在自己的进度条轨道上只有 2.02:1 —— 这就是为什么要拆出 accent-line。
+LINE_BAD = {
+    'light': '#26ba82',
+    'dark': '#315a44',
 }
 
 # (墨色, 底色, 最低比值, 说明)
@@ -96,14 +115,29 @@ TEXT_PAIRS = [
     ('danger', 'surface', 4.5, '.danger-ghost on card'),
     ('danger', 'sunken', 4.5, 'duplicate metric on sunken'),
     ('ok', 'surface', 4.5, 'kept entry on card'),
-    ('ok', 'ok-soft', 4.5, 'learned badge on soft fill'),
 ]
 
 # (文字色名, 填充色名, 最低比值, 说明)
 FILL_PAIRS = [
-    ('on-accent', 'accent-ink', 4.5, 'label on primary button'),
+    # ⚠️ 主按钮压的是 --accent（品牌色）而不是 --accent-ink，配近黑字而不是白字。
+    #    2026-10-07 之前这里是 ('on-accent','accent-ink') + 白字：
+    #    白字压 #26ba82 只有 2.49:1，而近黑字有 7.17:1。
+    #    判据要跟着实现走 —— 闸门量的是实际那一对，不是当初设想的那一对。
+    ('on-accent', 'accent', 4.5, 'label on primary button'),
     ('on-danger', 'danger', 4.5, 'label on execute button'),
     ('on-ok', 'ok', 4.5, 'label on learned badge'),
+]
+
+# ── 非文字对比度（2026-10-07 新增）──────────────────────────────
+# 为什么加这一组：换色之前，这道闸门**只量文字**，于是「品牌绿当文字合格、
+# 当线条不合格」这类缺陷整套漏过去 —— 旧 --accent #2f9e5e 对白底 3.40:1
+# 勉强过非文字门槛，可它压在自己那条进度条轨道上只有 2.93:1，从来没被量过。
+# 判据是 WCAG 1.4.11：UI 组件与有意义的图形 ≥3:1。
+LINE_PAIRS = [
+    ('accent-line', 'bg', 'focus ring on body'),
+    ('accent-line', 'surface', 'focus ring on card'),
+    ('accent-line', 'sunken', 'focus ring on sunken'),
+    ('accent-line', 'exec-track', 'progress fill vs its own track'),
 ]
 
 
@@ -187,6 +221,32 @@ def main():
         negative_passed += 1
         print('  dark  COLLISION  --ok == --accent  (identical value)')
 
+    # 非文字对比度的负控：LINE_BAD 当线性色必须在**每个**底上都红。
+    # 只红一个不算数 —— 那说明判据只量了某一个底，漏的正是最贴近实际的那处。
+    #
+    # ⚠️ 刻意用**独立**计数器，不并进 negative_passed：
+    #    共用一个的话，这 8 次「通过」会把 OLD 侧的回归抬到门槛之上，
+    #    于是「旧色板还能否复现历史缺陷」这个信号被另一个判据的通过次数稀释。
+    #    两个负控量的是两件不同的事，混在一个数里就都看不见了。
+    print('\n[negative control] line contrast - the bad line token MUST fail everywhere')
+    line_failures = 0
+    for mode in ('light', 'dark'):
+        for _, bg_name, note in LINE_PAIRS:
+            r = ratio(LINE_BAD[mode], BASE[mode][bg_name])
+            if r < 3.0:
+                line_failures += 1
+                print(f'  {mode:5} NG  {r:5.2f}  bad line token on {bg_name}  ({note})')
+            else:
+                print(f'  {mode:5} ??  {r:5.2f}  bad line token on {bg_name}  <- it passed!')
+    EXPECTED_LINE_FAILURES = len(LINE_PAIRS) * 2
+    if line_failures < EXPECTED_LINE_FAILURES:
+        print(f'\nFAIL: line-contrast negative control produced only {line_failures} failures,'
+              f' expected {EXPECTED_LINE_FAILURES}. The non-text criterion cannot prove'
+              f' anything, so the new LINE_PAIRS below is decorative.')
+        return 1
+    print(f'  -> {line_failures} line-contrast failures reproduced'
+          f' (expected {EXPECTED_LINE_FAILURES})\n')
+
     # 期望复现数。逐条对应下面这 7 处，不是拍脑袋写的：
     #   亮色 ink 4 处（muted/sunken、muted/bg、accent/surface、warn/surface）
     #   白字压 accent 2 处（亮 3.40、暗 2.06）
@@ -218,6 +278,11 @@ def main():
             show(mode, ratio(INK[mode][fg], base[bg]), need, note, bad)
         for on, fill, need, note in FILL_PAIRS:
             show(mode, ratio(ON[mode][on], INK[mode][fill]), need, note, bad)
+        # 非文字对比度：门槛是 3.0 而不是 4.5（WCAG 1.4.11）。
+        # 少了这一组，「品牌色当文字合格、当线条不合格」这类缺陷整套漏过去。
+        print('  -- non-text (WCAG 1.4.11, need 3.0)')
+        for fg, bg_name, note in LINE_PAIRS:
+            show(mode, ratio(INK[mode][fg], base[bg_name]), 3.0, note, bad)
         print()
 
     # ── 置信度徽章必须彼此可分 ───────────────────────────────────

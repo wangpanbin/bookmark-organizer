@@ -68,11 +68,37 @@ function resolveExtPath() {
   const root = mkdtempSync(join(tmpdir(), 'boext-'));
   tempRoots.push(root);
   const dest = join(root, 'ext');
+  // ⚠️ docs/panel-help.md 必须留在副本里：面板「帮助」页签在运行时 fetch 它。
+  //    2026-10-07 之前这条过滤把整个 docs/ 都排掉（为了少拷几 MB 工程文档），
+  //    加上帮助页签之后那会让每一次 E2E 的帮助用例都 404 ——
+  //    而症状是「帮助页签空白」，看起来像渲染器坏了，真因是副本里没这个文件。
+  //    判据：只放行 docs/panel-help.md 这一个文件，其余 docs/ 一律不拷。
+  const RUNTIME_DOCS = new Set(['panel-help.md']);
   cpSync(EXT_PATH, dest, {
     recursive: true,
     // vendor 产物是构建出来的、本机才有；node_modules 里也没有 E2E 需要的东西。
-    filter: (p) => !/(^|[\\/])(node_modules|\.git|tests|docs|\.scratch)([\\/]|$)/.test(p),
+    filter: (p) => {
+      const rel = p.slice(EXT_PATH.length).replace(/^[\\/]+/, '');
+      if (!rel) return true;
+      const parts = rel.split(/[\\/]/);
+      if (parts[0] === 'docs') {
+        // ⚠️ 目录本身必须放行：cpSync 先问目录再问它的子项，
+        //    目录返回 false 会把整棵子树剪掉，panel-help.md 根本没机会被访问到。
+        //    这正是第一版的写法：它排掉了 docs 目录，于是帮助页签永远是空白。
+        if (parts.length === 1) return true;
+        return parts.length === 2 && RUNTIME_DOCS.has(parts[1]);
+      }
+      return !/(^|[\\/])(node_modules|\.git|tests|docs|\.scratch)([\\/]|$)/.test(p);
+    },
   });
+  // 副本必须与 tools/package.py 的 INCLUDE_DOCS 保持一致：
+  // 那边的白名单排掉了它，这边也排掉，两边同进同退。
+  if (!existsSync(join(dest, 'docs', 'panel-help.md'))) {
+    throw new Error(
+      '扩展副本里没有 docs/panel-help.md —— 面板「帮助」页签在 E2E 里必然空白。'
+      + '它必须与 tools/package.py 的 INCLUDE_DOCS 同步。',
+    );
+  }
   if (!existsSync(join(dest, 'manifest.json'))) {
     throw new Error(`扩展副本不完整（缺 manifest.json）：${dest}`);
   }

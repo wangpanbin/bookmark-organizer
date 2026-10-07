@@ -25,6 +25,7 @@ Chrome MV3 扩展。按「功能」把已收集的书签自动归类到两层中
 
 | 文档 | 什么时候去看 |
 |---|---|
+| [docs/panel-help.md](docs/panel-help.md) | **面板「帮助」页签读的就是它**：每个页签怎么用、各功能的边界、已知问题、配置方法 |
 | [docs/testing.md](docs/testing.md) | 三类闸门（正向 / 证伪 / E2E）各自守什么、怎么跑、跑之前必须知道什么、**当前的覆盖缺口** |
 | [docs/acceptance-thresholds.md](docs/acceptance-thresholds.md) | 每个数字为什么是这个数字，以及**它到底校准过没有** |
 | [docs/lessons-learned.md](docs/lessons-learned.md) | 症状对得上时按症状查（大部分坑表现为「某个功能就是不工作」，根因在别处） |
