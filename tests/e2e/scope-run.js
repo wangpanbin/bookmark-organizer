@@ -128,6 +128,25 @@ test('⚠️ 两组对照：勾的 2 条被移动，没勾的 4 条 parentId 一
     const planRows = await page.evaluate(() => document.querySelectorAll('#planBody tr').length);
     assert.ok(planRows > 0, '子集预览没有渲染出任何计划行');
 
+    // ⚠️ 切回「手动整理」页，必须仍然有一条通往执行的入口。
+    //    这条是被真实用户报出来的洞：「执行整理」只存在于 hero 区，
+    //    而 hero **只在「计划明细」页 sticky**，在手动整理这一页会随页面滚走。
+    //    于是用户勾完、预览完，本页找不到任何执行入口，
+    //    症状是「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
+    await page.click('#tabs button[data-tab="scope"]');
+    await page.waitForSelector('#scopeReady:not([hidden])', { timeout: 10000 });
+    const readyText = await page.textContent('#scopeReadyText');
+    assert.match(readyText, /不会被动/, '跳转条没有说明「清单之外不会被动」这条承诺');
+
+    // 点它：应当切到计划明细页并滚回顶部，让 hero 里那个唯一的执行按钮进视野
+    await page.click('#btnScopeGoExecute');
+    await page.waitForFunction(
+      () => document.querySelector('#tabs button[data-tab="plan"]')?.classList.contains('active'),
+      undefined, { timeout: 5000 },
+    );
+    const execVisible = await page.isVisible('#btnExecute');
+    assert.ok(execVisible, '点了「去执行整理」，但「执行整理」按钮仍不在视野里');
+
     // ── 执行 ──
     await page.click('#btnExecute');   // confirm() 由 harness 自动接受
     await waitForExecutionDone(page, 60000);

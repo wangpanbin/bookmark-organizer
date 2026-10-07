@@ -408,9 +408,13 @@ URL 归一化判重敢自动删，是因为同一组条目的 URL 字符串完�
 npm install          # 只装 Playwright（跑 E2E 才需要）
 npm test             # 单元测试（Node 内置 test runner，零依赖）
 npm run test:falsify # 产品级证伪：改坏真实源码重跑整套，确认闸门会红
-npm run test:e2e     # E2E（需要完整 chromium + 有头模式）
+npm run test:e2e     # E2E（默认 headless，不弹窗）
+npm run test:scope    # 手动指定书签范围的 E2E
 node tests/e2e/diagnose.js   # 诊断：打印执行过程中任务状态的推进与失败原因
 ```
+
+E2E 走系统 Chrome/Edge 的**无头模式**，跑起来不会弹窗。
+想肉眼看着它跑：`BO_E2E_HEADED=1 npm run test:e2e`。
 
 ### 三类闸门，缺一不可
 

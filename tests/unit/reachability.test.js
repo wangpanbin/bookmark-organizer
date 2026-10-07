@@ -152,7 +152,7 @@ test('⚠️ 面板上引用的每个 DOM id 都必须真实存在', () => {
     'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
     'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
     'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
-    'scopeListCount', 'planScopeChip',
+    'scopeListCount', 'planScopeChip', 'scopeReady', 'scopeReadyText', 'btnScopeGoExecute',
   ];
   const missing = NEW.filter((id) => !ids.has(id));
   assert.deepEqual(missing, [],

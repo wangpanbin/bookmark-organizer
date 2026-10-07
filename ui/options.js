@@ -525,6 +525,33 @@ function syncExecuteButton() {
  * 这与 2026-10-05 那次事故是同一个教训：执行路径的文案必须写明范围，
  * 漏写一次就是 45 条书签在用户不知情的情况下被搬走。
  */
+/**
+ * 「预览已完成，去执行」的跳转条。
+ *
+ * ⚠️ 为什么需要它：「执行整理」只存在于 hero 区，而 hero **只在「计划明细」页
+ *    sticky**（CSS 靠 body[data-tab] 判）。在「手动整理」这一页它会随页面滚走，
+ *    于是用户勾完、预览完，本页却找不到任何通往执行的入口 ——
+ *    症状是「勾了半天，没地方执行」，而界面上没有任何一处说明为什么。
+ *
+ * ⚠️ 刻意**不**在这里再放一个「执行整理」按钮：同一动作两个入口，
+ *    早晚会出现「一个能点一个不能点」「一个用的范围是另一个不是」。
+ *    这里只负责把人送到那唯一的执行按钮面前。
+ */
+function renderScopeReady() {
+  const el = $('scopeReady');
+  if (!el) return;
+  const scoped = state.planScope.mode === 'scope';
+  const runnable = state.plan ? (state.plan.items || []).length : 0;
+  if (!scoped || !runnable) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  $('scopeReadyText').textContent =
+    `预览已生成：清单里的 ${runnable} 条待移动，清单之外的书签不会被动。`
+    + '点右边去「计划明细」页核对，再点「执行整理」开始。';
+}
+
 function renderPlanScopeChip() {
   const el = $('planScopeChip');
   if (!el) return;
@@ -587,6 +614,7 @@ function renderScope() {
   $('btnScopeClearAll').hidden = !stats.total;
   // 没有待整理的条目时禁用：点了也只会得到一句「清单是空的」
   $('btnScopePreview').disabled = !(stats.pending + stats.failed);
+  renderScopeReady();
 
   const ul = $('scopeList');
   ul.textContent = '';
@@ -2697,6 +2725,13 @@ async function init() {
   $('btnScopePick').addEventListener('click', () => openScopePicker().catch((e) => {
     toast(`读不到书签树：${e.message || e}`, true);
   }));
+  // 跳到「计划明细」页并滚回顶部 —— hero 只在那一页 sticky，
+  // 不滚回去的话「执行整理」按钮仍然不在视野里，等于没跳。
+  $('btnScopeGoExecute').addEventListener('click', () => {
+    const tab = document.querySelector('#tabs button[data-tab="plan"]');
+    if (tab) selectTab(tab);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
   $('btnScopePreview').addEventListener('click', () => doScopePreview());
   $('btnScopeRetry').addEventListener('click', () => doScopePreview({ retryFailed: true }));
   $('btnScopeClearDone').addEventListener('click', async () => {

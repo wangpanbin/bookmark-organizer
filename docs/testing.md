@@ -196,10 +196,56 @@ storage.js 是全项目最容易**静默**损坏数据的模块，之前只能�
 > 「无论勾什么都全跳过」的实现也能让它变绿 —— 那种闸门测不出东西。
 > 它的判据是端到端的**用户可见承诺**；执行器「不信任上游过滤」那道独立复查
 > 由 `tests/unit/veto.test.js` 覆盖（E2E 走真实用户路径，构造陈旧 payload 属于绕过前端）。
+>
+> ⚠️ 那条用例的断言**只能按组断言**，不能断言具体哪一条被删。
+> 「保留项」不是夹具决定的，是 Chrome 分配的 id 决定的：两条候选路径深度相同、
+> 又是同一毫秒创建，`dateAdded` 完全相同，于是 `compareKeeper` 落到 id 升序，
+> 而带不带跟踪参数谁拿到小 id 是不确定的（实测两种都出现过）。
+> 早先断言「带 `?spm=abc` 的那条必须消失」，于是这条闸门**随机红绿**。
+> 现在断言的是真正的不变量：A 组（勾了不删）两条都在，B 组（没勾）只剩一条。
+
+### 跑 E2E
+
+默认 **headless**，不会弹窗。需要肉眼看着它跑的时候：
+
+```bash
+BO_E2E_HEADED=1 npm run test:e2e      # 开窗（调试用）
+BO_E2E_CHANNEL=chrome npm run test:e2e # 强制换浏览器通道
+BO_E2E_EXT_PATH=D:/no-space/ext npm run test:e2e  # 扩展已在无空格路径时跳过复制
+```
+
+| 命令 | 覆盖 |
+|---|---|
+| `npm run test:e2e` | 主干 9 条（加载 / 零写入 / 幂等 / 回滚 / 去重 / 断点续跑 / 回收后数据可读 / 锁定 / 逐条否决） |
+| `npm run test:scope` | 手动范围 3 条（两组对照 / 确认弹窗文案 / 失效不按 URL 认领） |
+
+> ⚠️ **单跑一条用例会红，不代表代码有问题。** 本机实测「去重逐条否决」
+> 隔离跑与跟着全套跑结果不同 —— 断言对象押在了 id 分配上（详见上一段）。
+> 判断回归时**要么跑全套，要么先在原始 HEAD 上跑同一条做对照**，
+> 别拿「单独跑红了」直接当回归证据。
 
 ### E2E 的硬约束，全部来自本机已实证的坑
 
-- **`chromium_headless_shell` 不支持加载扩展**。必须完整 chromium（`channel: 'chromium'`）且**有头模式**。
+- **`chromium_headless_shell` 不支持加载扩展**，而 Playwright 自带的 chromium 在
+  `headless: true` 时用的正是它。
+  **但走 `channel`（系统 Chrome/Edge）时，`headless: true` 用的是真实浏览器的新
+  headless 模式，扩展照常工作**（本机 Edge 154 实测 service worker 正常出现）。
+  → 本 harness 走 channel，**默认 headless**，跑测试不再弹窗。
+    要肉眼调试用 `BO_E2E_HEADED=1`。
+- **Chrome 155 已移除 `--load-extension`**（本机实测：换无空格路径、
+  加 `--disable-features=DisableLoadExtensionCommandLineSwitch` 与
+  `--enable-unsafe-extension-debugging` 全部无效）；**Edge 154 仍支持**。
+  通道链 `msedge → chrome → chromium` **只对「二进制缺失」这一类错回退**，
+  其他错误立刻抛 —— 把真问题降级成「换个浏览器再试试」会把排查带偏一整轮。
+- **扩展路径不能含空格。** `--load-extension=F:\test\Label Management\…`
+  会被 Chrome 解析失败，症状是**浏览器正常启动、扩展根本没加载**，
+  只表现为 `waitForEvent('serviceworker')` 超时。极易误判成「扩展坏了」。
+- **复制扩展时路径必须在进程内稳定。** unpacked 扩展的 id 由**绝对路径哈希**而来，
+  路径一变 id 就变，而 `chrome.storage.local` 按扩展 id 分区。
+  于是「跑一半关浏览器、同 profile 重开继续跑」这类用例会读到**空的
+  `task:current`**，症状是「执行记录整个消失了」——
+  而真实原因是一个没人会想到的临时目录名。`resolveExtPath()` 已按进程 memo。
+  这条专坑「多次 launch + 依赖 storage 续跑」的用例，比如断点续跑。
 - 必须 `launch_persistent_context` + **每次全新 `user_data_dir`**。
   复用同一 context 改扩展产物，Chrome 会命中资源缓存 —— 看着像「闸门无效」，
   其实是坏实现从未运行过。

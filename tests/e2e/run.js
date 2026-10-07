@@ -368,20 +368,41 @@ test('去重逐条否决：勾了「不删」的条目执行后仍在，没勾�
       return out;
     });
 
+    // ⚠️⚠️ 断言的对象必须换掉，否则这条闸门会随机红绿。
+    //
+    // 早先这里断言「对照组-待删（?spm=abc 那条）必须消失」，
+    // 并且断言「否决组-保留 / 对照组-保留 都必须还在」。
+    // 但**哪一条是 keeper 不是夹具决定的，是 Chrome 分配的 id 决定的**：
+    // compareKeeper 的口径是「同深度 → 同收藏时间 → id 升序」，
+    // 这两条路径深度相同、又是同一批毫秒内创建的，dateAdded 常常完全相同，
+    // 于是落到 id 升序 —— 而 id 跟着 profile 的分配走，
+    // 带不带 ?spm=abc 谁拿到小 id 是不确定的（实测两种都出现过）。
+    // 于是「待删项」有时真的是待删项、有时反而是保留项，断言就随机红绿。
+    //
+    // 真正要保证的不变量是**按组看**的：
+    //   A 组（勾了不删）→ 两条都在，因为被保护的那条根本没进删除队列
+    //   B 组（没勾）    → 只剩一条，因为另一条确实被删了
+    const survives = (u) => urls.includes(u);
     const vetoKept = urlOf('否决组-待删');
-    const controlDropped = urlOf('对照组-待删');
     assert.ok(
-      urls.includes(vetoKept),
+      survives(vetoKept),
       `勾了「不删」的条目被删掉了（${vetoKept}）—— 不可逆数据损失`,
     );
-    assert.ok(
-      !urls.includes(controlDropped),
-      `没勾的对照组条目没被删（${controlDropped}）—— 否决被当成了全局跳过`,
+
+    const groupA = ['否决组-保留', '否决组-待删'].map(urlOf);
+    const aSurvivors = groupA.filter(survives);
+    assert.equal(
+      aSurvivors.length, 2,
+      `A 组应当两条都在（被「不删」保护的那条没进删除队列），实际剩 ${aSurvivors.length} 条：${aSurvivors.join(' / ')}`,
     );
-    // 两条保留项都必须在
-    for (const t of ['否决组-保留', '对照组-保留']) {
-      assert.ok(urls.includes(urlOf(t)), `保留项 ${urlOf(t)} 不见了`);
-    }
+
+    const groupB = ['对照组-保留', '对照组-待删'].map(urlOf);
+    const bSurvivors = groupB.filter(survives);
+    assert.equal(
+      bSurvivors.length, 1,
+      `B 组应当也删掉一条，实际剩下 ${bSurvivors.length} 条（${bSurvivors.join(' / ')}）`
+      + '—— 否决被当成了全局跳过，或两条都被删了',
+    );
   } finally {
     await ctx.close();
   }

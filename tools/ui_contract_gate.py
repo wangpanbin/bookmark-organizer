@@ -78,7 +78,7 @@ GATED = [
     'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
     'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
     'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
-    'scopeListCount', 'planScopeChip',
+    'scopeListCount', 'planScopeChip', 'scopeReady', 'scopeReadyText', 'btnScopeGoExecute',
 ]
 miss = [i for i in GATED if i not in ids]
 print(f'\n  gated ids present: {"ALL OK" if not miss else miss}')
@@ -123,6 +123,67 @@ for f in ('options.js', 'options.html', 'popup.html'):
         print(f'    ui/{f}:{i}  {s[:90]}')
 if leftover:
     fails.append(f'{leftover} prose em-dash(es) remain')
+else:
+    print('    (none)')
+
+# ── HTML 注释不得自我截断 ────────────────────────────────────────
+#
+# ═══ 这道检查守的是一次真实事故 ═══
+# 2026-10-07，界面上出现了一串莫名其妙的半句话：
+#     「，会被当成正文散文报红。） -->
+# 根因是写注释时在**注释正文里写了注释的结束记号**。HTML 注释不能嵌套，
+# 于是注释在那一处被截断，后半句当成**可见正文**渲染到了页面上。
+#
+# ⚠️ 为什么上面那道逐行 em-dash 检查没能抓到它：
+#    逐行检查靠「这行含结束记号 → 当注释跳过」来识别注释，
+#    而出事那行**恰好含结束记号** —— 量具和缺陷长成了同一个形状，
+#    于是它精准地对正确代码放行、对错误代码也放行。
+#    这类「闸门用了一个恰好与缺陷同形的判据」是最难发现的一种失效，
+#    所以下面这段自检是必须的：判据本身必须先证明两侧都对过。
+
+def broken_comment_hits(src):
+    """返回 [(残留起始行号, 残留片段)]；没有则返回 []。
+
+    做法：按非贪婪解析取出每个注释，把它们的区间挖掉之后，
+    剩下的正文里不该再出现任何注释记号 —— 出现即说明有注释提前截断了。
+    """
+    spans = [(m.start(), m.end()) for m in re.finditer(r'<!--.*?-->', src, re.S)]
+    rest, prev = [], 0
+    for a, b in spans:
+        rest.append(src[prev:a])
+        prev = b
+    rest.append(src[prev:])
+    residue = ''.join(rest)
+    out = []
+    for m in re.finditer(r'<!--|-->', residue):
+        out.append((residue[:m.start()].count('\n') + 1,
+                    residue[max(0, m.start() - 24):m.start() + 32]))
+    return out
+
+
+# 自检：判据必须两侧都对。绿灯本身不算证据，一道从来没红过的闸门等于没有闸门。
+_SELF_BAD = '<div>a</div>\n<!-- 说明里写了结束记号 --> 的后半句 -->\n<div>b</div>\n'
+_SELF_GOOD = '<div>a</div>\n<!-- 说明里提到「结束记号」三个字\n     但没有真的写出它 -->\n<div>b</div>\n'
+if not broken_comment_hits(_SELF_BAD):
+    fails.append('注释自截断判据失灵：喂了已知坏样本却没报错')
+    print('    ⚠️ 自检失败：已知坏样本没被抓到')
+if broken_comment_hits(_SELF_GOOD):
+    fails.append('注释自截断判据误报：正常注释被判成截断')
+    print('    ⚠️ 自检失败：正常样本被误报')
+if broken_comment_hits(_SELF_BAD) and not broken_comment_hits(_SELF_GOOD):
+    print('    自检：已知坏样本能抓到、正常样本不误报')
+
+print('\n  HTML 注释未被自身截断:')
+broken = 0
+for f in ('options.html', 'popup.html'):
+    src = (ROOT / 'ui' / f).read_text(encoding='utf-8')
+    hits = broken_comment_hits(src)
+    if hits:
+        broken += 1
+        print(f'    ui/{f}: 注释正文里写了注释记号，其后半句会变成可见正文：'
+              f'约第 {hits[0]} 行 …{hits[1][:44]}…')
+if broken:
+    fails.append(f'{broken} 个 HTML 文件里有注释写成了自我截断（后半句会漏到页面上）')
 else:
     print('    (none)')
 

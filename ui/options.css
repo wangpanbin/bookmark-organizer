@@ -765,6 +765,26 @@ table.grid .hint { display: inline-block; }
 .scope-stat[data-zero="1"] b { color: var(--muted); }
 .scope-stat-note { flex: 1 1 100%; font-size: 12px; }
 
+/* 流程提示：说明「执行整理」在哪个页面，不是装饰 */
+.hint-flow {
+  margin-top: var(--sp-2);
+  color: var(--muted);
+  background: var(--sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+}
+
+/* 预览完成后的跳转条 */
+.scope-ready {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-ink);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+}
+.scope-ready-text { color: var(--text); font-size: 13px; flex: 1 1 240px; }
+
 .scope-h { font-size: 13px; color: var(--text); margin: 0 0 var(--sp-2); }
 .scope-h-sub { color: var(--muted); font-weight: 400; margin-left: 6px; }
 

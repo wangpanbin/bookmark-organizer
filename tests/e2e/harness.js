@@ -1,14 +1,21 @@
 /**
  * E2E 脚手架。
  *
- * ═══ 三条硬约束（全部来自本机已实证的坑，不是风格偏好）═══
- * 1. `chromium_headless_shell` **不支持**加载扩展。必须用完整 chromium
- *    （`channel: 'chromium'` 或 chromium-<rev>/chrome-win64/chrome.exe）且**有头模式**。
- *    扩展类 E2E 的第一步就该单独验这一条 —— 不通过则整套不成立。
- * 2. 必须 `launch_persistent_context` + **每次全新 user_data_dir**。
+ * ═══ 四条硬约束（全部来自本机已实证的坑，不是风格偏好）═══
+ * 1. **`chromium_headless_shell` 不支持加载扩展**，而 Playwright 自带的
+ *    chromium 在 `headless: true` 时用的正是它。
+ *    但走 `channel`（系统 Chrome/Edge）时，`headless: true` 用的是**真实浏览器
+ *    的新 headless 模式**，扩展照常工作（本机 Edge 154 实测 service worker 正常出现）。
+ *    → 所以本 harness 走 channel，**默认 headless**，跑测试不再弹窗。
+ *      要肉眼调试用 `BO_E2E_HEADED=1`。
+ * 2. **走 channel 时 Chrome 155 已移除 `--load-extension`**（Edge 154 仍支持），
+ *    且**扩展路径不能含空格**。两件事都由 resolveExtPath() 与下面的通道链兜住。
+ * 3. 必须 `launch_persistent_context` + **每次全新 user_data_dir**。
  *    改扩展产物做证伪时若复用同一 context，Chrome 会命中扩展资源缓存，
  *    补丁写了但页面跑的仍是旧脚本，看着像「闸门无效」其实是坏实现从未运行。
- * 3. 断言走**真实用户路径**（点按钮、读表格 DOM），不要直接调应用内部函数 ——
+ *    ⚠️ 但**扩展副本的路径必须在进程内稳定**（unpacked 扩展 id 由绝对路径哈希而来，
+ *    路径一变 id 就变，`chrome.storage.local` 跟着换分区）。
+ * 4. 断言走**真实用户路径**（点按钮、读表格 DOM），不要直接调应用内部函数 ——
  *    内部函数可能压根没被用户路径触达。
  *    只有「造夹具」和「读书签树」这两件必须绕不过去的事，才用 chrome.* API。
  */
@@ -85,11 +92,35 @@ function isMissingBinary(err) {
 }
 
 /**
+ * 要不要开窗口？
+ *
+ * ⚠️ 默认 **headless**，因为「跑一次 E2E 弹一次窗、界面一闪一闪」
+ *    是真的会让人烦的，而且那条规则原来是默认**有头**的 ——
+ *    理由早已过时：它继承自「chromium_headless_shell 不支持加载扩展」。
+ *
+ *    但那条限制**只对 Playwright 自带的 chromium 成立**：
+ *    走 channel（系统 Chrome/Edge）时，`headless: true` 用的是
+ *    **真实浏览器的新 headless 模式**，扩展完全支持。
+ *    本机实测（Edge 154 + headless:true）→ service worker 正常出现。
+ *
+ *    所以：默认 headless（安静），要肉眼调试时用 BO_E2E_HEADED=1 或
+ *    `launchWithExtension({ headed: true })` 临时开窗。
+ *
+ * @param {{headed?: boolean}} opts
+ * @returns {boolean}
+ */
+function wantHeaded(opts = {}) {
+  if (opts.headed === true) return true;
+  if (opts.headed === false) return false;
+  return process.env.BO_E2E_HEADED === '1';
+}
+
+/**
  * 启动带扩展的浏览器上下文。
  * @param {{headed?: boolean, reuseUserDataDir?: string, channel?: string}} [opts]
  */
 export async function launchWithExtension(opts = {}) {
-  const headed = opts.headed !== false;
+  const headed = wantHeaded(opts);
   const userDataDir = opts.reuseUserDataDir || mkdtempSync(join(tmpdir(), 'bo-e2e-'));
   if (!opts.reuseUserDataDir) userDataDirs.push(userDataDir);
 

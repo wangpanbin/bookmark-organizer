@@ -135,6 +135,10 @@
         勾选一个文件夹时，它里面的书签会在这一刻展开成一张快照，之后文件夹变不变都不影响这张清单。
         移不动的条目（移动设备书签、已锁定、浏览器内部页）会灰掉并写明原因。
       </p>
+      <p class="hint hint-flow">
+        <b>完整流程：</b>选择书签 → 加入清单 → <b>预览选中</b> → 自动切到「计划明细」页，
+        核对无误后点那里的 <b>「执行整理」</b>。真正动书签的只有最后那一步，而它一直在上面那一排按钮里。
+      </p>
       <div class="panel-actions">
         <button class="primary" id="btnScopePreview" type="button">预览选中</button>
         <button class="ghost" id="btnScopePick" type="button">选择书签</button>
@@ -152,6 +156,19 @@
       <span class="scope-stat-note" id="scopeNote"></span>
     </div>
 
+    <!-- 预览完成后的「去执行」入口。
+         ⚠️ 为什么需要它：「执行整理」只存在于 hero 区，而 hero **只在「计划明细」页 sticky**，
+            在本页会随页面滚走。于是用户在「手动整理」勾完、预览完，
+            这一页却找不到任何通往执行的入口。
+            症状是「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
+         ⚠️ 这里刻意**不**再放一个「执行整理」按钮：同一动作两个入口，
+            早晚会出现「一个能点一个不能点」「一个用的范围是另一个不是」。
+            只给一个跳转：切到计划明细页并滚回顶部，让那唯一的执行按钮露出来。 -->
+    <div class="scope-ready" id="scopeReady" hidden>
+      <span class="scope-ready-text" id="scopeReadyText"></span>
+      <button class="primary" id="btnScopeGoExecute" type="button">去执行整理</button>
+    </div>
+
     <!-- 清单本体 -->
     <div class="scope-body">
       <div class="scope-list-wrap">
@@ -164,8 +181,13 @@
            ⚠️ 刻意用**懒渲染**：只渲染展开的文件夹。
               书签上千条时一次性全铺开会让面板卡住，而这里最忌讳的就是卡住，
               用户会觉得「勾个书签把扩展整死了」。
-              （多行 HTML 注释的续行不要写破折号：ui_contract_gate.py 是逐行判的，
-              续行既不以 <!-- 开头也不含 -->，会被当成正文散文报红。） -->
+           ⚠️⚠️ **注释正文里绝对不能出现注释的结束记号，也不能出现注释的开始记号。**
+              HTML 注释不能嵌套：正文里一旦写出结束记号，注释就在那里被截断，
+              后半句会当成**可见正文**渲染到页面上（用户会看到一串莫名其妙的
+              半句话，还以为是自己操作出了错）。
+              同一个坑的第二层：多行注释的**续行**既不以开始记号开头、也不含结束记号，
+              所以 ui_contract_gate.py 逐行判散文时认不出它是注释。
+              → 写这类元注释时，把两个记号拆开写（下面这行就是这么做的）。 -->
       <div class="scope-picker" id="scopePicker" hidden>
         <div class="scope-picker-head">
           <h2 class="scope-h">选择书签</h2>

@@ -39,7 +39,8 @@ Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked
 | `python tools/archive_sink.py --selftest` | 归档接收器自检：写一条再读回，判据是磁盘上真的多出文件、**且文件名跨进程稳定** |
 | `npm test` | 单元测试（Node 内置 test runner；需 Python 做文件枚举） |
 | `npm run test:falsify` | 产品级证伪：备份源码、打坏补丁、跑整套、断言变红、再还原。⚠️ **不是只读**，不能与任何编辑/测试并发 |
-| `npm run test:e2e` | E2E（需要完整 chromium + 有头模式） |
+| `npm run test:e2e` | E2E（**默认 headless，不弹窗**；需要开窗调试用 `BO_E2E_HEADED=1`，见约束 12） |
+| `npm run test:scope` | 手动指定书签范围的 E2E：两组对照 + 确认弹窗文案 + 失效不按 URL 认领（同样默认 headless） |
 | `npm run test:all` | 全套验证 |
 | `npm run package` | 打包产物 |
 | `npm run gate:privacy` | 隐私闸门：扫所有将推送的 blob，查真 key / 真实书签数据 |
@@ -56,6 +57,7 @@ Chrome MV3 书签整理扩展。业务源码是原生 ES Module，`load unpacked
 `exec python "$(git rev-parse --show-toplevel)/tools/precommit.py"`
 不接线的代价是实测过的：170 条单测与 10 处证伪点从来没被要求跑过，于是「全绿」和「没跑」长得一模一样。
 E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞进每次提交会变成没人愿意等的门。
+（E2E 现在是 headless 的，「要开浏览器」指它仍然是分钟级的真实浏览器流程，不是启动开销。）
 
 本机 `node --test <目录>` 会把目录当模块解析报 `MODULE_NOT_FOUND`，脚本里已改用 glob。
 
@@ -162,6 +164,31 @@ E2E 与证伪**故意不**进钩子——它们要开浏览器、分钟级，塞
    `tests/unit/root-id-literal.test.js` 是为此补的窄判据。
    加新闸门时要记住：**闸门量的是它写的那条路径**，不是问题的全貌。
    判断一个新判据够不够，要问「出问题时它量的是不是同一个指标」。
+
+12. **E2E 默认 headless，不要开窗。**
+
+   `tests/e2e/harness.js` 走 `channel`（系统 Chrome/Edge），
+   `headless: true` 用的是**真实浏览器的新 headless 模式**，扩展照常工作
+   （本机 Edge 154 实测 service worker 正常出现，主干 9/9 + 手动范围 3/3 全绿且不弹窗）。
+
+   ⚠️ 曾经有一阵规则写着「扩展类 E2E 必须有头模式」，理由是
+   `chromium_headless_shell` 不支持加载扩展。**那条限制只对 Playwright 自带的
+   chromium 成立**：自带 chromium 在 `headless: true` 时用的正是 headless_shell，
+   而走 channel 时不是。两条限制被混成一条，于是「必须弹窗」一直没人质疑。
+
+   要肉眼调试用 `BO_E2E_HEADED=1`（或 `launchWithExtension({ headed: true })`），
+   **不要**把默认值改回有头。
+
+   同一处还压着三条环境事实，都不是风格问题而是本机实证的坑：
+   - **Chrome 155 已移除 `--load-extension`**（Edge 154 仍支持）。
+     通道链只对「二进制缺失」回退，其他错误必须立刻抛 ——
+     把真问题降级成「换个浏览器再试」会把排查带偏一整轮。
+   - **扩展路径不能含空格**：浏览器正常启动、扩展根本没加载，
+     只表现为 `waitForEvent('serviceworker')` 超时。极易误判成「扩展坏了」。
+   - **复制扩展时路径必须在进程内稳定**：unpacked 扩展 id 由绝对路径哈希而来，
+     路径一变 id 就变，`chrome.storage.local` 按 id 分区 ——
+     「跑一半关浏览器、同 profile 重开继续跑」会读到**空的 `task:current`**，
+     症状是「执行记录整个消失了」，而真因是一个没人会想到的临时目录名。
 
 > ⚠️ **`npm run test:falsify` 不是只读的。** 它会**修改真实源文件**、跑一遍整套、
 > 再还原。所以它**不能和任何编辑或测试并发** —— 你今天已经因此拿到过一次假失败
