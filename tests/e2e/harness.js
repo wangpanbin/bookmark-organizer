@@ -14,7 +14,7 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, cpSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,33 +23,113 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const EXT_PATH = resolve(HERE, '..', '..');
 
 const userDataDirs = [];
+const tempRoots = [];
+
+/**
+ * 把扩展复制到**无空格**的临时路径。
+ *
+ * ⚠️ 为什么非做不可（本机实测，2026-10-07）：
+ *    `--load-extension=F:\test\Label Management\bookmark-organizer` 里那个空格
+ *    会让 Chrome 解析不了这个参数，表现为**浏览器正常启动、扩展根本没加载**，
+ *    于是 `waitForEvent('serviceworker')` 20 秒超时。
+ *    症状极具误导性：看起来像「扩展起不来」，而真实原因是一个路径空格。
+ *
+ *    探针结论（同机实测，别凭记忆改）：
+ *      · 原路径（含空格）· Chrome  → 无 SW
+ *      · 无空格副本   · Chrome    → 无 SW
+ *      · 无空格副本   · msedge    → ✅ SW 出现
+ *    也就是说**两件事同时成立**：Chrome 155 已移除 `--load-extension`，
+ *    而 Edge 154 仍支持但路径不能带空格。
+ *
+ * ⚠️⚠️ 副本路径必须**在进程内稳定**，绝不能每次 launch 重新 mkdtemp。
+ *    unpacked 扩展的 id 由**绝对路径**哈希而来，路径一变 id 就变，
+ *    而 `chrome.storage.local` 是按扩展 id 分区的 ——
+ *    于是「跑一半关掉浏览器、同 profile 重开继续跑」这条用例会读到空的
+ *    `task:current`，症状是「执行记录整个消失了」，
+ *    而真实原因是一个没人会想到的临时目录名。
+ *    这条就是被它坑出来的：断点续跑用例一次要开三次浏览器。
+ *
+ * 可用 BO_E2E_EXT_PATH 跳过复制（CI 上扩展已在无空格路径时用）。
+ */
+let extCopyCache = null;
+function resolveExtPath() {
+  const forced = process.env.BO_E2E_EXT_PATH;
+  if (forced) return forced;
+  if (!/\s/.test(EXT_PATH)) return EXT_PATH;
+  if (extCopyCache) return extCopyCache;      // ← 进程内稳定，扩展 id 才稳定
+
+  const root = mkdtempSync(join(tmpdir(), 'boext-'));
+  tempRoots.push(root);
+  const dest = join(root, 'ext');
+  cpSync(EXT_PATH, dest, {
+    recursive: true,
+    // vendor 产物是构建出来的、本机才有；node_modules 里也没有 E2E 需要的东西。
+    filter: (p) => !/(^|[\\/])(node_modules|\.git|tests|docs|\.scratch)([\\/]|$)/.test(p),
+  });
+  if (!existsSync(join(dest, 'manifest.json'))) {
+    throw new Error(`扩展副本不完整（缺 manifest.json）：${dest}`);
+  }
+  extCopyCache = dest;
+  return dest;
+}
+
+/**
+ * 这个通道的浏览器在吗？
+ * ⚠️ 只对「二进制不存在」这一类错回退；其他错误立刻抛 ——
+ *    把真问题（例如扩展加载失败）当成「换个浏览器再试试」，
+ *    是那种能把排查带偏一整轮的降级。
+ */
+function isMissingBinary(err) {
+  const msg = String((err && err.message) || '');
+  return /Executable doesn't exist|please run the following command to download/i.test(msg);
+}
 
 /**
  * 启动带扩展的浏览器上下文。
- * @param {{headed?: boolean, reuseUserDataDir?: string}} [opts]
+ * @param {{headed?: boolean, reuseUserDataDir?: string, channel?: string}} [opts]
  */
 export async function launchWithExtension(opts = {}) {
   const headed = opts.headed !== false;
   const userDataDir = opts.reuseUserDataDir || mkdtempSync(join(tmpdir(), 'bo-e2e-'));
   if (!opts.reuseUserDataDir) userDataDirs.push(userDataDir);
 
-  const ctx = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chromium',
-    headless: !headed,
-    args: [
-      `--disable-extensions-except=${EXT_PATH}`,
-      `--load-extension=${EXT_PATH}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-    ],
-  });
+  const ext = resolveExtPath();
+  const args = [
+    `--disable-extensions-except=${ext}`,
+    `--load-extension=${ext}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
 
-  // service worker 是扩展的「活着」信号：拿不到它 = 扩展没起来
+  const want = opts.channel || process.env.BO_E2E_CHANNEL || 'msedge';
+  const chain = [want, ...['msedge', 'chrome', 'chromium'].filter((c) => c !== want)];
+
+  let ctx = null;
+  let used = null;
+  const tried = [];
+  for (const channel of chain) {
+    try {
+      ctx = await chromium.launchPersistentContext(userDataDir, { channel, headless: !headed, args });
+      used = channel;
+      break;
+    } catch (e) {
+      tried.push(`${channel}: ${isMissingBinary(e) ? '二进制缺失' : String(e.message).slice(0, 100)}`);
+      if (!isMissingBinary(e)) break;
+    }
+  }
+  if (!ctx) {
+    throw new Error(`没有可用的浏览器通道：\n  ${tried.join('\n  ')}\n可设 BO_E2E_CHANNEL 指定。`);
+  }
+  if (used !== want) console.warn(`[harness] 期望 channel="${want}"，实际用了 "${used}"`);
+
+  // service worker 是扩展的「活着」信号：拿不到它 = 扩展没起来。
+  // ⚠️ 别把这个超时当成「扩展坏了」——本机实测它也可能是路径含空格，
+  //    或 Chrome 版本已移除该开关。resolveExtPath 与上面的通道链就是为此存在的。
   let [sw] = ctx.serviceWorkers();
   if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 });
   const extensionId = new URL(sw.url()).host;
 
-  return { ctx, sw, extensionId, userDataDir };
+  return { ctx, sw, extensionId, userDataDir, channel: used, extPath: ext };
 }
 
 /** 打开主面板 */
@@ -324,10 +404,15 @@ export async function waitForReportStatus(page, expected, timeout = 60000) {
 }
 
 
-/** 清理临时 profile */
+/** 清理临时 profile 与扩展副本 */
 export function cleanupAll() {
   for (const d of userDataDirs) {
     try { rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
   userDataDirs.length = 0;
+  for (const r of tempRoots) {
+    try { rmSync(r, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+  tempRoots.length = 0;
+  extCopyCache = null;
 }
