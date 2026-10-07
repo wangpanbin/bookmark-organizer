@@ -25,9 +25,24 @@
  * 而不是探测的那一刻 —— 用户标重要页通常就是因为现在还来得及存。
  *
  * 代价是每条多一次 GET。对一个「防链接腐烂」的功能来说这笔账是划算的。
+ *
+ * ═══ ⚠️ 为什么进度是「增量 + 游标守卫」写回，而不是整份覆盖 ═══
+ * 早先这里是 `let run = await getArchiveRun()` …（跨过整段网络）… `set(K.ARCHIVE_STATE, run)`。
+ * 那是 AGENTS.md 第 2 条明令禁止的读-改-写，而且**中间隔着几十秒的网络**，
+ * 窗口大到不是理论风险：
+ *   · 用户在这期间点「从头再归档一遍」（`resetArchiveRun` 置 null）
+ *     → 这一片结束时把已清空的状态**原样写回**，用户的重置被静默撤销；
+ *   · 两个面板页 / 双击按钮让两个调用读到同一个 cursor=0
+ *     → 各自 `cursor += 20` 后整份覆盖，游标从 0 跳到 20，
+ *       中间那 20 条**永久跳过**，面板显示「扫完了」而它们从没被归档。
+ * 所以现在：网络在临界区**之外**跑完，结果压成一份 `delta`，
+ * 进 `mutate` 时基于**当前**值累加，并带一道游标守卫
+ * （`base.cursor !== startCursor` → SKIP，不写）。
+ * 守卫挡的是「重复推进」：宁可这一片不计数、下一片重发一次
+ * （归档文件名按 URL 稳定哈希，重发是覆盖不是重复），也不丢条目。
  */
 
-import { get, set, K } from '../storage.js';
+import { get, set, mutate, SKIP, K } from '../storage.js';
 import { probeMany } from '../scan/probe.js';
 import { archiveMany, probeSink } from './client.js';
 import { importantUrlSet } from './important.js';
@@ -107,7 +122,9 @@ export async function archiveSlice(opts = {}) {
   }
 
   const size = Number.isFinite(opts.slice) ? Math.max(1, opts.slice) : ARCHIVE_SLICE;
-  const batch = queue.slice(run.cursor, run.cursor + size);
+  // ⚠️ 钉住起点：它后面是写回时的游标守卫条件（「我还基于这个位置在算」）
+  const startCursor = run.cursor;
+  const batch = queue.slice(startCursor, startCursor + size);
 
   // 重抓正文。`wantSoft404:false` —— 这里不判软 404，省一次全量正则
   const timeoutMs = Number.isFinite(settings.linkScanTimeoutMs) ? settings.linkScanTimeoutMs : 8000;
@@ -122,22 +139,55 @@ export async function archiveSlice(opts = {}) {
     if (r.error || !r.html) continue;
     items.push({ url: p.url, html: r.html, title: (r.meta && r.meta.pageTitle) || '' });
   }
-  run.fetchFailed += batch.length - items.length;
+  // ⚠️ 以下全部只往 delta 上加，**不碰 run**。run 是几十秒前读出来的快照，
+  //    拿它当累加器就等于把读-改-写又搬回临界区外。
+  const delta = { done: 0, fetchFailed: batch.length - items.length, postFailed: 0, skipped: 0, rendered: 0 };
 
   // G4 的分级在这一行生效：被标星的才带 important，接收器才去渲染
   const importantSet = await importantUrlSet();
   const res = await archiveMany(items, { importantSet });
   for (const r of res) {
-    if (r.ok) run.done += 1;
-    else if (r.skipped) run.skipped += 1;
-    else run.postFailed += 1;
-    if (r.rendered && r.rendered.ok) run.rendered += 1;
+    if (r.ok) delta.done += 1;
+    else if (r.skipped) delta.skipped += 1;
+    else delta.postFailed += 1;
+    if (r.rendered && r.rendered.ok) delta.rendered += 1;
   }
 
-  run.cursor += batch.length;
-  run.total = queue.length;
-  run.updatedAt = Date.now();
-  await set(K.ARCHIVE_STATE, run);
+  // 增量写回 + 游标守卫。理由见文件顶部那一节。
+  let superseded = false;
+  const next = await mutate(K.ARCHIVE_STATE, (cur) => {
+    const base = cur && Number.isFinite(cur.cursor) ? cur : emptyRun(queue.length);
+    if (base.cursor !== startCursor) {
+      superseded = true;
+      return SKIP;
+    }
+    return {
+      ...base,
+      cursor: startCursor + batch.length,
+      total: queue.length,
+      done: base.done + delta.done,
+      fetchFailed: base.fetchFailed + delta.fetchFailed,
+      postFailed: base.postFailed + delta.postFailed,
+      skipped: base.skipped + delta.skipped,
+      rendered: base.rendered + delta.rendered,
+      // 空跑一轮（队列非空但没有一条能重抓）也要有个 startedAt，
+      // 否则面板上的「开始于」是 0
+      startedAt: base.startedAt || Date.now(),
+      updatedAt: Date.now(),
+    };
+  }, null);
 
-  return { ...summarize(run), reason: null, finished: run.cursor >= run.total };
+  if (superseded) {
+    // 有人推进过了。**如实报当前真实进度**，不把这片的计数叠上去
+    // —— 叠上去就是重复计数，而重复计数比少计数更难被发现。
+    const real = await getArchiveRun();
+    return {
+      ...summarize(real),
+      reason: '另一个归档循环已推进了进度；本批正文已落盘（文件名按 URL 稳定哈希，重发是覆盖不是重复），但未计入进度',
+      finished: !!real && real.cursor >= queue.length,
+      superseded: true,
+    };
+  }
+
+  return { ...summarize(next), reason: null, finished: next.cursor >= next.total, superseded: false };
 }

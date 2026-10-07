@@ -116,12 +116,19 @@ export async function onAlarm() {
  * @returns {Promise<Array<{id:string, url:string}>>}
  */
 export async function collectTargets() {
-  const { getFlatTree } = await import('../tree.js');
+  // ⚠️ 这里是 readFlatTree，不是 getFlatTree。
+  //    tree.js 从来没导出过 getFlatTree，早先写成那样会解构出 undefined，
+  //    `await undefined()` 抛 TypeError 被下面的 catch 吞掉并 return []，
+  //    于是「没有可探测的书签」成了这条链路的**永久**返回值：
+  //    linkStart、onAlarm、semanticRun 全部静默空转，且不报任何错。
+  //    tests/unit/scan-logic.test.js 的「不引用不存在的导出」是钉这条的。
+  const { readFlatTree } = await import('../tree.js');
   const { isExcludedUrl, parseUrl } = await import('../normalize.js');
   let flat = [];
   try {
-    flat = (await getFlatTree()) || [];
-  } catch {
+    flat = (await readFlatTree()) || [];
+  } catch (e) {
+    console.warn('[link-scan] 读取书签树失败', e);
     return [];
   }
   const out = [];
