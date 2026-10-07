@@ -12,6 +12,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 import {
   DEAD_MIN_STREAK, DEAD_MIN_SPAN_MS, isGoneStatus, shouldMarkDead, advanceFailState,
@@ -299,4 +304,63 @@ test('providersOf 去重且排序', () => {
   assert.deepEqual(providersOf([{ provider: 'github' }, { provider: null }, { provider: 'arxiv' }, { provider: 'github' }]),
     ['arxiv', 'github']);
   assert.deepEqual(providersOf([]), []);
+});
+
+// ───────────── 「引用了不存在的导出」这道闸门 ─────────────
+
+/**
+ * tree.js 真实导出的名字。
+ * ⚠️ 这不是精确解析，但对 tree.js 这个纯 ESM 文件足够：
+ *    它没有 re-export、没有 `export default`、没有 class，
+ *    四种导出写法都是直白的 `export (async) function|const|class Name`。
+ *    解析不出来时下面的 size 断言会先红，而不是悄悄放过。
+ */
+function exportsOfTree() {
+  const src = readFileSync(join(REPO, 'src', 'tree.js'), 'utf8');
+  const names = new Set();
+  for (const m of src.matchAll(/export\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/g)) {
+    names.add(m[1]);
+  }
+  for (const m of src.matchAll(/export\s*\{([^}]*)\}/g)) {
+    for (const part of m[1].split(',')) {
+      const seg = part.trim();
+      if (!seg) continue;
+      const as = seg.split(/\s+as\s+/);
+      names.add((as[1] || as[0]).trim());
+    }
+  }
+  return names;
+}
+
+test('⚠️ 具名导入的名字必须真的被导出（这条曾让两条功能静默失效）', () => {
+  const names = exportsOfTree();
+  assert.ok(names.size >= 5, `tree.js 解析出的导出只有 ${names.size} 个，判据本身可能失效`);
+
+  const files = [];
+  (function walk(dir) {
+    for (const name of readdirSync(dir)) {
+      const abs = join(dir, name);
+      if (statSync(abs).isDirectory()) { walk(abs); continue; }
+      if (name.endsWith('.js')) files.push(abs);
+    }
+  })(join(REPO, 'src'));
+
+  const offenders = [];
+  for (const abs of files) {
+    const rel = relative(REPO, abs).split('\\').join('/');
+    if (rel === 'src/tree.js') continue;
+    const src = readFileSync(abs, 'utf8');
+    for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"](?:\.\.?\/)+(?:[^'"]*\/)?tree\.js['"]/g)) {
+      for (const part of m[1].split(',')) {
+        const seg = part.trim();
+        if (!seg) continue;
+        const name = seg.split(/\s+as\s+/)[0].trim();
+        if (!names.has(name)) offenders.push(`${rel} → ${name}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [],
+    '从 tree.js 导入了它没有导出的名字。'
+    + '解构出来是 undefined，await undefined() 抛的 TypeError 会被 catch 吞掉，'
+    + '症状是「这条功能从来没跑起来过」而全程零报错。');
 });

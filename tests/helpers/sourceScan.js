@@ -322,3 +322,202 @@ export function findNonSemanticTargetRoot(sources) {
 export function readSource(absPath) {
   return readFileSync(absPath, 'utf8');
 }
+
+// ───────────── 根 id 字面量扫描（backup.js 那次事故的回归闸门）─────────────
+
+/** `ROOT_ID` 这个标识符。早先 backup.js 定义过它，现在整个仓库不许再有 */
+const ROOT_ID_IDENT = /\bROOT_ID\b/g;
+
+/** 把 parentId 指到数字字面量上：`{ parentId: '2' }` / `parentId: 2` */
+const PARENT_ID_NUMERIC = /\bparentId\s*[:=]\s*(['"`])(\d)\1/g;
+
+/** 路径退化成一个数字数组：`|| ['2']` —— 经典的「根 id 当根名用」 */
+const PATH_FALLBACK_NUMERIC = /\|\|\s*\[\s*(['"`])[123]\1\s*\]/g;
+
+/**
+ * 找出所有把根 id 当成常量写死的地方。
+ *
+ * ═══ 为什么这道闸门独立于 findNonSemanticTargetRoot ═══
+ * 后者只盯 `targetRoot` 这一个设置项，而 backup.js 那次根本不是从设置来的：
+ * 它自己定义了 `ROOT_ID = { BAR:'1', OTHER:'2', MOBILE:'3' }`，
+ * 注释还言之凿凿说「根 id 是固定契约，只有标题随语言变」。
+ * 于是 findNonSemanticTargetRoot 全绿，2026-10-05 的 45 条照样全军覆没 ——
+ * 这道闸门当时量的是一个**没有覆盖到出问题的那条路径**的指标。
+ *
+ * 判定口径刻意很窄，只抓三种「拿数字当根 id」的具体写法：
+ *   ① `ROOT_ID` 这个标识符
+ *   ② `parentId: '1'|'2'|'3'`
+ *   ③ `|| ['1']` / `|| ['2']` 这种把路径退化成根 id 数组的写法
+ *
+ * ⚠️ 刻意**不**抓 `v === '1'` 这种比较：roots.js 的 pickRootKey 里
+ *    有一段刻意的迁移映射（旧版本存下来的 '1' 翻译成语义键），
+ *    那是**读用户旧设置**，不是**写死一个根 id 给 API 用**。
+ *    把两者混在一起，这道闸门第一次跑就会对正确的代码报红。
+ *
+ * @param {Array<{rel:string, text:string}>} sources
+ * @returns {string[]} 形如 `src/backup.js:31 → parentId: '2'`
+ */
+export function findHardcodedRootIds(sources) {
+  const bad = [];
+  const add = (rel, kind, detail) => bad.push(`${rel} → ${kind} ${detail}`);
+
+  for (const { rel, text } of sources || []) {
+    const src = stripComments(String(text || ''));
+
+    for (const m of src.matchAll(ROOT_ID_IDENT)) {
+      add(rel, 'ROOT_ID 标识符', `第 ${lineOf(src, m.index)} 行`);
+    }
+    for (const m of src.matchAll(PARENT_ID_NUMERIC)) {
+      add(rel, 'parentId 写死成根 id', `'${m[2]}'（第 ${lineOf(src, m.index)} 行）`);
+    }
+    for (const m of src.matchAll(PATH_FALLBACK_NUMERIC)) {
+      add(rel, '路径退化成根 id 数组', `'${m[1]}'（第 ${lineOf(src, m.index)} 行）`);
+    }
+  }
+  return bad;
+}
+
+/** 报行号用：把偏移换算成 1 起的行号 */
+function lineOf(text, index) {
+  let line = 1;
+  for (let i = 0; i < index && i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) line += 1;
+  }
+  return line;
+}
+
+// ───────────────── storage 读-改-写（AGENTS.md 第 2 条） ─────────────────
+
+/**
+ * 去掉注释但**保留每一个换行**，使处理后的行号与原文一一对应。
+ *
+ * ⚠️ 为什么不能直接用 stripComments：它把 `/* … *\/` 整块换成**一个**空格，
+ *    一个跨 10 行的块注释会让后面所有行号前移 ——
+ *    于是「这一行有没有写豁免说明」这种按行查的判据全部错位，
+ *    而且错位不会报错，只会让闸门**因为错误的原因而红或绿**。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function blankCommentsKeepLines(text) {
+  return String(text)
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:/'"])\/\/[^\n]*/g, (m, p1) => p1 + ' '.repeat(Math.max(0, m.length - p1.length)));
+}
+
+/** 键表达式归一：只认「点号链」或「一次调用」，其余（动态拼接等）一律放弃比较 */
+const KEY_EXPR = /^[\w$]+(?:\.[\w$]+)*(?:\((?:[^()]|\([^()]*\))*\))?$/;
+
+function normKey(raw) {
+  const k = String(raw || '').trim().replace(/\s+/g, '');
+  return KEY_EXPR.test(k) ? k : null;
+}
+
+/** 本文件里「包了一层 get 的 async 函数」：函数名 → 它读的键 */
+function collectGetWrappers(text) {
+  const out = new Map();
+  // 近似：函数体取到第一个 `}`。只认**体里没有嵌套花括号**的取读函数
+  // （本项目的 `getXxx()` 全是这个形状），所以一行写完 `=> { return … }`
+  // 与多行写完都能认出来。
+  // 认不出的只是漏检（不误报），所以这个近似是安全的方向 ——
+  // 但漏检也是漏网，**每加一个 `getXxx()` 取读包装都要确认它能被认出来**。
+  for (const m of text.matchAll(/(?:^|\n)\s*(?:export\s+)?async\s+function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{([^{}]*)/g)) {
+    const g = m[2].match(/await\s+get\s*\(\s*([^,)]+)/);
+    const key = normKey(g && g[1]);
+    if (key) out.set(m[1], key);
+  }
+  return out;
+}
+
+/**
+ * 解构赋值里「哪个变量对应哪个键」。
+ *
+ * ⚠️ `getMany([K.A, K.B])` 的对应关系是**按位置**的，不是按名字 ——
+ *    早先的判据用「一个正则抓第一个实参」，于是 `getMany([K.A, K.B])`
+ *    只记下 `[K.A` 这个非法键表达式、整条读被放弃，解构形状 100% 漏检。
+ *    漏检和恒真在后果上是一回事：闸门看起来在，其实在这一整类上是空的。
+ */
+function collectDestructured(text) {
+  const out = [];
+  for (const m of text.matchAll(/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:await\s+)?get(?:Many)?\s*\(\s*([\s\S]*?)\)\s*;/g)) {
+    const names = m[1]
+      .split(',')
+      .map((part) => part.split(':').pop().trim().replace(/^\.\.\./, ''))
+      .filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
+    if (!names.length) continue;
+    const arg = m[2].trim();
+    if (arg.startsWith('[')) {
+      // 按位置配对。数量对不上就整体放弃（不猜）
+      const keys = arg.slice(1, arg.lastIndexOf(']')).split(',').map(normKey);
+      if (keys.length !== names.length || keys.some((k) => !k)) continue;
+      names.forEach((n, i) => out.push([n, keys[i]]));
+    } else {
+      const key = normKey(arg);
+      if (key) for (const n of names) out.push([n, key]);
+    }
+  }
+  return out;
+}
+
+/**
+ * 找出「读进一个变量、又把这个变量原样 set 回去」的读-改-写（AGENTS.md 第 2 条）。
+ *
+ * ═══ 判据为什么长这样 ═══
+ * 违规的**签名**不是「用了 set」，而是「同一个键：先 get 进变量，改，再 set 回同一个变量」。
+ * 只禁 `set` 会把整份写入（`set(K.LINK_STATE, {...})`，新建一轮状态）一起误杀，
+ * 而那正是绝大多数正当写入。禁得越宽，闸门越快被学会忽略。
+ *
+ * 三种「读」都算，因为真实代码三种都出现过：
+ *   ① `const x = await get(K.A)`               直接调 storage.js 的包装
+ *   ② `const { a } = await getMany([...])`     解构
+ *   ③ `const s = await getLinkState()`          **包了一层**（本项目的实际写法）
+ * 漏掉 ③ 就等于放过本次三个真实违规里的两个 —— 判据必须对准真实形状。
+ *
+ * ═══ 逃生舱 ═══
+ * 同一行（或前两行）写 `storage-rmw-ok: <理由>` 可放行，理由不能为空。
+ * 「需要豁免」本身就是一次 consciously 的确认，这正是想要的摩擦。
+ * 标记从**原文**读（注释剥离会把它抹掉），所以行号必须保真 → 用 blankCommentsKeepLines。
+ *
+ * @param {string} sourceText 原始源码（不用预先去注释）
+ * @returns {string[]} 形如 `第 42 行 set(K.LINK_STATE, state) —— 变量 state 来自 await getLinkState()`
+ */
+export function findStorageRmw(sourceText) {
+  const raw = String(sourceText);
+  const text = blankCommentsKeepLines(raw);
+  const rawLines = raw.split('\n');
+  const lineOf = (index) => raw.slice(0, index).split('\n').length - 1;
+
+  /** @type {Map<string, string>} 变量名 → 它是从哪个键读出来的 */
+  const fromGet = new Map();
+
+  // ① 直接 get
+  for (const m of text.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?get\s*\(\s*([^,)]+)/g)) {
+    const key = normKey(m[2]);
+    if (key) fromGet.set(m[1], key);
+  }
+  // ② 解构 get / getMany（按位置配对，见 collectDestructured）
+  for (const [name, key] of collectDestructured(text)) fromGet.set(name, key);
+  // ③ 包了一层 get 的本地 async 函数
+  for (const [fn, key] of collectGetWrappers(text)) {
+    const re = new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*await\\s+${fn}\\s*\\(`, 'g');
+    for (const m of text.matchAll(re)) fromGet.set(m[1], key);
+  }
+
+  const bad = [];
+  // 写入。`(?<![\w.$])` 排除 `store.set(` / `area().set(` 这类原生调用
+  for (const m of text.matchAll(/(?<![\w.$])(?:await\s+)?\bset\s*\(\s*([^,]+),\s*([A-Za-z_$][\w$]*)\s*\)/g)) {
+    const key = normKey(m[1]);
+    const name = m[2];
+    if (!key || !fromGet.has(name)) continue;
+    if (fromGet.get(name) !== key) continue;
+
+    const at = m.index ?? 0;
+    const line = lineOf(at);
+    const window = rawLines.slice(Math.max(0, line - 2), line + 1).join('\n');
+    const excuse = window.match(/storage-rmw-ok\s*[:：]\s*(\S[^\n]*)/);
+    if (excuse && excuse[1].trim()) continue;
+
+    bad.push(`第 ${line + 1} 行 set(${m[1].trim()}, ${name}) —— ${name} 来自对这个键的 get`);
+  }
+  return bad;
+}

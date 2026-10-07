@@ -22,10 +22,19 @@ import { findDuplicates } from '../../src/dedupe.js';
 import { buildPlan, setRules } from '../../src/plan.js';
 import { DEFAULT_TAXONOMY } from '../../src/classify/taxonomy.js';
 import { SAMPLE_BOOKMARKS, HIT_RATE_THRESHOLD } from '../fixtures/samples.js';
-import { findForbiddenImports, extractImports, FORBIDDEN_IN_PURE_CHAIN, PURE_CHAIN_MODULES, usesChromeApi, findForbiddenRuntime, FORBIDDEN_RUNTIME_NAMES, readSource, stripComments } from '../helpers/sourceScan.js';
+import { findForbiddenImports, extractImports, FORBIDDEN_IN_PURE_CHAIN, PURE_CHAIN_MODULES, usesChromeApi, findForbiddenRuntime, FORBIDDEN_RUNTIME_NAMES, readSource, stripComments, findStorageRmw } from '../helpers/sourceScan.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = join(HERE, '..', '..', 'src');
+
+/** 递归列出 src/ 下的业务 .js（排除 vendor 产物）。清单是活的：新增文件自动纳入。 */
+function walkJs(dir) {
+  return readdirSync(dir).flatMap((name) => {
+    const abs = join(dir, name);
+    if (statSync(abs).isDirectory()) return walkJs(abs);
+    return /\.(js|mjs)$/.test(name) && !name.includes('vendor') ? [abs] : [];
+  });
+}
 
 // ───────────────── 1. 命中率闸门能红吗 ─────────────────
 
@@ -388,14 +397,8 @@ test('证伪：读设置项的 `!== false` 只能用在 DEFAULT_SETTINGS 里真�
   //    这正是想要的摩擦：多写一个名字，就多一次「它真的是选项吗」的确认。
   const OPTION_NAMES = new Set(['useJsonMode', 'wantSoft404', 'wantBody', 'important']);
 
-  const walk = (dir) => readdirSync(dir).flatMap((name) => {
-    const abs = join(dir, name);
-    if (statSync(abs).isDirectory()) return walk(abs);
-    return /\.(js|mjs)$/.test(name) && !name.includes('vendor') ? [abs] : [];
-  });
-
   const offenders = [];
-  for (const abs of walk(SRC_DIR)) {
+  for (const abs of walkJs(SRC_DIR)) {
     const text = stripComments(readFileSync(abs, 'utf8'));
     // 抓 `X.Y !== false` —— 任何接收者都行，因为我们真正判断的是
     // 「Y 是不是一个已登记的设置项」
@@ -523,4 +526,175 @@ test('证伪：规则引擎在无规则时必须返回 null（而不是瞎猜一
   const r = matchRule({ url: 'https://github.com/a', title: 'GitHub 教程' }, empty);
   assert.equal(r, null, '无规则却给出了分类 —— 那这条路径根本不在测量「规则是否命中」');
   assert.equal(dedupeKey('https://a.com/x'), dedupeKey('https://a.com/x'));
+});
+
+// ───────────── 7. storage 读-改-写闸门（AGENTS.md 第 2 条）能红吗 ─────────────
+//
+// 前科（2026-10-06 handoff §5 记为 S3）：三处把「读 → 改 → 写」摊在临界区外，
+// 最重的一处 `archive/run.js` 的读与写之间隔着**整段正文重抓的网络**。
+// 症状不是报错而是静默丢数据：两个调用各推一次游标 → 中间那批永久跳过 →
+// 面板显示「扫完了」而它们从没被归档。
+//
+// ⚠️ 这道闸门的「该红」一侧是容易糊弄过去的（坏代码确实更坏），
+//    真正要考的是下面的「该绿」：**整份写入是绝大多数正当写法**，
+//    判据一旦把它们一起杀掉，闸门就只剩让人学会忽略它这一个作用。
+
+test('证伪：闸门能抓住三种真实形状的读-改-写（直接 get / 解构 / 包了一层）', () => {
+  // ① 直接调 storage.js 的包装
+  const direct = `
+    const q = await get(K.LINK_QUEUE, {});
+    q['https://a'] = { url: 'https://a' };
+    await set(K.LINK_QUEUE, q);
+  `;
+  // ② 解构
+  const destructured = `
+    const { a, b } = await getMany([K.A, K.B]);
+    a.n += 1;
+    await set(K.A, a);
+  `;
+  // ③ ⭐ 包了一层 —— 本项目的实际写法。
+  //    早先的判据只认 ①②，于是 3 处真实违规里的 2 处（scan/runner.js 的
+  //    `await getLinkState()`、archive/run.js 的 `await getArchiveRun()`）全部漏检。
+  //    判据必须对准真实形状，而不是对准自己写样本时的形状。
+  //
+  //    ⚠️ 形状 ③ 要求取读包装的**定义与调用同文件**（判据在文件内解析 `async function`）。
+  //    本项目成立：getLinkState / getArchiveRun / getSuggestions 全是模块内的。
+  //    哪天开始从别的模块 import 一个 get 包装，这道闸门会对那一处**失效** ——
+  //    下面那条测试把这个限制写成断言，好过让它悄悄变成一片看不见的网。
+  const wrapped = `
+    export async function getArchiveRun() {
+      return (await get(K.ARCHIVE_STATE)) || null;
+    }
+    export async function archiveSlice() {
+      let run = await getArchiveRun();
+      run.done += 1;
+      await set(K.ARCHIVE_STATE, run);
+    }
+  `;
+  // 同一形状，一行写完的包装也必须认出来
+  const wrappedOneLiner = `
+    export async function getLinkState() { return (await get(K.LINK_STATE)) || emptyState(); }
+    export async function runSlice() {
+      let state = await getLinkState();
+      state.cursor += 1;
+      await set(K.LINK_STATE, state);
+    }
+  `;
+  for (const [label, src] of [['直接 get', direct], ['解构', destructured], ['包了一层', wrapped], ['包了一层（单行）', wrappedOneLiner]]) {
+    const hits = findStorageRmw(src);
+    assert.equal(hits.length, 1, `${label} 这个形状没被抓到 —— 闸门对准的是自己写的样本，不是真实代码`);
+  }
+});
+
+test('证伪：形状 ③ 的覆盖范围是「取读包装与调用同文件」（限制要写在脸上，不是默默留着）', () => {
+  // 取读包装从别的模块 import 过来时，判据在文件内解析不到定义 → 漏检。
+  // 这是**已知的**覆盖边界，不是 bug。写成断言是为了：哪天有人给包装加了
+  // `storage-rmw-ok` 豁免、或换了取读方式时，这里会提醒他边界还在。
+  const imported = `
+    import { getArchiveRun } from './state.js';
+    export async function archiveSlice() {
+      let run = await getArchiveRun();
+      run.done += 1;
+      await set(K.ARCHIVE_STATE, run);
+    }
+  `;
+  assert.deepEqual(findStorageRmw(imported), [],
+    '判据现在能跨文件解析取读包装了 —— 那就把这条限制注释放掉，别让它过期');
+});
+
+test('证伪：正当写法不得被误报（整份写入是绝大多数情况）', () => {
+  // 「该绿」这一侧才是判据的真正考验。下面每一条都是**闸门会红就说明判据写宽了**的正当代码。
+  const MUST_NOT_RED = [
+    ['整份写入一个新建对象', `
+      await set(K.LINK_STATE, { ...emptyState(), status: 'running', round: 3 });
+    `],
+    ['整份写入一个函数调用的结果', `
+      await set(K.LINK_STATE, emptyState());
+    `],
+    ['写另一个键 —— 不是同一个键的读-改-写', `
+      const raw = await get(K.AI_CREDENTIALS, {});
+      await set(K.SETTINGS, raw);
+    `],
+    ['setMany 不是单键 set', `
+      const cur = await get(K.TASK_CURRENT, {});
+      await setMany({ [K.TASK_CURRENT]: { ...cur, updatedAt: 1 } });
+    `],
+    ['原生 Map.set 不是 storage.set', `
+      const v = await get(K.SETTINGS, {});
+      v.set('a', 1);
+    `],
+    ['注释里引用旧代码不得被当成活代码', `
+      // 早先是 \`let state = await getLinkState()\` … \`await set(K.LINK_STATE, state)\`
+      /**
+       * 以及块注释里的那一行：await set(K.LINK_QUEUE, q);
+       */
+      const untouched = 1;
+    `],
+    ['mutate 本身不得被当成违规（那正是解药）', `
+      await mutate(K.LINK_QUEUE, (cur) => ({ ...(cur || {}), x: 1 }), {});
+    `],
+  ];
+  for (const [label, src] of MUST_NOT_RED) {
+    const hits = findStorageRmw(src);
+    assert.deepEqual(hits, [], `${label} 被误报了 —— 判据太宽，闸门会因为错误的原因而红：\n  ${hits.join('\n  ')}`);
+  }
+});
+
+test('证伪：豁免标记必须带非空理由，空理由等于没写', () => {
+  const withReason = `
+    const q = await get(K.LINK_QUEUE, {});
+    await set(K.LINK_QUEUE, q); // storage-rmw-ok: 键由调用方保证独占
+  `;
+  assert.deepEqual(findStorageRmw(withReason), [], '带理由的豁免没被认出来');
+
+  // ⚠️ 光写标记不写理由 = 没写。没有这一条，豁免会退化成「加个注释就能关掉闸门」
+  for (const src of [
+    `const q = await get(K.LINK_QUEUE, {});\nawait set(K.LINK_QUEUE, q); // storage-rmw-ok:`,
+    `const q = await get(K.LINK_QUEUE, {});\nawait set(K.LINK_QUEUE, q); // storage-rmw-ok: `,
+  ]) {
+    assert.equal(findStorageRmw(src).length, 1, '空理由的豁免被放行了 —— 那不是豁免，是静默关闸门');
+  }
+});
+
+test('证伪：真实的 src/ 不得有读-改-写漏在临界区外', () => {
+  // 最终判据：对磁盘上 src/ 的**每一个**文件跑一遍。清单是活的（新增文件自动纳入）。
+  const offenders = [];
+  for (const abs of walkJs(SRC)) {
+    const hits = findStorageRmw(readFileSync(abs, 'utf8'));
+    if (hits.length) offenders.push(`${abs.slice(SRC.length + 1)}: ${hits.join('；')}`);
+  }
+  assert.deepEqual(offenders, [],
+    `这些地方把「读 → 改 → 写」摊在 mutate 的临界区之外（AGENTS.md 第 2 条）：\n  ${offenders.join('\n  ')}\n`
+    + '改法：网络放在临界区**之外**跑完，结果压成一份 delta，进 mutate 时基于当前值累加；'
+    + '确实需要豁免就写 `storage-rmw-ok: <理由>`，理由不能为空。');
+});
+
+test('证伪：这道闸门本身不是恒真的（它确实会红，且红在真实代码上）', () => {
+  // 一道从来没红过的闸门等于没有闸门。这里直接拿本仓库**修复前**的真实形状验证：
+  // 三处违规的原文缩影，与 git 里的 a44e358 版本逐行对应。
+  const BEFORE_FIX = `
+    export async function getArchiveRun() { return (await get(K.ARCHIVE_STATE)) || null; }
+    export async function archiveSlice() {
+      let run = await getArchiveRun();
+      if (!run) run = emptyRun(0);
+      run.done += 1;
+      run.cursor += 20;
+      await set(K.ARCHIVE_STATE, run);
+    }
+  `;
+  const hits = findStorageRmw(BEFORE_FIX);
+  assert.equal(hits.length, 1, '修复前的真实形状竟然没被抓到 —— 这道闸门是恒真的');
+  assert.match(hits[0], /ARCHIVE_STATE/, '抓到的不是那一处');
+
+  // 修复后的形状必须转绿，否则说明判据只认「坏的样子」而不认「对的样子」
+  const AFTER_FIX = `
+    export async function getArchiveRun() { return (await get(K.ARCHIVE_STATE)) || null; }
+    export async function archiveSlice() {
+      let run = await getArchiveRun();
+      const delta = { done: 1 };
+      const next = await mutate(K.ARCHIVE_STATE, (cur) => ({ ...cur, done: cur.done + delta.done }));
+      return next;
+    }
+  `;
+  assert.deepEqual(findStorageRmw(AFTER_FIX), [], '正确的 mutate 写法被误报了');
 });
