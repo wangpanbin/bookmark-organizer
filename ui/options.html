@@ -104,6 +104,8 @@
         <div class="panel-actions plan-filters">
           <label class="chk"><input type="checkbox" id="onlyChanged"> 只看将要移动的</label>
           <label class="chk"><input type="checkbox" id="onlyLow"> 只看低置信</label>
+          <label class="chk"><input type="checkbox" id="onlyUnclassified"> 只看未归类</label>
+          <span class="plan-filter-note" id="unclassifiedNote"></span>
         </div>
     <div class="table-wrap">
       <!-- 骨架屏是表格的兄弟节点，不在 #planBody 里。
@@ -147,21 +149,25 @@
     <div class="scope-stats" id="scopeStats">
       <span class="scope-stat" data-k="pending">待整理 <b id="scopePending">0</b></span>
       <span class="scope-stat" data-k="done">已整理 <b id="scopeDone">0</b></span>
+      <span class="scope-stat" data-k="in-place">已在原位 <b id="scopeInPlace">0</b></span>
+      <span class="scope-stat" data-k="unclassified">未归类 <b id="scopeUnclassified">0</b></span>
       <span class="scope-stat" data-k="failed">失败 <b id="scopeFailed">0</b></span>
       <span class="scope-stat" data-k="stale">已失效 <b id="scopeStale">0</b></span>
+      <span class="scope-stat" data-k="blocked">无法处理 <b id="scopeBlocked">0</b></span>
       <span class="scope-stat-note" id="scopeNote"></span>
     </div>
 
-    <!-- 预览完成后的「去执行」入口。
-         ⚠️ 为什么需要它：「执行整理」只存在于「计划明细」页，而本页是「手动整理」。
-            用户勾完、预览完却找不到任何通往执行的入口，症状是
-            「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
-         ⚠️ 这里刻意**不**再放一个「执行整理」按钮：同一动作两个入口，
-            早晚会出现「一个能点一个不能点」「一个用的范围是另一个不是」。
-            只给一个跳转：切到计划明细页并滚回顶部，让那唯一的执行按钮露出来。 -->
-    <div class="scope-ready" id="scopeReady" hidden>
-      <span class="scope-ready-text" id="scopeReadyText"></span>
-      <button class="primary" id="btnScopeGoExecute" type="button">去执行整理</button>
+    <!-- ⚠️ 执行闸门（D6）。
+         「N 条没能归类」不是提醒，是**阻断**：存在它们时「执行整理」是禁用的，
+         用户必须逐条改判、或显式点「就放待归类」。
+         理由：静默塞进「其他/待归类」的执行结果，就是用户当初报的
+         「我手工标记的会被过滤掉」，换个说法而已。
+         「一键重试」走的是 strict 提示词（强制每条都选一个最接近的分类），
+         所以它给的结果在行内标成「AI 的猜测」，可改。 -->
+    <div class="scope-gate" id="scopeGate" hidden>
+      <span class="scope-gate-text" id="scopeGateText"></span>
+      <button class="ghost" id="btnScopeRetryUnclassified" type="button">一键重试未归类</button>
+      <button class="ghost" id="btnScopeAcceptAll" type="button">全部放待归类</button>
     </div>
 
     <!-- 清单本体 -->

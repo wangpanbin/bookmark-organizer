@@ -985,8 +985,8 @@ table.grid .hint { display: inline-block; }
 .scope-stat[data-zero="1"] b { color: var(--muted); }
 .scope-stat-note { flex: 1 1 100%; font-size: 12px; }
 
-/* 预览完成后的跳转条 */
-.scope-ready {
+/* 执行闸门条（替代原来的「预览完成后的跳转条」） */
+.scope-gate {
   display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2);
   margin-bottom: var(--sp-3);
   padding: var(--sp-2) var(--sp-3);
@@ -994,7 +994,7 @@ table.grid .hint { display: inline-block; }
   border-radius: var(--radius-sm);
   background: var(--accent-soft);
 }
-.scope-ready-text { color: var(--text); font-size: 13px; flex: 1 1 240px; }
+.scope-gate-text { color: var(--text); font-size: 13px; flex: 1 1 240px; }
 
 .scope-h { font-size: 13px; color: var(--text); margin: 0 0 var(--sp-2); }
 .scope-h-sub { color: var(--muted); font-weight: 400; margin-left: 6px; }
@@ -1041,6 +1041,43 @@ table.grid .hint { display: inline-block; }
   cursor: pointer; font-size: 12px; padding: 2px 4px;
 }
 .scope-item .scope-drop:hover { color: var(--danger); }
+
+/* 每行的「将要归到 XXX」+ 分类下拉。
+   ⚠️ 这两个类名必须真的被 ui/options.js 用到 ——
+      ui_contract_gate.py 的 dead_classes 判据会把「只定义、没引用」的样式判成红，
+      症状是闸门拦住你一个与本次改动毫无关系的名字。 */
+.scope-target {
+  flex: 0 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--muted);
+}
+.scope-target-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-target.is-static { color: var(--muted); }
+/* 「一键重试未归类」的结果是 AI 猜的，必须标出来。 */
+.scope-guess {
+  flex: none; font-size: 11px; padding: 0 6px; border-radius: var(--radius-pill);
+  border: 1px solid var(--warn); color: var(--warn); white-space: nowrap;
+}
+.scope-pick {
+  flex: none; max-width: 200px;
+  font: inherit; font-size: 12px;
+  padding: 2px 6px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.scope-item[data-status="unclassified"] .scope-target-text,
+.scope-item[data-status="pending"] .scope-target-text { color: var(--warn); }
+.scope-item[data-status="done"] .scope-target-text,
+.scope-item[data-status="in-place"] .scope-target-text { color: var(--muted); }
+
+.scope-item[data-status="in-place"] .scope-badge,
+.scope-item[data-status="blocked"] .scope-badge { color: var(--muted); }
+.scope-item[data-status="unclassified"] .scope-badge {
+  color: var(--warn); border-color: var(--warn);
+}
+.scope-item[data-status="in-place"] .scope-name,
+.scope-item[data-status="blocked"] .scope-name { color: var(--muted); }
+
+.plan-filter-note { font-size: 12px; color: var(--warn); }
 
 .scope-picker {
   border: 1px solid var(--border); border-radius: var(--radius-sm);

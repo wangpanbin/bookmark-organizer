@@ -128,24 +128,37 @@ test('⚠️ 两组对照：勾的 2 条被移动，没勾的 4 条 parentId 一
     const planRows = await page.evaluate(() => document.querySelectorAll('#planBody tr').length);
     assert.ok(planRows > 0, '子集预览没有渲染出任何计划行');
 
-    // ⚠️ 切回「手动整理」页，必须仍然有一条通往执行的入口。
-    //    这条是被真实用户报出来的洞：「执行整理」只存在于 hero 区，
-    //    而 hero **只在「计划明细」页 sticky**，在手动整理这一页会随页面滚走。
-    //    于是用户勾完、预览完，本页找不到任何执行入口，
-    //    症状是「勾了半天，没地方执行」，而界面上没有任何一处提示为什么。
+    // ⚠️ 2026-10-07：这一段换了内容。
+    //    原来是「预览完成后必须有一条通往执行的入口」（btnScopeGoExecute 跳转条），
+    //    症状是「勾了半天，没地方执行」。
+    //    现在手动整理页**自己承担预览职责**（每行显示「将要归到 XXX」+ 可改的下拉），
+    //    所以要验的是另一件事：**没归类的条目会把执行拦住**。
+    //    这才是这个功能真正的承诺 —— 用户圈定的每一条都要有交代，
+    //    而静默塞进「其他/待归类」执行掉，正是他当初报的「AI 把它过滤了」。
     await page.click('#tabs button[data-tab="scope"]');
-    await page.waitForSelector('#scopeReady:not([hidden])', { timeout: 10000 });
-    const readyText = await page.textContent('#scopeReadyText');
-    assert.match(readyText, /不会被动/, '跳转条没有说明「清单之外不会被动」这条承诺');
+    await page.waitForFunction(
+      () => document.querySelectorAll('#scopeList .scope-target').length > 0,
+      undefined, { timeout: 10000 },
+    );
 
-    // 点它：应当切到计划明细页并滚回顶部，让 hero 里那个唯一的执行按钮进视野
-    await page.click('#btnScopeGoExecute');
+    // 每行都要有「将要归到 XXX」的结论 —— 不出现就是「什么都没发生」
+    const targets = await page.evaluate(() => Array.from(
+      document.querySelectorAll('#scopeList .scope-item'),
+      (li) => (li.querySelector('.scope-target-text') || {}).textContent || '',
+    ));
+    assert.equal(targets.length, 2, '清单里两条都要有「将要归到…」的结论');
+    for (const t of targets) {
+      assert.ok(t.length > 0, '有一行没有显示将要归到哪里 —— 这就是用户报的「没交代」');
+    }
+
+    // 挪到「计划明细」页执行；hero 里那个「执行整理」在这一页是 sticky 的。
+    await page.click('#tabs button[data-tab="plan"]');
     await page.waitForFunction(
       () => document.querySelector('#tabs button[data-tab="plan"]')?.classList.contains('active'),
       undefined, { timeout: 5000 },
     );
     const execVisible = await page.isVisible('#btnExecute');
-    assert.ok(execVisible, '点了「去执行整理」，但「执行整理」按钮仍不在视野里');
+    assert.ok(execVisible, '「执行整理」按钮不在视野里');
 
     // ── 执行 ──
     await page.click('#btnExecute');   // confirm() 由 harness 自动接受
@@ -178,6 +191,27 @@ test('⚠️ 两组对照：勾的 2 条被移动，没勾的 4 条 parentId 一
     throw e;
   }
 });
+
+/**
+ * 执行前若「未归类闸门」亮着，点「全部放待归类」把它解开。
+ *
+ * ⚠️ 这不是为了绕过闸门去凑测试通过 —— 闸门**本来就该拦住**：
+ *    2026-10-07 之前它判反了方向，把「正要被搬进 待归类」的那批放了过去，
+ *    而把「已经在 待归类 里、没有东西要搬」的拦了下来。
+ *    现在判据是「目标落在兜底桶」，两者都拦。
+ *    所以任何手动整理的执行动作，都必须先显式承认「这些就留在这儿」。
+ */
+async function resolveScopeGate(page) {
+  const shown = await page.evaluate(() => !document.getElementById('scopeGate').hidden);
+  if (!shown) return false;
+  await page.click('#tabs button[data-tab="scope"]');
+  await page.click('#btnScopeAcceptAll');
+  await page.waitForFunction(
+    () => document.getElementById('scopeGate').hidden, undefined, { timeout: 15000 },
+  );
+  await page.click('#tabs button[data-tab="plan"]');
+  return true;
+}
 
 test('⚠️ 确认弹窗必须写明范围与清单外条数（界面不许承诺做不到的事）', async () => {
   const { ctx, extensionId } = await launchWithExtension();
@@ -217,6 +251,8 @@ test('⚠️ 确认弹窗必须写明范围与清单外条数（界面不许承�
       window.__confirmMsg = null;
       window.confirm = (m) => { window.__confirmMsg = String(m); return false; };
     });
+    // 闸门会拦，先显式承认「这些就留在这儿」——这正是它要的行为
+    await resolveScopeGate(page);
     await page.click('#btnExecute');
     await page.waitForFunction(() => window.__confirmMsg !== null, undefined, { timeout: 15000 });
     const text = await page.evaluate(() => window.__confirmMsg);
@@ -283,6 +319,102 @@ test('⚠️ 失效条目标「已失效」且不被按 URL 认回来', async ()
     assert.equal(decoyParentAfter, decoyParentBefore,
       '替身被按 URL 认回去并搬动了 —— 它与被删那条同 URL，但用户从来没勾过它。'
       + '这正是「失效条目不许按 URL 认领」要挡的误伤。');
+
+    await ctx.close();
+  } catch (e) {
+    await ctx.close();
+    throw e;
+  }
+});
+
+/**
+ * ⚠️ 完整性契约（D2 / D6）的端到端闸门。
+ *
+ * 这道测试守的是整个功能真正的承诺：用户圈进清单的每一条，
+ * 执行完都必须有交代，不允许悄悄躺在「其他/待归类」里，
+ * 更不允许「标记了却什么都没发生」。
+ *
+ * 三个必查的点，缺一个整条契约就不成立：
+ *   ① 七档计数能核平：清单 N 条 = 各档之和
+ *   ② 执行前，有「没归类」的条目时按钮是禁用的（且说清为什么）
+ *   ③ 点「全部放待归类」之后闸门解禁，用户确实有一条出路，
+ *      而不是被卡死在「只能一条条手改」
+ */
+test('⚠️ 完整性契约：每条都有交代，且未归类会拦住执行', async () => {
+  const { ctx, extensionId } = await launchWithExtension();
+  try {
+    const page = await openPanel(ctx, extensionId);
+    await seedBookmarks(page, [
+      // 长尾未命中站点：规则判不了，只能交给 AI。没配 key 时它们会停在待归类。
+      { title: '契约组-归类-1', url: 'https://unknown-contract-1.example.org/page' },
+      { title: '契约组-归类-2', url: 'https://unknown-contract-2.example.org/page' },
+    ]);
+
+    await page.click('#tabs button[data-tab="scope"]');
+    await page.click('#btnScopePick');
+    await page.waitForSelector('#scopePicker:not([hidden])');
+    await page.fill('#scopeSearch', '契约组');
+    await page.waitForSelector('[data-scope-check]');
+    const ids = await page.evaluate(() => Array.from(
+      document.querySelectorAll('[data-scope-check]'), (el) => el.dataset.scopeCheck,
+    ));
+    for (const id of ids) await page.check(`[data-scope-check="${id}"]`);
+    await page.click('#btnScopeAddPicked');
+    await page.waitForFunction(
+      () => document.querySelectorAll('#scopeList .scope-item').length === 2,
+      undefined, { timeout: 10000 },
+    );
+
+    await page.click('#btnScopePreview');
+    await page.waitForFunction(
+      () => document.getElementById('planScopeChip')?.dataset.mode === 'scope',
+      undefined, { timeout: 30000 },
+    );
+
+    // ① 七档必须能核平
+    const sums = await page.evaluate(() => {
+      const num = (id) => Number(document.getElementById(id).textContent || 0);
+      const keys = ['scopePending', 'scopeDone', 'scopeInPlace', 'scopeUnclassified',
+        'scopeFailed', 'scopeStale', 'scopeBlocked'];
+      const total = keys.reduce((a, k) => a + num(k), 0);
+      const listed = document.querySelectorAll('#scopeList .scope-item').length;
+      return { total, listed };
+    });
+    assert.equal(sums.total, sums.listed,
+      `七档之和 ${sums.total} ≠ 清单行数 ${sums.listed}，有条目落不进任何一档，就是「没交代」`);
+
+    // ② 未归类会拦住执行
+    //
+    // ⚠️ 判据是**闸门本身**，不是「未归类」那个计数。
+    //    2026-10-07 之前的实现把方向搞反了：它统计的是「已经躺在待归类里、
+    //    没有东西要搬」的条数，于是「正要被搬进待归类」的那批畅通无阻 ——
+    //    而后者恰恰是用户最初报的那件事。
+    //    现在闸门拦的是「目标落在兜底桶」，那一批里
+    //    `status` 仍是 pending（所以 scopeUnclassified 计数为 0），
+    //    用计数当判据就会把「闸门正确拦下」误判成「闸门误报」。
+    const gateShown = await page.evaluate(() => !document.getElementById('scopeGate').hidden);
+    assert.ok(gateShown,
+      '这些条目规则与 AI 都判不出分类，闸门却没有拦 —— 会把它们静默塞进「其他/待归类」');
+    const execDisabled = await page.evaluate(() => document.getElementById('btnExecute').disabled);
+    assert.equal(execDisabled, true,
+      '还有没归类的条目，「执行整理」却是可点的。契约破了，会把它们静默塞进待归类');
+
+    // ③ 必须有一条出路
+    await resolveScopeGate(page);
+    const stillDisabled = await page.evaluate(() => document.getElementById('btnExecute').disabled);
+    assert.equal(stillDisabled, false,
+      '点了「全部放待归类」之后闸门还是没解禁，用户被卡死了，除了逐条手改没有出路');
+
+    // 解禁之后再点回去，闸门不该又亮起来（resolution 必须真的写进了清单）
+    await page.click('#tabs button[data-tab="scope"]');
+    await page.click('#btnScopePreview');
+    await page.waitForFunction(
+      () => document.getElementById('planScopeChip')?.dataset.mode === 'scope',
+      undefined, { timeout: 30000 },
+    );
+    const gateAgain = await page.evaluate(() => !document.getElementById('scopeGate').hidden);
+    assert.equal(gateAgain, false,
+      '重新预览之后闸门又亮了 —— 「全部放待归类」的处置根本没落进清单');
 
     await ctx.close();
   } catch (e) {

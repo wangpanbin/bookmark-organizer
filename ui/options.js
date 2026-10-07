@@ -12,7 +12,7 @@
 import { readFlatTree } from '../src/tree.js';
 import { listRoots, pickRootKey, resolveRoot } from '../src/roots.js';
 import { findDuplicates, toRemovalList, dedupeStats } from '../src/dedupe.js';
-import { buildPlan, setRules, selectForLlm, REASON } from '../src/plan.js';
+import { buildPlan, setRules, selectForLlm, REASON, RESOLUTION_ACCEPT_UNCLASSIFIED } from '../src/plan.js';
 import { DEFAULT_RULES } from '../src/classify/dict.js';
 import {
   getTaxonomy, isKnownPath, fallbackPath, allPaths, pathString, DEFAULT_TAXONOMY,
@@ -38,7 +38,7 @@ import {
 import {
   SCOPE_STATUS, EMPTY_LIST, normalizeList, isEmptyList, runnableIds, annotateSelectable,
   expandFolderSelection, addEntries, removeEntries, clearDone,
-  prepareScope, summarize, applyRunResult,
+  prepareScope, summarize, applyRunResult, derivePlanView, unresolvedIds, isTerminal, reasonLabel,
 } from '../src/scope-list.js';
 
 const MAX_ROWS = 300;
@@ -84,6 +84,22 @@ const state = {
   planScope: { mode: 'all', count: 0 },
   /** 勾选区是否展开 */
   scopePicking: false,
+  /**
+   * 当前计划的「投影」：清单 id → 将要归到哪 / 动不动 / 在不在兜底桶。
+   * 由 scope-list.js 的 derivePlanView 算，本页不自己反推。
+   */
+  scopeView: new Map(),
+  /** 本轮「没归类且你还没接受」的清单条目 id，执行闸门用它禁按钮 */
+  unresolved: [],
+  /**
+   * 经过「一键重试未归类」的条目 id。
+   * 界面上要标「AI 的猜测」—— strict 提示词强制模型必须选一个分类，
+   * 所以这些结果是**猜的**，而 README / 帮助页都承诺会标出来。
+   * 不标的话，用户会把一次猜测当成自己选的分类。
+   */
+  scopeGuessed: new Set(),
+  /** classifyBatch 报「AI 亲口没说这条」的 key 集合；D12 的重试只挑这些 */
+  scopeUndecidedKeys: [],
   /** 搜索词，空串 = 浏览模式 */
   scopeQuery: '',
   /** 展开着的文件夹 id 集合 */
@@ -303,12 +319,21 @@ async function loadAndClassify(opts) {
   }
 
   setRules(DEFAULT_RULES);
+  // 清单里每条「我说了就放待归类」的显式处置。
+  // ⚠️ 刻意**不**并进 manualAssignments 再落 K.MANUAL_ASSIGNMENTS：
+  //    那是全局的、会沉淀下来影响以后的每一次整理，而这份是
+  //    「本次清单内的一次性处置」（D11：手动改判不污染规则库）。
+  const resolution = scopeResolutionMap();
+  // 手动整理里逐条选定的分类覆盖全局手改（同名 key 时后者优先）。
+  // ⚠️ 它只活在 state.scopeManual 这份**内存**映射里，从不落 K.MANUAL_ASSIGNMENTS。
+  const effectiveManual = { ...manual, ...(state.scopeManual || {}) };
   let plan = buildPlan({
     entries: planEntries,
     taxonomy: state.taxonomy,
     learnedRules: learned,
     locks,
-    manualAssignments: manual,
+    manualAssignments: effectiveManual,
+    resolution,
   });
 
   // LLM 兜底：只对规则未命中的那一小撮发请求
@@ -332,14 +357,31 @@ async function loadAndClassify(opts) {
           onProgress: ({ done, total }) => busy(`LLM 兜底分类中… ${done}/${total}`),
         });
         state.llmErrors = res.errors || [];
-        const { valid } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
+        const { valid, dropped } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
+        // ⚠️ dropped 早先算出来就扔了，于是「模型自造了一个类目」
+        //    这件事**完全不可见** —— 条目静默退回兜底桶，用户看到的只是
+        //    「它怎么进了待归类」。现在把它并进错误提示，让拒绝有据可查。
+        if (dropped.length) {
+          state.llmErrors.push(
+            `模型返回了 ${dropped.length} 个类目树里不存在的分类，已丢弃：`
+            + `${dropped.slice(0, 3).join('、')}${dropped.length > 3 ? ' 等' : ''}。`,
+          );
+        }
+                if (res.undecided && res.undecided.length) {
+          // 存 key 本身，不只存个数：「一键重试未归类」要靠它挑出
+          // 「AI 亲口没说这条」的那一批（D12），而请求失败的那些不在里面。
+          // 只存个数的话，那道门就退化成「把所有未归类都重发一遍」，
+          // 文档里那句「只重发 AI 说不知道的」就成了空话。
+          state.scopeUndecidedKeys = res.undecided.slice();
+        }
         plan = buildPlan({
           entries: planEntries,
           taxonomy: state.taxonomy,
           learnedRules: learned,
           locks,
-          manualAssignments: manual,
+          manualAssignments: effectiveManual,
           llmAssignments: valid,
+          resolution,
         });
       }
     } catch (e) {
@@ -347,6 +389,11 @@ async function loadAndClassify(opts) {
       state.llmErrors = [`LLM 兜底异常，已降级为纯规则分类：${e && e.message ? e.message : e}`];
     }
   }
+
+  // 清单投影：每行「将要归到 XXX」与执行闸门都走这一份。
+  // ⚠️ 必须在两遍 buildPlan 都跑完之后算 —— 中间那份计划还没带上
+  //    LLM 的判，用它投影出来的「将要归到」是兜底桶，与真正要搬的去向不符。
+  state.scopeView = derivePlanView(plan.items, pathString(fallbackPath(state.taxonomy)));
 
   // 去重
   state.groups = settings.dedupeEnabled ? findDuplicates(state.entries) : [];
@@ -481,13 +528,19 @@ async function render() {
 function renderStats() {
   const urls = state.entries.filter((e) => e.type === 'url');
   const plan = state.plan;
+  // ⚠️ 「将要移动」必须只数 status === 'pending'，**不能**用 plan.items.length。
+  //    plan.items 现在还装着「已在原位 / 无法处理 / 未归类」这些 skipped 条目
+  //    （它们留在表里是刻意的：结论必须可见，否则在清单侧永远拿不到裁决）。
+  //    用 length 会把这个数虚高，而它是用户判断「有没有生效」的唯一依据 ——
+  //    而且 e2e/run.js 的幂等断言正是拿它跟第二轮的 0 比对。
+  const toMove = plan ? plan.items.filter((i) => i.status === 'pending').length : null;
   $('stTotal').textContent = urls.length;
-  $('stMove').textContent = plan ? plan.items.length : '—';
+  $('stMove').textContent = toMove === null ? '—' : toMove;
   $('stInPlace').textContent = plan ? (plan.stats.byReason[REASON.IN_PLACE] || 0) : '—';
   $('stUnclassified').textContent = plan ? (plan.stats.byReason[REASON.UNCLASSIFIED] || 0) : '—';
   $('stDup').textContent = state.groups.length ? dedupeStats(state.groups).removable : '—';
   $('stFolders').textContent = plan ? plan.newFolders.length : '—';
-  setTabCount('tabPlanCount', plan ? plan.items.length : 0);
+  setTabCount('tabPlanCount', toMove === null ? 0 : toMove);
   setTabCount('tabDupCount', state.groups.length);
   // 语义配色只给真实数字。还没数据时那些卡里是「—」占位符，
   // 涂成琥珀/红会看着像报错（「重复项」是红的，最误导），
@@ -535,8 +588,35 @@ function setSpine(pct, mode) {
   }
 }
 
+/**
+ * 这份计划里「真正会执行 move() 的条目数」。
+ *
+ * ⚠️ 为什么不直接用 plan.items.length：2026-10-07 起 plan.items 除了 pending，
+ *    还装着「已在原位 / 无法处理 / 未归类」这些 **skipped** 条目 ——
+ *    它们留在表里是刻意的（「判定无需移动」也是结论，丢掉就等于什么都没发生，
+ *    清单侧会永远拿不到裁决）。但它们**不会被执行器碰**
+ *    （apply.js 只挑 status === 'pending'）。
+ *    所以凡是语义是「将要移动 N 条」的地方都必须走这里，
+ *    各自复述一遍的话，数字会漂，而它是用户判断「有没有生效」的唯一依据。
+ */
+function pendingCount(plan) {
+  if (!plan || !Array.isArray(plan.items)) return 0;
+  return plan.items.filter((i) => i.status === 'pending').length;
+}
+
 function syncExecuteButton() {
-  const has = state.plan && (state.plan.items.length > 0 || state.dupPayload.length > 0);
+  // ⚠️ 手动模式下还有「没归类」的条目时，「执行整理」必须禁用（D6）。
+  //    这不是提醒，是闸门：把它们静默塞进「其他/待归类」执行掉，
+  //    用户看到的正是他当初报的「我手工标记的会被过滤」。
+  if (state.planScope.mode === 'scope' && state.unresolved && state.unresolved.length) {
+    $('btnExecute').disabled = true;
+    $('btnExecute').title =
+      `还有 ${state.unresolved.length} 条没能归类。在「手动整理」页逐条选一个分类，`
+      + '或点「全部放待归类」，这里才能执行。';
+    return;
+  }
+  $('btnExecute').title = '';
+  const has = (pendingCount(state.plan) > 0) || state.dupPayload.length > 0;
   $('btnExecute').disabled = !has;
 }
 
@@ -551,37 +631,6 @@ function syncExecuteButton() {
  * 这与 2026-10-05 那次事故是同一个教训：执行路径的文案必须写明范围，
  * 漏写一次就是 45 条书签在用户不知情的情况下被搬走。
  */
-/**
- * 「预览已完成，去执行」的跳转条。
- *
- * ⚠️ 为什么需要它：「执行整理」只存在于 hero 区，而 hero **只在「计划明细」页
- *    sticky**（CSS 靠 body[data-tab] 判）。在「手动整理」这一页它会随页面滚走，
- *    于是用户勾完、预览完，本页却找不到任何通往执行的入口 ——
- *    症状是「勾了半天，没地方执行」，而界面上没有任何一处说明为什么。
- *
- * ⚠️ 刻意**不**在这里再放一个「执行整理」按钮：同一动作两个入口，
- *    早晚会出现「一个能点一个不能点」「一个用的范围是另一个不是」。
- *    这里只负责把人送到那唯一的执行按钮面前。
- */
-function renderScopeReady() {
-  const el = $('scopeReady');
-  if (!el) return;
-  const scoped = state.planScope.mode === 'scope';
-  const runnable = state.plan ? (state.plan.items || []).length : 0;
-  if (!scoped || !runnable) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  $('scopeReadyText').textContent =
-    `预览已生成：清单里的 ${runnable} 条待移动，清单之外的书签不会被动。`
-    // ⚠️ 2026-10-07 原文写的是「点右边去」——那是指向整理栏里的执行按钮。
-    //    整理栏收进「计划明细」页之后，本页根本没有那个按钮，
-    //    方位词就变成了界面在指一条不存在的路（AGENTS.md 约束 8）。
-    //    E2E 只断言「不会被动」这几个字（scope-run.js），所以改后半句是安全的。
-    + '切到「计划明细」页核对，再点「执行整理」开始。';
-}
-
 function renderPlanScopeChip() {
   const el = $('planScopeChip');
   if (!el) return;
@@ -611,9 +660,30 @@ const SCOPE_LIST_CAP = 500;
 const SCOPE_STATUS_LABEL = {
   [SCOPE_STATUS.PENDING]: '待整理',
   [SCOPE_STATUS.DONE]: '已整理',
+  [SCOPE_STATUS.IN_PLACE]: '已在原位',
   [SCOPE_STATUS.FAILED]: '失败',
   [SCOPE_STATUS.STALE]: '已失效',
+  [SCOPE_STATUS.BLOCKED]: '无法处理',
+  [SCOPE_STATUS.UNCLASSIFIED]: '未归类',
 };
+
+/**
+ * 七档状态在 DOM 上的 id 对照 —— 统计卡与 summarize 的键名**一一对应**。
+ *
+ * ⚠️ 这里**只有这一份**。早先还并存过一个 SCOPE_STAT_KEYS 常量，
+ *    它自称「唯一一份映射」，实际从来没人引用，而真正在用的是下面 SET 表 ——
+ *    两个名字都声称是唯一一份，读者只能靠猜。这正是本仓库反复吃过的那类亏：
+ *    同一份判据写在两处，漂移时没有任何提示。
+ */
+const SCOPE_STAT_SET = [
+  ['pending', 'scopePending', 'pending'],
+  ['done', 'scopeDone', 'done'],
+  ['in-place', 'scopeInPlace', 'inPlace'],
+  ['unclassified', 'scopeUnclassified', 'unclassified'],
+  ['failed', 'scopeFailed', 'failed'],
+  ['stale', 'scopeStale', 'stale'],
+  ['blocked', 'scopeBlocked', 'blocked'],
+];
 
 /** 清单本体 + 四个计数 + 按钮的显隐 */
 function renderScope() {
@@ -621,30 +691,34 @@ function renderScope() {
   state.scopeList = list;
   const stats = summarize(list);
 
-  $('scopePending').textContent = stats.pending;
-  $('scopeDone').textContent = stats.done;
-  $('scopeFailed').textContent = stats.failed;
-  $('scopeStale').textContent = stats.stale;
-  for (const k of ['pending', 'done', 'failed', 'stale']) {
-    const el = document.querySelector(`.scope-stat[data-k="${k}"]`);
-    if (el) el.dataset.zero = stats[k] ? '0' : '1';
+  // ⚠️ 判据在 SCOPE_STAT_SET，DOM 上的 data-k 是 kebab、summarize 的键是 camel，
+  //    两者不转换就会写错一档 —— 而少写一个数**没有任何报错**。
+  for (const [k, id, statKey] of SCOPE_STAT_SET) {
+    const v = stats[statKey] || 0;
+    const el = $(id);
+    if (el) el.textContent = v;
+    const chip = document.querySelector(`.scope-stat[data-k="${k}"]`);
+    if (chip) chip.dataset.zero = v ? '0' : '1';
   }
+
   const note = $('scopeNote');
   if (note) {
     const bits = [];
     if (stats.pending) bits.push(`勾了 ${stats.pending} 条待整理`);
+    if (stats.unclassified) bits.push(`${stats.unclassified} 条未能归类`);
     if (stats.failed) bits.push(`${stats.failed} 条可以重试`);
-    if (stats.stale) bits.push(`${stats.stale} 条书签已不存在，不会被处理`);
+    const stuck = stats.stale + stats.blocked;
+    if (stuck) bits.push(`${stuck} 条动不了`);
     note.textContent = bits.join('；');
   }
 
-  setTabCount('tabScopeCount', stats.pending + stats.failed);
+  setTabCount('tabScopeCount', stats.pending + stats.failed + stats.unclassified);
   $('btnScopeRetry').hidden = !stats.failed;
-  $('btnScopeClearDone').hidden = !stats.done;
+  $('btnScopeClearDone').hidden = !(stats.done + stats.inPlace);
   $('btnScopeClearAll').hidden = !stats.total;
   // 没有待整理的条目时禁用：点了也只会得到一句「清单是空的」
-  $('btnScopePreview').disabled = !(stats.pending + stats.failed);
-  renderScopeReady();
+  $('btnScopePreview').disabled = !(stats.pending + stats.failed + stats.unclassified);
+  renderScopeGate();
 
   const ul = $('scopeList');
   ul.textContent = '';
@@ -654,7 +728,7 @@ function renderScope() {
   if (isEmptyList(list)) {
     $('scopeEmpty').hidden = false;
     fillEmpty($('scopeEmpty'), '○', '清单还是空的',
-      '点上面的「选择书签」，勾上想整理的那些。'
+      '点「选择书签」，勾上想整理的那些。'
       + '没勾的书签不会移动，也不会被删除。');
   } else {
     $('scopeEmpty').hidden = true;
@@ -663,6 +737,31 @@ function renderScope() {
   $('scopeListCount').textContent = items.length
     ? `共 ${items.length} 条${items.length > shown.length ? `，下面是前 ${shown.length} 条` : ''}`
     : '';
+}
+
+/**
+ * 执行闸门（D6）。
+ *
+ * ⚠️ 这是「完整性契约」的落地点，也是整个功能承诺兑现的地方：
+ *    只要还有「没归类、又没被你接受」的条目，「执行整理」就是禁用的。
+ *    两条出路：逐条改判下拉，或者显式点「全部放待归类」。
+ *
+ *    早先这里没有任何闸门，未归类的条目被静默塞进「其他/待归类」执行掉 ——
+ *    用户看到的正是他当初报的「我手工标记的会被过滤」。
+ */
+function renderScopeGate() {
+  const el = $('scopeGate');
+  if (!el) return;
+  const ids = unresolvedIds(state.scopeList, state.scopeView);
+  state.unresolved = ids;
+  if (!ids.length) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  $('scopeGateText').textContent =
+    `${ids.length} 条没能归类：它们现在的位置也是它们该去的地方，所以没有东西要搬。`
+    + '逐条选一个分类，或点「全部放待归类」承认它们就该留在这儿。两者都能让执行按钮解禁。';
 }
 
 function scopeItemNode(it) {
@@ -685,6 +784,22 @@ function scopeItemNode(it) {
 
   li.append(name, path, badge);
 
+  // 「将要归到 XXX」+ 可改的下拉（D7：本页自己承担预览职责）。
+  // ⚠️ 只有还没拿到终态的条目才给下拉 —— 终态条目改了也不会重跑，
+  //    给一个点不动的控件比不给更糟。
+  const view = state.scopeView && state.scopeView.get(it.id);
+  const editable = !isTerminal(it.status) && it.status !== SCOPE_STATUS.BLOCKED;
+  if (editable) {
+    li.append(scopeTargetNode(it, view));
+  } else if (view) {
+    const t = document.createElement('span');
+    t.className = 'scope-target is-static';
+    t.textContent = view.willMove
+      ? `将要归到 ${view.toStr}`
+      : `${view.blockedLabel}（${view.toStr}）`;
+    li.append(t);
+  }
+
   // 失效条目写明「它原来在哪」，用户才能判断是自己删的还是被同步清的
   if (it.status === SCOPE_STATUS.STALE && it.path.length) {
     const why = document.createElement('span');
@@ -700,6 +815,12 @@ function scopeItemNode(it) {
     why.title = it.lastError;
     li.append(why);
   }
+  if (it.status === SCOPE_STATUS.BLOCKED) {
+    const why = document.createElement('span');
+    why.className = 'scope-err';
+    why.textContent = it.lastError || '这一条动不了（被范围校验挡住，或它是浏览器内部页 / 本机地址）';
+    li.append(why);
+  }
 
   const drop = document.createElement('button');
   drop.type = 'button';
@@ -710,6 +831,228 @@ function scopeItemNode(it) {
   li.append(drop);
 
   return li;
+}
+
+/** 一行的「将要归到 XXX」标签 + 分类下拉 */
+function scopeTargetNode(it, view) {
+  const wrap = document.createElement('span');
+  wrap.className = 'scope-target';
+
+  const label = document.createElement('span');
+  label.className = 'scope-target-text';
+  label.textContent = view && view.willMove
+    ? `将要归到 ${view.toStr}`
+    : '没能归类，它现在就在「其他/待归类」';
+  // ⚠️ 这一句是 README / docs/panel-help.md / options.html 的注释都承诺过的：
+  //    「一键重试」走的是 strict 提示词（强制每条都选一个最接近的分类），
+  //    所以它的结果**是猜测**，必须标出来。
+  //    文档写了而界面没做，比没写更糟 —— 用户会以为那是他自己选的。
+  //    判据在 state.scopeGuessed：只有经过重试的条目才带这个标记。
+  if (state.scopeGuessed && state.scopeGuessed.has(it.id)) {
+    const guess = document.createElement('span');
+    guess.className = 'scope-guess';
+    guess.textContent = 'AI 的猜测';
+    guess.title = '这条是「一键重试未归类」的结果：AI 被要求必须选一个最接近的分类，'
+      + '所以它可能猜错。改下拉就能换。';
+    label.append(document.createTextNode(' '), guess);
+  }
+  wrap.append(label);
+
+  const sel = document.createElement('select');
+  sel.className = 'scope-pick';
+  sel.id = `scopePick-${it.id}`;
+  sel.setAttribute('aria-label', `给「${it.title || it.url || it.id}」选一个分类`);
+
+  const unclassified = document.createElement('option');
+  unclassified.value = '';
+  unclassified.textContent = '选一个分类（或就留待归类）';
+  sel.append(unclassified);
+
+  for (const opt of taxonomyPickOptions()) {
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.label;
+    if (view && opt.value === view.toStr) o.selected = true;
+    sel.append(o);
+  }
+
+  sel.addEventListener('change', () => onScopePick(it.id, sel.value));
+  wrap.append(sel);
+  return wrap;
+}
+
+/**
+ * 确认弹窗里那几行「清单内这 N 条会这样落定」。
+ *
+ * ⚠️ 为什么必须列全：弹窗上「移动 N 条」与「清单内 M 条」是两个不同的数，
+ *    早先并排显示却不解释差额 —— 用户看得见缺口，无从得知哪几条掉了、为什么。
+ *    列全之后，「清单内 = 移动 + 已在原位 + 未归类 + 失败 + 无法处理」
+ *    这个等式用户可以自己核平。
+ *
+ * @param {object} plan
+ * @returns {string[]} confirm() 用的行
+ */
+function scopeOutcomeLines(plan) {
+  const rows = [
+    REASON.IN_PLACE,
+    REASON.UNCLASSIFIED,
+    REASON.UNCLASSIFIED_ACCEPTED,
+    REASON.EXCLUDED,
+    REASON.LOCKED,
+    REASON.READONLY,
+  ];
+  const by = plan.stats.byReason || {};
+  const out = [];
+  for (const reason of rows) {
+    const n = by[reason] || 0;
+    if (n) out.push(`　　${n} 条 ${reasonLabel(reason)}`);
+  }
+  out.unshift(`　　${pendingCount(plan)} 条 会被移动`);
+  return out;
+}
+
+/** 类目树展成两级下拉的选项（含兜底桶那一档） */
+function taxonomyPickOptions() {
+  const out = [];
+  const fb = fallbackPath(state.taxonomy);
+  const fbStr = pathString(fb);
+  for (const top of state.taxonomy || []) {
+    const subs = Array.isArray(top.children) ? top.children : [];
+    if (subs.length) {
+      for (const s of subs) out.push({ value: `${top.name}/${s}`, label: `${top.name} / ${s}` });
+    } else {
+      out.push({ value: top.name, label: top.name });
+    }
+  }
+  out.push({ value: fbStr, label: `${fbStr}（就留在这儿）` });
+  return out;
+}
+
+/**
+ * 清单里「我说了就放待归类」的条目 → buildPlan 的 resolution 参数。
+ *
+ * ⚠️ 只走这条路径的处置**不写进** K.MANUAL_ASSIGNMENTS，也不写 K.RULES_LEARNED。
+ *    理由（D11）：手动整理里的改判是「这一批怎么办」的逃生舱，不是「教会扩展」。
+ *    沉淀下去的话，下一次全量整理会按你这次的一时判断跑，而那多半不是你想要的。
+ *
+ * @returns {Object<string,string>} dedupeKey(url) → 'accept-unclassified'
+ */
+function scopeResolutionMap() {
+  const out = {};
+  for (const it of normalizeList(state.scopeList).items) {
+    if (it.resolution !== RESOLUTION_ACCEPT_UNCLASSIFIED) continue;
+    const k = dedupeKey(it.url);
+    if (k) out[k] = RESOLUTION_ACCEPT_UNCLASSIFIED;
+  }
+  return out;
+}
+
+/** 用户在下拉里给某一条指定了分类。只对本次清单生效，不沉淀。 */
+async function onScopePick(id, value) {
+  const item = normalizeList(state.scopeList).items.find((i) => i.id === id);
+  if (!item) return;
+  if (!value) {
+    // 选回「— 选一个分类 —」＝撤销这条处置，它重新变成需要处理的未归类条目
+    await updateScopeList((cur) => markResolution(cur, id, ''));
+  } else if (value === pathString(fallbackPath(state.taxonomy))) {
+    await updateScopeList((cur) => markResolution(cur, id, RESOLUTION_ACCEPT_UNCLASSIFIED));
+  } else {
+    // 指定了真实分类 → 走 manualAssignments 的**同一份**判据，但只在本页内存里
+    state.scopeManual = state.scopeManual || {};
+    const k = dedupeKey(item.url);
+    if (k) state.scopeManual[k] = value;
+  }
+  state.scopeList = await getScopeList();
+  await loadAndClassify({ mode: state.planScope.mode });
+}
+
+/** 给单个清单条目写 resolution（scope-list.js 的写侧，走 updateScopeList 的临界区） */
+function markResolution(list, id, resolution) {
+  const cur = normalizeList(list);
+  return {
+    v: 1,
+    updatedAt: Date.now(),
+    items: cur.items.map((it) => (
+      it.id === id ? { ...it, resolution, updatedAt: Date.now() } : it
+    )),
+  };
+}
+
+/** 「全部放待归类」：一次处置掉所有未归类条目，然后重算（不调 AI） */
+async function acceptAllUnclassified() {
+  const ids = state.unresolved || [];
+  if (!ids.length) return;
+  const now = Date.now();
+  await updateScopeList((cur) => {
+    const c = normalizeList(cur);
+    return {
+      v: 1,
+      updatedAt: now,
+      items: c.items.map((it) => (
+        ids.includes(it.id)
+          ? { ...it, resolution: RESOLUTION_ACCEPT_UNCLASSIFIED, updatedAt: now }
+          : it
+      )),
+    };
+  });
+  state.scopeList = await getScopeList();
+  await loadAndClassify({ mode: state.planScope.mode });
+}
+
+/**
+ * 「一键重试未归类」：只重发「AI 明确说不知道」的条目，
+ * 并用 strict 提示词（强制每条都选一个最接近的分类）。
+ *
+ * ⚠️ 刻意**不**重发上次请求失败的条目：那是网络或配置问题，
+ *    把同一份请求原样再发一遍多半还是同样的结果，而用户看到的是
+ *    「我点了重试，什么都没变」—— 比不点更让人火大。
+ */
+async function retryUnclassified() {
+  const ids = state.unresolved || [];
+  if (!ids.length) return;
+  // ⚠️ D12：只重发「AI 明确说不知道」的条目。
+  //    state.scopeUndecided 记的是 classifyBatch 的 undecided ——
+  //    「请求成功、模型亲口没说这条」。上次请求**失败**的那些不在里面，
+  //    因为原样再发一遍多半还是同样的结果，而用户看到的是
+  //    「我点了重试，什么都没变」，比不点更让人火大。
+  const undecidedKeys = new Set(state.scopeUndecidedKeys || []);
+  const items = normalizeList(state.scopeList).items
+    .filter((it) => ids.includes(it.id) && it.url && undecidedKeys.has(dedupeKey(it.url)));
+  if (!items.length) {
+    toast('这几条没有一条是「AI 说不知道」，它们多半是上次请求没成功。'
+      + '那种情况重发没有意义，请先到「设置 → LLM 兜底」把 key 与权限确认好。', true);
+    return;
+  }
+
+  busy(`重试 ${items.length} 条未归类…`);
+  try {
+    const settings = await getSettings();
+    const payload = items.map((it) => ({
+      key: dedupeKey(it.url) || it.id,
+      url: it.url,
+      title: it.title || '',
+    })).filter((x) => x.key);
+
+    const res = await classifyBatch(payload, {
+      taxonomy: state.taxonomy,
+      settings,
+      strict: true,          // 强制每条都给一个最接近的分类
+      onProgress: ({ done, total }) => busy(`重试未归类… ${done}/${total}`),
+    });
+    const { valid } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
+    state.scopeManual = state.scopeManual || {};
+    for (const [k, v] of Object.entries(valid)) state.scopeManual[k] = v;
+    // 标出哪些是「AI 猜的」—— 界面要显示「AI 的猜测」标记
+    state.scopeGuessed = new Set(
+      Array.from(state.scopeGuessed || []).concat(Object.keys(valid)),
+    );
+    busy('');
+    await loadAndClassify({ mode: state.planScope.mode });
+    toast(res.errors.length ? res.errors[0] : `已重试 ${items.length} 条，结果在下面的下拉里`);
+  } catch (e) {
+    busy('');
+    toast(`重试失败：${e && e.message ? e.message : e}`, true);
+  }
 }
 
 /** parentId → 子条目。勾选区靠它把树铺出来。 */
@@ -974,7 +1317,7 @@ async function runScopePreview() {
     //    而不是停在勾选区以为「点了没反应」。
     const tab = document.querySelector('#tabs button[data-tab="plan"]');
     if (tab) selectTab(tab);
-    toast(`预览完成：清单里的 ${state.plan.items.length} 条待移动，清单之外的书签不会被动`);
+    toast(`预览完成：清单里的 ${pendingCount(state.plan)} 条待移动，清单之外的书签不会被动`);
   } catch (e) {
     busy('');
     showSkeleton('planSkeleton', 6, false);
@@ -1028,9 +1371,27 @@ function renderPlan() {
 
   const onlyChanged = $('onlyChanged').checked;
   const onlyLow = $('onlyLow').checked;
+  const onlyUnclassified = $('onlyUnclassified').checked;
   let rows = state.plan.items;
   if (onlyChanged) rows = rows.filter((i) => i.status === 'pending');
   if (onlyLow) rows = rows.filter((i) => i.confidence === 'low');
+  // 「未归类」= 目标落在兜底桶，而它**已经在**兜底桶里，所以没有东西要搬。
+  // 这一档早先混在「已在原位」里一起显示（两者都是 skipped），
+  // 而它们恰恰是相反的两件事：一个整理好了，一个压根没整理。
+  const fbStr = pathString(fallbackPath(state.taxonomy));
+  const isUnclassified = (i) => i.reason === REASON.UNCLASSIFIED
+    || i.reason === REASON.UNCLASSIFIED_ACCEPTED;
+  if (onlyUnclassified) rows = rows.filter(isUnclassified);
+
+  // 未归类汇总（D13）：不管当前筛没筛，这一行都要报总数，
+  // 否则用户筛一下就看不到「还有几条没归类」这个事实本身。
+  const unclassifiedTotal = state.plan.items.filter(isUnclassified).length;
+  const note = $('unclassifiedNote');
+  if (note) {
+    note.textContent = unclassifiedTotal
+      ? `${unclassifiedTotal} 条未能归类，都停在「${fbStr}」`
+      : '';
+  }
 
   // 筛选后一条不剩时不能只剩一张空表头。此前这里直接往下走，
   // 结果是一张有表头、零行的表 —— 用户看不出是筛没了还是没数据。
@@ -1538,6 +1899,15 @@ async function doExecute() {
     return;
   }
 
+  // ⚠️ 手动模式下还有没归类的条目 → 拒绝启动（D6）。
+  //    按钮已经禁用了，这里再挡一道：禁用是界面层的判断，
+  //    而「静默把没归类的塞进待归类执行掉」正是这个功能当初最伤人的失败方式。
+  if (scoped && state.unresolved && state.unresolved.length) {
+    toast(`还有 ${state.unresolved.length} 条没能归类，整理没有开始。`
+      + '在「手动整理」页逐条选一个分类，或点「全部放待归类」，再回来执行。', true);
+    return;
+  }
+
   // 将要新建的**顶层**文件夹名 —— 用户靠它就能预判整理后的书签栏长什么样
   const newTops = [...new Set(plan.newFolders
     .filter((p) => Array.isArray(p) && p.length)
@@ -1553,7 +1923,7 @@ async function doExecute() {
     //    写成 '**只整理你勾选的书签**' 的话用户会看到字面的两个星号。
     scoped ? '即将只整理你勾选的书签：' : '即将整理你的书签：',
     '',
-    `　移动　　${plan.items.length} 条`,
+    `　移动　　${pendingCount(plan)} 条`,
     `　新建　　${plan.newFolders.length} 个文件夹`,
     `　删除　　${dups.length} 条重复项`,
     ...(state.veto.length ? [`　　　　　（其中 ${state.veto.length} 条已被你标记为不删）`] : []),
@@ -1563,6 +1933,12 @@ async function doExecute() {
       ? [
         `　清单内　${scopeIds.length} 条（本次只动这些）`,
         `　清单外　${untouched} 条（一条都不会移动，也不会删除）`,
+        // 完整性契约：五档全列出来，用户才可能核平
+        // 「清单 N 条 = 已整理 + 已在原位 + 未归类 + 失败 + 无法处理」。
+        // 早先只报「移动 N 条」，与「清单内 N 条」并排却不解释差额 ——
+        // 用户看得见缺口，无从得知哪几条掉了、为什么。
+        `　清单内这 ${scopeIds.length} 条会这样落定：`,
+        ...scopeOutcomeLines(plan),
       ]
       : ['　本次是全量整理：整棵树里能动的书签都会被分类']),
     // ⚠️ 这一行是本次修复的重点：整理到**哪个根**是设置决定的，
@@ -1573,8 +1949,12 @@ async function doExecute() {
     '',
     `快照：${state.snapshotTs ? new Date(Number(state.snapshotTs)).toLocaleString() : '（将自动创建）'}`,
     '',
-    '这些操作可以点「恢复备份」回滚。',
-    ...(scoped ? ['回滚会恢复整棵书签树到快照时的样子，不只清单里的这几条。'] : []),
+    ...(scoped
+      ? [
+        '⚠ 回滚是整棵书签树的，不只清单里这几条。',
+        '　 你在整理期间自己做的其他归类，回滚时会被一并撤销。',
+      ]
+      : ['这些操作可以点「恢复备份」回滚。']),
     '',
     '确定继续？',
   ].join('\n');
@@ -2870,7 +3250,7 @@ async function init() {
     try {
       await loadAndClassify({ backup: true });
       if (state.llmErrors.length) toast(state.llmErrors[0], true);
-      else toast(`预览完成：${state.plan.items.length} 条待移动，${state.dupPayload.length} 条重复`);
+      else toast(`预览完成：${pendingCount(state.plan)} 条待移动，${state.dupPayload.length} 条重复`);
     } catch (e) {
       busy('');
       // 骨架屏只在 render() 里收。loadAndClassify 抛错时走不到那里，
@@ -2914,14 +3294,12 @@ async function init() {
   $('btnScopePick').addEventListener('click', () => openScopePicker().catch((e) => {
     toast(`读不到书签树：${e.message || e}`, true);
   }));
-  // 跳到「计划明细」页并滚回顶部 —— hero 只在那一页 sticky，
-  // 不滚回去的话「执行整理」按钮仍然不在视野里，等于没跳。
-  $('btnScopeGoExecute').addEventListener('click', () => {
-    const tab = document.querySelector('#tabs button[data-tab="plan"]');
-    if (tab) selectTab(tab);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  });
+  // ⚠️ 2026-10-07 删掉了「去执行整理」跳转按钮：本页现在自己承担预览职责
+  //    （每行显示「将要归到 XXX」+ 可改的下拉），不需要把人送去另一页核对。
+  //    保留它反而制造两个说法 —— 这一页说「待移动 N 条」、那一页说另一套数。
   $('btnScopePreview').addEventListener('click', () => doScopePreview());
+  $('btnScopeAcceptAll').addEventListener('click', () => acceptAllUnclassified());
+  $('btnScopeRetryUnclassified').addEventListener('click', () => retryUnclassified());
   $('btnScopeRetry').addEventListener('click', () => doScopePreview({ retryFailed: true }));
   $('btnScopeClearDone').addEventListener('click', async () => {
     const n = summarize(state.scopeList).done;
@@ -3020,6 +3398,7 @@ async function init() {
 
   $('onlyChanged').addEventListener('change', renderPlan);
   $('onlyLow').addEventListener('change', renderPlan);
+  $('onlyUnclassified').addEventListener('change', renderPlan);
 
   // 类目保存
   $('btnSaveTaxonomy').addEventListener('click', async () => {

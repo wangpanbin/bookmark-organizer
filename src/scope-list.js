@@ -30,16 +30,62 @@
 
 import { dedupeKey, isExcludedUrl } from './normalize.js';
 
-/** 清单条目的状态。done 是终态，不再参与对账与重跑 */
+/**
+ * 清单条目的状态。
+ *
+ * ⚠️⚠️ 2026-10-07 起从 4 个变成 7 个，因为「完整性契约」落地了：
+ *    执行完不允许残留「待整理」——每一条都必须落到一个**明确的终态**，
+ *    而那个终态的理由要看得见。早先只有 done/failed/stale 三种落点，
+ *    于是「已被判定无需移动」「被范围挡住」「AI 没归类且你还没处置」
+ *    这三种截然不同的情况，全都被 `if (!p) return it;` 静默吞掉，
+ *    清单行永远停在「待整理」——用户视角就是「点了没反应」。
+ *
+ *    ⚠️ done / in-place / stale 三个是**终态**：不被后续运行改写
+ *       （见 reconcileList 与 applyRunResult）。
+ *    ⚠️ 新增状态时**必须**同时改四处，否则界面与闸门会静默漂移：
+ *       ① 本表  ② summarize 的 switch  ③ applyRunResult 的映射
+ *       ④ ui/options.js 的 SCOPE_STATUS_LABEL
+ */
 export const SCOPE_STATUS = Object.freeze({
-  PENDING: 'pending',   // 待整理
-  DONE: 'done',         // 已整理
-  FAILED: 'failed',     // 整理失败，可重试
-  STALE: 'stale',       // 已失效：树上找不到这条书签
+  PENDING: 'pending',          // 待整理   — 还没跑
+  DONE: 'done',                // 已整理   — 移动成功并回读确认
+  IN_PLACE: 'in-place',        // 已在原位 — 规则判它该在这儿，不需要移动
+  FAILED: 'failed',            // 失败     — 移动失败，可重试
+  STALE: 'stale',              // 已失效   — 这条书签在树上找不到了
+  BLOCKED: 'blocked',          // 无法处理 — 被范围校验挡住 / 浏览器内部页与本机地址
+  UNCLASSIFIED: 'unclassified', // 未归类   — 还没归类；或你明确说了「就放待归类」
 });
 
-/** 会被送去分类的状态。done 不在其中 —— 整理过的不重复花 LLM 的钱 */
-const RUNNABLE = [SCOPE_STATUS.PENDING, SCOPE_STATUS.FAILED];
+/**
+ * 会被送去分类的状态。终态（done / in-place / stale）不在其中 ——
+ * 它们已经有结论了，整理过的不重复花 LLM 的钱。
+ *
+ * ⚠️ blocked **不**在其中：它装的是「浏览器内部页 / 本机地址 / 被范围挡住」，
+ *    重新判一次结果不会变（URL 还是那个 URL），重跑只是白花一次 LLM 的钱。
+ *    早先把 BLOCKED 也加进来过，与「不可重试」的语义直接冲突。
+ */
+const RUNNABLE = [
+  SCOPE_STATUS.PENDING,
+  SCOPE_STATUS.FAILED,
+  SCOPE_STATUS.UNCLASSIFIED,
+];
+
+/**
+ * 全部状态值，`summarize` 的 switch 用它做穷尽性自检。
+ * 写成 Object.values(SCOPE_STATUS) 而不是写死数组：
+ * 加了状态忘了改 switch，这里会立刻报出来。
+ */
+const ALL_STATUS = Object.values(SCOPE_STATUS);
+
+/**
+ * 终态：不再参与「本轮要处理」的判定。
+ * @param {string} status
+ */
+export function isTerminal(status) {
+  return status === SCOPE_STATUS.DONE
+    || status === SCOPE_STATUS.IN_PLACE
+    || status === SCOPE_STATUS.STALE;
+}
 
 /**
  * 本轮允许动的书签 id。
@@ -84,7 +130,16 @@ export function normalizeList(raw) {
         url: typeof it.url === 'string' ? it.url : '',
         title: typeof it.title === 'string' ? it.title : '',
         path: Array.isArray(it.path) ? it.path.map(String) : [],
-        status: Object.values(SCOPE_STATUS).includes(it.status) ? it.status : SCOPE_STATUS.PENDING,
+        status: ALL_STATUS.includes(it.status) ? it.status : SCOPE_STATUS.PENDING,
+        // 用户对「未归类」条目的显式处置：'' | 'accept-unclassified'
+        // 取值刻意与 plan.js 的 RESOLUTION_ACCEPT_UNCLASSIFIED 同值，
+        // 但这里是**收敛**而非定义 —— 定义在那儿，这里只认它。
+        resolution: it.resolution === 'accept-unclassified' ? 'accept-unclassified' : '',
+        // ⚠️ 这里**刻意没有** plannedTo：面板每行的「将要归到 XXX」来自
+        //    derivePlanView(plan.items)，那才是唯一判据。早先清单条目上
+        //    挂过一个 plannedTo 字段，却从来没有人写它 —— 一个只有读没有写的
+        //    字段，比没有更糟：它看起来像个数据源，实际永远为空。
+        //    真要落一份快照，就在面板算完投影后写回，而不是另开一个字段。
         addedAt: Number(it.addedAt) || 0,
         updatedAt: Number(it.updatedAt) || 0,
         lastReason: typeof it.lastReason === 'string' ? it.lastReason : '',
@@ -235,10 +290,14 @@ export function removeEntries(list, ids, now = Date.now()) {
   return { v: 1, updatedAt: now, items: cur.items.filter((it) => !drop.has(it.id)) };
 }
 
-/** 清空「已整理」的那些（保留历史直到用户主动清） */
+/** 清空「已整理」的那些（保留历史直到用户主动清）。已在原位同样是已完成的，一并清掉 */
 export function clearDone(list, now = Date.now()) {
   const cur = normalizeList(list);
-  return { v: 1, updatedAt: now, items: cur.items.filter((it) => it.status !== SCOPE_STATUS.DONE) };
+  return {
+    v: 1,
+    updatedAt: now,
+    items: cur.items.filter((it) => it.status !== SCOPE_STATUS.DONE && it.status !== SCOPE_STATUS.IN_PLACE),
+  };
 }
 
 // ───────────────────────── 对账 ─────────────────────────
@@ -249,8 +308,9 @@ export function clearDone(list, now = Date.now()) {
  * ⚠️⚠️ 刻意**不**按 URL 找回：同一 URL 存过多条是常事，按 URL 顶替等于
  *    整理了一条用户没选的书签。认不出来就标 stale 跳过，让用户自己看着办。
  *
- * `done` 条目不参与对账：它已经是历史记录，书签事后被用户删掉是正常收尾，
- * 让它翻回「已失效」反而把「这批确实整理过」的事实抹掉了。
+ * `done` / `in-place` / `stale` 条目不参与对账：它们已经是历史结论，
+ * 书签事后被用户删掉是正常收尾，让它们翻回「已失效」反而把
+ * 「这批确实整理过」的事实抹掉了。
  *
  * @param {object} list
  * @param {Array} entries 当前 flattenTree 的完整结果
@@ -263,7 +323,7 @@ export function reconcileList(list, entries) {
   const stale = [];
   const revived = [];
   const items = cur.items.map((it) => {
-    if (it.status === SCOPE_STATUS.DONE) return it;
+    if (isTerminal(it.status)) return it;
     const alive = live.has(it.id);
     if (alive) {
       if (it.status === SCOPE_STATUS.STALE) revived.push(it.id);
@@ -300,15 +360,41 @@ export function buildScopeEntries(entries, list) {
   return (entries || []).filter((e) => e && wanted.has(String(e.id)));
 }
 
-/** 四种状态的计数，面板上的徽章用它 */
+/**
+ * 各状态的计数，面板上的徽章用它。
+ *
+ * ⚠️⚠️ 这里刻意**穷举**每个状态，**没有 `else` 兜底**。
+ *    早先的写法是 `if DONE … else if FAILED … else pending += 1`，
+ *    后果是**任何新增状态都被静默计入「待整理」**，而
+ *    「七档之和 === total」那条求和闭包**照样成立** ——
+ *    闸门全绿，失效无从发现。误报与漏报都来自这里，所以宁可 default 记成 unknown。
+ *
+ * @param {object} list
+ * @returns {{total:number, pending:number, done:number, failed:number,
+ *            stale:number, blocked:number, unclassified:number, unknown:number}}
+ */
 export function summarize(list) {
   const cur = normalizeList(list);
-  const out = { total: cur.items.length, pending: 0, done: 0, failed: 0, stale: 0 };
+  const out = {
+    total: cur.items.length,
+    pending: 0, done: 0, failed: 0, inPlace: 0,
+    stale: 0, blocked: 0, unclassified: 0, unknown: 0,
+  };
+
   for (const it of cur.items) {
-    if (it.status === SCOPE_STATUS.DONE) out.done += 1;
-    else if (it.status === SCOPE_STATUS.FAILED) out.failed += 1;
-    else if (it.status === SCOPE_STATUS.STALE) out.stale += 1;
-    else out.pending += 1;
+    switch (it.status) {
+      case SCOPE_STATUS.PENDING: out.pending += 1; break;
+      case SCOPE_STATUS.DONE: out.done += 1; break;
+      case SCOPE_STATUS.IN_PLACE: out.inPlace += 1; break;
+      case SCOPE_STATUS.FAILED: out.failed += 1; break;
+      case SCOPE_STATUS.STALE: out.stale += 1; break;
+      case SCOPE_STATUS.BLOCKED: out.blocked += 1; break;
+      case SCOPE_STATUS.UNCLASSIFIED: out.unclassified += 1; break;
+      default:
+        // normalizeList 已把非法值收敛成 PENDING，走不到这里；
+        // 留着是为了「新增状态忘了加分支」时**显形**，而不是被吞成 pending。
+        out.unknown += 1;
+    }
   }
   return out;
 }
@@ -316,13 +402,65 @@ export function summarize(list) {
 // ───────────────────────── 执行结果回写 ─────────────────────────
 
 /**
+ * plan item 的 (status, reason) → SCOPE_STATUS 的**唯一**映射表。
+ *
+ * ⚠️ 为什么单列一张表：这张表曾经是内联 if-else 链，只有三条分支，
+ *    结果 `out-of-scope`（apply.js 的范围闸门产出）**没有落点**，
+ *    条目每轮都被 `runnableIds` 重新选中、每轮都没裁决，
+ *    永远停在「待整理」且界面不解释 —— 与「AI 过滤」的症状一模一样，
+ *    但根因完全无关。散落的 if-else 链越写越长，漏掉一条分支没有任何提示。
+ *
+ *    plan.items 的 reason 取值见 src/plan.js 的 REASON。
+ */
+const PLAN_VERDICT = Object.freeze({
+  'done': SCOPE_STATUS.DONE,
+  'failed': SCOPE_STATUS.FAILED,
+  'skipped:already-in-place': SCOPE_STATUS.IN_PLACE,
+  // ⚠️⚠️ 这一条**曾经缺失**，症状正是本功能最初报的那个：
+  //    查不到落点 → 条目保持原状态 → 「永远停在待整理」。
+  //    它对应的正是「还躺在兜底桶里、没被判出分类」那一批。
+  'skipped:unclassified': SCOPE_STATUS.UNCLASSIFIED,
+  'skipped:unclassified-accepted': SCOPE_STATUS.UNCLASSIFIED,
+  'skipped:bookmark-missing': SCOPE_STATUS.STALE,
+  'skipped:out-of-scope': SCOPE_STATUS.BLOCKED,
+  'skipped:excluded': SCOPE_STATUS.BLOCKED,
+  'skipped:locked': SCOPE_STATUS.BLOCKED,
+  'skipped:readonly': SCOPE_STATUS.BLOCKED,
+});
+
+/** reason → 给人看的一句话。⚠️ 与 PLAN_VERDICT 同源维护，改一处必须改另一处。 */
+const REASON_LABEL = Object.freeze({
+  'already-in-place': '已在原位',
+  'unclassified': '未归类',
+  'unclassified-accepted': '未归类（你已确认就放待归类）',
+  'bookmark-missing': '书签已不存在',
+  'out-of-scope': '被范围校验挡住',
+  'excluded': '浏览器内部页或本机地址',
+  'locked': '已锁定',
+  'readonly': '移动设备书签是只读的',
+});
+
+/**
+ * 把 reason 翻成人话。面板不许自己复述这张表 —— 它与 PLAN_VERDICT 同源。
+ * @param {string} reason
+ * @returns {string}
+ */
+export function reasonLabel(reason) {
+  return REASON_LABEL[reason] || String(reason || '');
+}
+
+/**
  * 一轮执行结束后，把 plan 里每条计划项的最终状态写回清单。
  *
  * ⚠️ plan.items 的 status 语义（见 src/apply.js）：
  *    'done'    移动成功且回读确认（assertMoved）
  *    'failed'  移动失败，原因在 task.failed 里
- *    'skipped' 只可能是 reconcilePlanIds 判定的 bookmark-missing
+ *    'skipped' 未执行；具体原因看 reason，落点见 PLAN_VERDICT
  *    'pending' 一轮跑完还不该出现，出现了就当没处理过
+ *
+ * ⚠️⚠️ **map 里查不到的组合一律保持原状**，这是刻意的：
+ *    判据表漏了新分支时宁可让用户看见「还在待整理」，
+ *    也不要把它归到一个看起来正常、实则错误的终态上。
  *
  * @param {object} list
  * @param {Array} planItems task.plan.items
@@ -346,24 +484,113 @@ export function applyRunResult(list, planItems, failures = []) {
 
   let changed = false;
   const items = cur.items.map((it) => {
-    // done 是终态，不被后续运行改写
-    if (it.status === SCOPE_STATUS.DONE) return it;
+    // 终态不被后续运行改写
+    if (isTerminal(it.status)) return it;
     const p = verdict.get(it.id);
     if (!p) return it;   // 这一轮没轮到它，保持原状
 
-    let next = null;
-    if (p.status === 'done') {
-      next = { ...it, status: SCOPE_STATUS.DONE, lastReason: p.reason || it.lastReason, lastError: '', updatedAt: Date.now() };
-    } else if (p.status === 'failed') {
-      next = { ...it, status: SCOPE_STATUS.FAILED, lastError: errById.get(it.id) || '未知原因', updatedAt: Date.now() };
-    } else if (p.status === 'skipped' && p.reason === 'bookmark-missing') {
-      next = { ...it, status: SCOPE_STATUS.STALE, updatedAt: Date.now() };
+    const key = p.status === 'skipped' ? `skipped:${p.reason}` : p.status;
+      const nextStatus = PLAN_VERDICT[key];
+    // 查不到 → 保持原状（见上面「宁可让用户看见」的说明）
+    if (!nextStatus) return it;
+
+    let next = { ...it, status: nextStatus, updatedAt: Date.now() };
+    if (nextStatus === SCOPE_STATUS.DONE) {
+      next.lastReason = p.reason || it.lastReason;
+      next.lastError = '';
+    } else if (nextStatus === SCOPE_STATUS.FAILED) {
+      next.lastError = errById.get(it.id) || '未知原因';
+    } else if (nextStatus === SCOPE_STATUS.UNCLASSIFIED) {
+      // 只有「你已确认」才记成处置过；「还没判出来」不能倒过来写成已确认，
+      // 否则下一轮它会从闸门里漏过去 —— 而它恰恰是还没交代的那条。
+      next.resolution = p.reason === 'unclassified-accepted' ? 'accept-unclassified' : '';
+      next.lastError = '';
+    } else if (nextStatus === SCOPE_STATUS.IN_PLACE) {
+      next.lastError = '';
+    } else {
+      next.lastError = errById.get(it.id) || it.lastError;
     }
-    if (next) changed = true;
-    return next || it;
+
+    changed = true;
+    return next;
   });
 
   return changed ? { v: 1, updatedAt: Date.now(), items } : cur;
+}
+
+/**
+ * 把一份计划投影成「清单每一行该怎么显示」。
+ *
+ * ⚠️ 为什么面板不能自己反推：清单行要显示「将要归到 XXX」，
+ *    而那份信息只存在于 plan.items 里。面板若自己按 status 复述一遍规则，
+ *    就会与 plan.js 漂移 —— 而漂移的症状是「清单里写着要搬去 A，
+ *    执行时搬到 B」，界面承诺与实际行为不一致，比不做更糟。
+ *    所以这里是**唯一**一份投影判据。
+ *
+ * @param {Array} planItems plan.items
+ * @param {string} fallbackStr 兜底桶的 '顶层/子类' 串
+ * @returns {Map<string, {toStr:string, toPath:string[], willMove:boolean,
+ *                        inFallback:boolean, blocked:string, reason:string}>}
+ */
+export function derivePlanView(planItems, fallbackStr) {
+  const fb = String(fallbackStr || '');
+  const out = new Map();
+  for (const it of planItems || []) {
+    if (!it || it.id == null) continue;
+    const id = String(it.id);
+    const toStr = it.toStr || (Array.isArray(it.toPath) ? it.toPath.join('/') : '');
+    const willMove = it.status === 'pending';
+    const inFallback = toStr === fb;
+    out.set(id, {
+      toStr,
+      toPath: Array.isArray(it.toPath) ? it.toPath.slice() : [],
+      willMove,
+      inFallback,
+      reason: it.reason || '',
+      // 面板对终态条目要显示「为什么不动」，读的就是这个字段。
+      // 早先它去读一个从未被产出的 blockedLabel，于是永远拿到 undefined，
+      // 界面只剩一个光秃秃的类目名，用户不知道自己看的是哪一种结局。
+      blockedLabel: willMove ? '' : reasonLabel(it.reason),
+    });
+  }
+  return out;
+}
+
+/**
+ * 清单里「本轮还需要你处理」的条目：AI 没归类、且你还没明确说「就放待归类」。
+ *
+ * ⚠️ 这就是执行闸门的判据（见 ui/options.js 的 syncExecuteButton）：
+ *    D6 的「未归类必须在执行前处理完，或显式接受」全靠它。
+ *    判据放在纯函数里是为了能被单测直接钉住 ——
+ *    面板里写一个 `.filter(...)` 的话，闸门就成了没人验的一句表达式。
+ *
+ * @param {object} list
+ * @param {Map<string,object>} [planView] derivePlanView 的输出。
+ *        **缺省时一条都不算** —— 还没预览过就等于「还没算」，
+ *        那不是「没归类」。宁可闸门此刻不拦，也不要在没有计划时编造一个理由。
+ * @returns {string[]} 清单条目 id
+ */
+export function unresolvedIds(list, planView) {
+  const cur = normalizeList(list);
+  const out = [];
+  for (const it of cur.items) {
+    if (isTerminal(it.status)) continue;
+    if (it.status === SCOPE_STATUS.FAILED || it.status === SCOPE_STATUS.BLOCKED) continue;
+    if (it.resolution === 'accept-unclassified') continue;
+    const v = planView && planView.get(it.id);
+    if (!v) continue;
+    // ⚠️⚠️ 判据是「目标落在兜底桶」，**与 willMove 无关**。
+    //    两种都算「没归类」：
+    //      ① willMove=false：已经躺在待归类里，没有东西要搬 ——
+    //         D6 要你给它一个分类，或承认它就该留在这儿。
+    //      ② willMove=true ：**正要把它搬进待归类** ——
+    //         这才是用户最初报的「静默塞进待归类」，更该拦。
+    //    早先写成 `if (v.willMove) continue`，恰好把 ② 放过去了，
+    //    于是「正要被塞进待归类」的条目畅通无阻，而闸门看上去是好的。
+    if (!v.inFallback) continue;
+    out.push(it.id);
+  }
+  return out;
 }
 
 /**

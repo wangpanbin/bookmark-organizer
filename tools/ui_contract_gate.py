@@ -283,7 +283,13 @@ GATED = [
     'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
     'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
     'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
-    'scopeListCount', 'planScopeChip', 'scopeReady', 'scopeReadyText', 'btnScopeGoExecute',
+    'scopeListCount', 'planScopeChip',
+    # 2026-10-07 手动整理重做：七档状态 + 执行闸门 + 每行的分类下拉。
+    # 移除了 scopeReady / scopeReadyText / btnScopeGoExecute ——
+    # 本页现在自己承担预览职责，不再需要把人送去另一页核对。
+    'scopeInPlace', 'scopeUnclassified', 'scopeBlocked',
+    'scopeGate', 'scopeGateText', 'btnScopeAcceptAll', 'btnScopeRetryUnclassified',
+    'onlyUnclassified', 'unclassifiedNote',
     # 2026-10-07 面板重排与换色新增。
     # 窄栏（整理栏）：只有这几件属于「计划明细」页。
     'hero', 'planSpine', 'spineVal', 'planScopeChip',

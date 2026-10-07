@@ -189,12 +189,50 @@ test('面板没填 key 时 classifyBatch 给出可操作提示', async () => {
   }
 });
 
-test('LLM 关闭时 classifyBatch 什么都不做、连错误都不报', async () => {
+test('LLM 关闭时：不发请求，但必须说清「AI 根本没参与」', async () => {
+  // ⚠️ 2026-10-07 改了语义。早先是**一个字都不报**地 return，
+  //    后果是「AI 没参与」与「AI 说不知道」在界面上长得一模一样 ——
+  //    用户看到「其他/待归类」里躺着一批书签，无从判断是模型拒答还是压根没问。
+  //    而这正是「AI 过滤了」这种怀疑的来源之一，所以现在必须留痕。
   const res = await L.classifyBatch([{ key: 'k', url: 'https://a.com', title: 't' }], {
     taxonomy: [], settings: { llmEnabled: false, apiKey: 'sk-x' },
   });
-  assert.deepEqual(res.errors, []);
-  assert.equal(res.asked, 0);
+  assert.equal(res.asked, 0, '关掉了就不该发请求');
+  assert.deepEqual(res.assignments, {});
+  assert.equal(res.skipped, 'llm-disabled', '必须能分辨「关掉了」与「没配 key」');
+  assert.equal(res.errors.length, 1);
+  assert.match(res.errors[0], /LLM 兜底已关闭/, '要说清是关闭，不是失败');
+});
+
+test('strict 提示词：强制每条都给一个最接近的分类', async () => {
+  const items = [{ key: 'k1', url: 'https://a.com', title: 't' }];
+  const tax = [{ name: '开发', children: ['前端'] }];
+
+  const normal = L.buildPrompt(items, tax);
+  assert.match(normal.system, /返回空数组/, '默认模式必须保留「不确定就留白」');
+
+  const strict = L.buildPrompt(items, tax, { strict: true });
+  assert.ok(!/若没有任何一个合适，就返回空数组/.test(strict.system),
+    'strict 模式还留着「返回空数组」这条，等于没换提示词');
+  assert.match(strict.system, /每一条都必须给出一个分类/);
+  assert.match(strict.system, /最接近/);
+});
+
+test('undecided 与 malformed：模型的沉默和残缺输出要分开记账', async () => {
+  // parseJsonArray / callOnce 都在真实请求里，Node 下跑不到。
+  // 这里直接验证 buildPrompt 的输入契约与记账口径的关键前提：
+  // undecided 的来源是「模型没提到这条」，malformed 是「提到了但缺字段」。
+  // 两者混在一起的话，界面会把「输出格式坏了」当成「模型不愿意答」，
+  // 于是「换个提示词再问一次」这个药方就下错了。
+  const { system, user } = L.buildPrompt(
+    [{ key: 'k1', url: 'https://a.com', title: 'A' }, { key: 'k2', url: 'https://b.com', title: 'B' }],
+    [{ name: '开发', children: ['前端'] }],
+    { strict: true },
+  );
+  assert.match(user, /key=k1/);
+  assert.match(user, /key=k2/);
+  assert.match(system, /返回的条数必须与输入条数一致/,
+    'strict 必须要求条数一致，否则模型照样可以悄悄漏掉几条');
 });
 
 test('空条目列表不发请求', async () => {

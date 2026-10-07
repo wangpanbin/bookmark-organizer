@@ -92,7 +92,17 @@ test('幂等：执行后重新预览应产生 0 变更', async () => {
     await runPreview(page);
     const s2 = await readStats(page);
     assert.equal(Number(s2.move), 0, `二次预览仍有 ${s2.move} 条待移动 —— 幂等被破坏`);
-    assert.equal(Number(s2.inPlace), Number(s2.total), '不是全部条目都落在目标位置上了');
+    // ⚠️ 「没动」现在有两类，2026-10-07 起必须分开数：
+    //    inPlace = 规则判它该在那个位置；
+    //    unclassified = 还躺在「其他/待归类」里、压根没被判过。
+    //    早先只有 inPlace 一个口径，于是未归类的条目被算进「已在位」，
+    //    而它们恰恰是**还没整理好**的那批 —— 这是完整性契约要消灭的东西。
+    assert.equal(Number(s2.move), 0, '待移动必须为 0');
+    assert.equal(
+      Number(s2.inPlace) + Number(s2.unclassified),
+      Number(s2.total),
+      `不是全部条目都有结论：inPlace=${s2.inPlace} + unclassified=${s2.unclassified} ≠ total=${s2.total}`,
+    );
   } finally {
     await ctx.close();
   }

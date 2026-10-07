@@ -190,6 +190,57 @@ CASES = [
         ["不得命中新闸门", "纯链路源码"],
         None,
     ),
+    # ─── 2026-10-07 手动整理静默失效（根因修复）新增 ───
+    # 这一类的特殊之处：**退化后的症状与原症状一模一样**（条目永远停在「待整理」、
+    # 界面不报错），所以只能靠闸门钉住，不能靠"用户会发现"。
+    (
+        "兜底桶又被当成「已在原位」（AI 从来没见过待归类里的书签）",
+        os.path.join("src", "plan.js"),
+        "    if (fromFallback) {",
+        "    if (true) {   // ← 证伪补丁：兜底桶重新变回合法目标位置\n"
+        "      // 早先那个 bug 的形状：落在待归类里的条目被判 IN_PLACE 剔除，\n"
+        "      // 于是 selectForLlm 的候选池里没有它，AI 从来没见过它。",
+        # ⚠️ 关键字要对着**实测变红的标题**写，别照着自己想守的东西写。
+        #    第一版这里写的是两个 ★ 用例的名字，量具却始终匹配不上（rc=1）。
+        #    原因：这个补丁把 `if (fromFallback)` 换成 `if (true)`，于是
+        #    **在位**的条目也被判成 unclassified —— 变红的是「已在位」那一侧，
+        #    两个 ★ 用例只覆盖了「兜底桶那一侧」，它们照绿。
+        #    闸门一直在正常测量，错的只是量具瞄的方向。
+        ["已在目标位置 → skipped", "路径模型", "真·在位（非兜底桶）"],
+        None,
+    ),
+    (
+        "在位条目不再留在计划表里（清单侧永远拿不到裁决 → 永久停在待整理）",
+        os.path.join("src", "plan.js"),
+        "    items.push(base);   // 结论可见 ≠ 什么都不发生：清单侧要靠它拿裁决",
+        "    continue;   // ← 证伪补丁：在位条目重新被剔除",
+        ["★ 真·在位（非兜底桶）", "已在目标位置 → skipped"],
+        None,
+    ),
+    (
+        "applyRunResult 丢了 out-of-scope 的落点（被范围挡住 → 永久停在待整理）",
+        os.path.join("src", "scope-list.js"),
+        "  'skipped:out-of-scope': SCOPE_STATUS.BLOCKED,",
+        "  // ← 证伪补丁：删掉这条映射\n",
+        ["applyRunResult：七种", "终态不被后续运行改写"],
+        None,
+    ),
+    (
+        # ⚠️ 这条的第一版瞄错了目标，值得一提：
+        #   原本注入的是「把 default 改回 else 兜底」，结果整套测试全绿。
+        #   原因是 `default: out.unknown += 1` 是**不可达的死代码** ——
+        #   normalizeList 已把非法 status 收敛成 PENDING，而 switch 又覆盖了
+        #   全部七个 SCOPE_STATUS 值，于是 default 永远进不去。
+        #   改一段没人走的代码，当然测不出任何退化。
+        #   真正的退化形状是「新增/改动状态时忘了加分支」，
+        #   所以注入点改成**删掉一个真实分支**。
+        "summarize 漏了一个分支（新状态被静默吞掉，求和闭包照样成立）",
+        os.path.join("src", "scope-list.js"),
+        "      case SCOPE_STATUS.IN_PLACE: out.inPlace += 1; break;\n",
+        "      // ← 证伪补丁：漏掉 in-place 分支，它会掉进 default\n",
+        ["summarize 必须覆盖全部七档"],
+        None,
+    ),
     # ─── link-scan 的 5 处（.scratch/link-scan）───
     (
         "死链阈值去掉「跨 24h」（alarms 会任意延迟 → 丢一轮就误杀）",
@@ -355,6 +406,14 @@ def main():
                     # 具名用例没命中时，用文件级失败兜底（加载失败也算红）
                     hit = [t for _, t in failing if any(k in t for k in expect_kw)]
                 status = "RED  ✓" if hit else "RED  (关键字未匹配)"
+                # ⚠️⚠️ `RED (关键字未匹配)` 与 `[!! 未红]` 是**完全不同的两件事**，
+                #    而它们都让 overall_ok = False、都返回 rc=1：
+                #      · RED (关键字未匹配) —— **闸门在正常测量**，只是量具瞄错了方向。
+                #        该做的是把 expect_kw 改成实测变红的标题。
+                #      · [!! 未红]          —— 闸门对这次退化真的不敏感，测试是摆设。
+                #        该做的是补测试。
+                #    不看这一行分类，就会把前者误判成后者，然后去改**正确的**代码。
+                #    2026-10-07 为此白跑了两轮证伪。
                 if not hit:
                     overall_ok = False
                 print(f"[{status}] {name}")

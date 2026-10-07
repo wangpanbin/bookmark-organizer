@@ -77,6 +77,13 @@ const MUST_BE_REACHABLE = [
   ['src/scope-list.js', 'prepareScope', '对账 + 裁子集，面板预览的唯一入口'],
   ['src/scope-list.js', 'annotateSelectable', '勾选区标出哪些不可动，以及为什么'],
   ['src/scope-list.js', 'applyRunResult', '一轮执行结束后把结果写回清单（状态机的写侧）'],
+  // 2026-10-07 新增。derivePlanView 是「每行显示将要归到哪」的唯一判据，
+  // unresolvedIds 是执行闸门的唯一判据 —— 面板里各写一个 .filter 的话，
+  // 界面承诺就会与实际执行漂移，而漂移没有任何报错。
+  ['src/scope-list.js', 'derivePlanView', '清单每行「将要归到 XXX」的唯一来源；面板自己反推必然与 plan 漂移'],
+  ['src/scope-list.js', 'unresolvedIds', '执行闸门：没归类又没被接受的条目，禁用「执行整理」'],
+  ['src/scope-list.js', 'isTerminal', 'done / in-place / stale 不参与对账与重跑的判据'],
+  ['src/scope-list.js', 'reasonLabel', 'reason → 人话标签；面板自己复述这张表必然与映射表漂移'],
   // 刻意**不列**同文件内部 helper（reconcileList / buildScopeEntries / blockedReason）：
   // 它们被 prepareScope / annotateSelectable 调用，可达性是传递的。
   // 列进来只会让这道闸门天天为正确的代码报红 —— 而误报的闸门等于没有闸门。
@@ -158,7 +165,13 @@ test('⚠️ 面板上引用的每个 DOM id 都必须真实存在', () => {
     'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
     'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
     'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
-    'scopeListCount', 'planScopeChip', 'scopeReady', 'scopeReadyText', 'btnScopeGoExecute',
+    'scopeListCount', 'planScopeChip',
+    // 2026-10-07 手动整理重做：七档状态 + 执行闸门 + 每行的分类下拉。
+    // 移除了 scopeReady / scopeReadyText / btnScopeGoExecute ——
+    // 本页现在自己承担预览职责，不再需要把人送去另一页核对。
+    'scopeInPlace', 'scopeUnclassified', 'scopeBlocked',
+    'scopeGate', 'scopeGateText', 'btnScopeAcceptAll', 'btnScopeRetryUnclassified',
+    'onlyUnclassified', 'unclassifiedNote',
     // 2026-10-07 面板重排：窄栏 + 帮助页签 + 亮暗切换
     'hero', 'planSpine', 'spineVal', 'btnDupPreview',
     'tab-help', 'panel-help', 'helpBody', 'helpError', 'helpEmpty', 'btnHelpReload',

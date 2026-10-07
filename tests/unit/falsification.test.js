@@ -454,12 +454,15 @@ test('证伪：若执行后没有真正搬动 → 幂等闸门必须红', () => 
     const t = first.items.find((i) => i.id === e.id);
     return t ? { ...e, path: [e.path[0], ...t.toPath] } : e;
   });
-  assert.equal(buildPlan({ entries: goodAfter, taxonomy: DEFAULT_TAXONOMY }).items.length, 0);
+  // ⚠️ 判据是 stats.planned（将要移动的条数），**不是** items.length ——
+  //    2026-10-07 起 items 里还留着 skipped 条目（在位/无法处理/未归类），
+  //    它们是「有结论」而不是「有变更」。用 length 量幂等会恒为假。
+  assert.equal(buildPlan({ entries: goodAfter, taxonomy: DEFAULT_TAXONOMY }).stats.planned, 0);
 
   // 坏实现：执行器什么都没做 → 第二轮仍有全部变更
   const badAfter = entries; // 原封不动
   assert.ok(
-    buildPlan({ entries: badAfter, taxonomy: DEFAULT_TAXONOMY }).items.length > 0,
+    buildPlan({ entries: badAfter, taxonomy: DEFAULT_TAXONOMY }).stats.planned > 0,
     '第二轮 0 变更 —— 幂等闸门测不出「执行器没干活」',
   );
 });
@@ -474,7 +477,7 @@ test('证伪：若「已在位」判断不剥根名 → 幂等闸门必须红', 
 
   // 正确实现：执行后路径是 [根名, ...toPath] → 剥根后与 toStr 相等 → 0 变更
   const good = entries.map((e) => ({ ...e, path: ['书签栏', ...plan.items[0].toPath] }));
-  assert.equal(buildPlan({ entries: good, taxonomy: DEFAULT_TAXONOMY }).items.length, 0);
+  assert.equal(buildPlan({ entries: good, taxonomy: DEFAULT_TAXONOMY }).stats.planned, 0);
 
   // 坏实现：把 fromPath 原样拿去比 toStr（根名没剥）→ 永远不等 → 每次都有变更
   const toStr = plan.items[0].toStr;
@@ -497,7 +500,7 @@ test('证伪：锁按字面 URL 比较而非归一化 → 锁闸门必须红', (
 
   // 正确实现：锁里写归一化后的形态也能锁上
   assert.equal(
-    buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY, locks: ['https://github.com/a'] }).items.length,
+    buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY, locks: ['https://github.com/a'] }).stats.planned,
     0,
     '按归一化 URL 锁没生效',
   );

@@ -194,11 +194,20 @@ export function parseJsonArray(text) {
  * 硬约束写进 system：只能用给定类目名、不能发明新类目、
  * 不确定就返回空数组（宁可进「待归类」也不要瞎猜）。
  *
+ * ⚠️ `strict` 是「一键重试未归类」用的模式（D12）：
+ *    把第 2 条从「不确定就返回空数组」翻成「**每一条都必须给出最接近的一个**」。
+ *    这是一次真实的权衡 —— 强制必答会让模型宁可猜也不留白，
+ *    猜错的分类比「待归类」更难被发现。
+ *    所以 strict 的结果在界面上要标成「这是 AI 的猜测」，
+ *    并且必须出现在每行的下拉里、可改。**别把 strict 当默认。**
+ *
  * @param {Array<{key:string,url:string,title:string}>} items
  * @param {Array} taxonomy
+ * @param {{strict?:boolean}} [opts]
  * @returns {{system:string, user:string}}
  */
-export function buildPrompt(items, taxonomy) {
+export function buildPrompt(items, taxonomy, opts = {}) {
+  const strict = !!(opts && opts.strict);
   const lines = [];
   for (const top of taxonomy || []) {
     const subs = Array.isArray(top.children) ? top.children : [];
@@ -209,7 +218,10 @@ export function buildPrompt(items, taxonomy) {
     '',
     '硬性要求：',
     '1. 只能用下面【可用分类】里出现过的分类名，格式为「顶层/子类」。',
-    '2. 绝对不许发明新分类。若没有任何一个合适，就返回空数组——宁可放进待归类也不要瞎猜。',
+    strict
+      ? '2. **每一条都必须给出一个分类**，即使你觉得很不确定，也要选最接近的那一个。'
+        + '返回的条数必须与输入条数一致，不允许省略任何一条。'
+      : '2. 绝对不许发明新分类。若没有任何一个合适，就返回空数组——宁可放进待归类也不要瞎猜。',
     '3. 依据 URL 域名与标题判断，不要臆测页面内容。',
     '4. 内网地址、localhost、chrome:// 等一律返回空数组。',
     '5. 只输出 JSON 数组，不要任何解释文字。每个元素形如 {"key":"...","to":"顶层/子类"}。',
@@ -299,22 +311,42 @@ async function callOnce({ system, user, settings }) {
 /**
  * 对一批条目做 LLM 分类。
  *
+ * ⚠️⚠️ 返回值里 `undecided` 与 `errors` 是**两件完全不同的事**，不能合并：
+ *    · undecided —— 请求成功，模型**亲口说不知道**（没给这条结果）。
+ *      这是「AI 的判断」，可以换个提示词再问一次。
+ *    · errors    —— 请求压根没成（超时 / 401 / JSON 解析不了）。
+ *      这是「网络或配置问题」，重发同一份请求多半还是同样的结果。
+ *    早先这两者混在 errors[] 里变成一句话，界面上分不出
+ *    「模型不愿答」与「模型没答上来」，于是「AI 过滤」这件事无从查证。
+ *
  * @param {Array<{key:string,url:string,title:string}>} items
- * @param {{taxonomy:Array, settings:object, onProgress?:Function}} opts
- * @returns {Promise<{assignments:Record<string,string>, errors:string[], asked:number, batches:number, usage:object[]}>}
+ * @param {{taxonomy:Array, settings:object, onProgress?:Function, strict?:boolean}} opts
+ * @returns {Promise<{assignments:Record<string,string>, errors:string[],
+ *                    undecided:string[], malformed:number, asked:number, batches:number,
+ *                    usage:object[], skipped?:string}>}
  */
 export async function classifyBatch(items, opts) {
-  const { taxonomy, onProgress } = opts || {};
+  const { taxonomy, onProgress, strict } = opts || {};
   const cfg = await resolveConfig(opts?.settings);
-  const out = { assignments: {}, errors: [], asked: 0, batches: 0, usage: [] };
+  const out = {
+    assignments: {}, errors: [], undecided: [], malformed: 0,
+    asked: 0, batches: 0, usage: [],
+  };
 
-  if (!cfg.llmEnabled) return out;
+  if (!cfg.llmEnabled) {
+    // ⚠️ 早先这里是静默 return，一句话都不留。后果：「AI 没参与」和
+    //    「AI 说不知道」在界面上长得一模一样，用户无从分辨。
+    out.skipped = 'llm-disabled';
+    out.errors.push('LLM 兜底已关闭：这些条目只能靠规则分类，没归类的会留在「其他/待归类」。');
+    return out;
+  }
   if (!cfg.apiKey) {
     // ⚠️ 措辞要能区分两种完全不同的情况：
     //    「压根没注入」和「注入了但没读到」。
     //    早先这里只说「没有 API key」，而动态 import 路径写错一级导致
     //    「注入了却读不到」也报同一句 —— 用户按提示去检查环境变量，
     //    一切正常，于是判定扩展在骗人。真正的信息在 loadedFrom/tried 里。
+    out.skipped = 'no-api-key';
     const diag = cfg.injectedTried && cfg.injectedTried.length
       ? `（已尝试读取注入文件：${cfg.injectedTried.join('；')}）`
       : '';
@@ -331,6 +363,7 @@ export async function classifyBatch(items, opts) {
 
   const granted = await hasLlmPermission(cfg.baseUrl);
   if (!granted) {
+    out.skipped = 'no-permission';
     out.errors.push(
       `尚未授予 ${cfg.baseUrl} 的访问权限。请在「设置 → LLM 兜底」里点「授权访问该域名」后再开启。`,
     );
@@ -343,18 +376,35 @@ export async function classifyBatch(items, opts) {
     out.asked += batch.length;
     onProgress?.({ done: i, total: list.length });
 
-    const { system, user } = buildPrompt(batch, taxonomy);
+    const { system, user } = buildPrompt(batch, taxonomy, { strict });
+    const answered = new Set();
     try {
       const { items: arr, usage } = await callOnce({ system, user, settings: cfg });
       if (usage) out.usage.push(usage);
       for (const row of arr) {
         const key = row && row.key ? String(row.key) : null;
         const to = row && row.to ? String(row.to) : null;
-        // 只接受 taxonomy 里真实存在的路径，模型自造的类目一律丢弃
-        if (key && to) out.assignments[key] = to;
+        // ⚠️ 早先这里是 `if (key && to)` 静默忽略，缺 key 或缺 to 的元素
+        //    一个字都不留。症状与「模型没返回这条」完全一样，
+        //    而两者要开的药方不同（前者是模型输出格式坏了）。
+        if (key && to) {
+          out.assignments[key] = to;
+          answered.add(key);
+        } else {
+          out.malformed += 1;
+        }
       }
     } catch (e) {
       out.errors.push(`第 ${out.batches} 批（${i + 1}-${i + batch.length} 条）失败：${e.message}`);
+    }
+
+    // 请求成功但模型没提到的那些 = 「它说不知道」。失败批不记进来：
+    // 那是「没问成」，重发同一份请求未必有用，要靠 errors 单独说清。
+    if (out.errors.length === 0 || !out.errors.some((m) => m.startsWith(`第 ${out.batches} 批`))) {
+      for (const it of batch) {
+        const k = it && it.key ? String(it.key) : null;
+        if (k && !answered.has(k)) out.undecided.push(k);
+      }
     }
   }
 
