@@ -20,6 +20,8 @@
 """
 
 import sys
+from collections import namedtuple
+from copy import deepcopy
 
 # ── 底色（两套模式各自独立取色，不是自动反色）────────────────────
 BASE = {
@@ -186,6 +188,169 @@ def delta_e(a, b):
     return ((la - lb) ** 2 + (aa - ab) ** 2 + (ba - bb) ** 2) ** 0.5
 
 
+Row = namedtuple('Row', 'kind mode a b note value need ok')
+
+
+def evaluate(base, ink, on):
+    """把判据表求值成一张行表。
+
+    ⚠️ 判据与自证伪**必须共用这一个函数**。自证伪若另写一份求值逻辑，
+       两份会漂，而且漂了没人知道是哪一份 —— 那等于用一道未验证的检查
+       去验证另一道。2026-10-07 之前这里是一段 print+append，
+       于是「判据还灵不灵」根本没法在脚本里回答自己。
+    """
+    rows = []
+
+    def add(kind, mode, a, b, note, value, need):
+        rows.append(Row(kind, mode, a, b, note, value, need, value >= need))
+
+    for mode in ('light', 'dark'):
+        for fg, bg, need, note in TEXT_PAIRS:
+            add('text', mode, fg, bg, note,
+                ratio(ink[mode][fg], base[mode][bg]), need)
+        for on_name, fill, need, note in FILL_PAIRS:
+            add('fill', mode, on_name, fill, note,
+                ratio(on[mode][on_name], ink[mode][fill]), need)
+        # 非文字对比度：门槛 3.0（WCAG 1.4.11），不是 4.5
+        for fg, bg, note in LINE_PAIRS:
+            add('line', mode, fg, bg, note,
+                ratio(ink[mode][fg], base[mode][bg]), 3.0)
+        # 徽章两级：填充明度承载「实心 vs 软底」，墨色色相承载「中 vs 低」
+        for soft, label in (('accent-soft', 'solid vs medium-soft'),
+                            ('warn-soft', 'solid vs low-soft')):
+            add('badge-lum', mode, 'accent-ink', soft, label,
+                ratio(ink[mode]['accent-ink'], ink[mode][soft]), 3.0)
+        add('badge-de', mode, 'accent-ink', 'warn', 'medium-ink vs low-ink',
+            delta_e(ink[mode]['accent-ink'], ink[mode]['warn']), 20.0)
+    return rows
+
+
+def _mutate_row(row, base, ink, on):
+    """构造一组色值，让**这一条**判据必然翻红。
+
+    ⚠️ 突变不引入任何魔法色值：一律把「被比较的那一方」改成「比较它的那一方」。
+       比值于是精确等于 1.00:1，与门槛差得最远。
+       换一个随手挑的颜色就得验一遍「它到底够不够低」，
+       而那种验法本身就会漂 —— 这里没有可漂的地方。
+    """
+    b, i, o = deepcopy(base), deepcopy(ink), deepcopy(on)
+    m = row.mode
+    if row.kind in ('text', 'line'):
+        i[m][row.a] = b[m][row.b]      # 前景 = 它所压的那个底
+    elif row.kind == 'fill':
+        o[m][row.a] = i[m][row.b]      # 文字 = 它所压的那个填充
+    elif row.kind in ('badge-lum', 'badge-de'):
+        i[m][row.b] = i[m][row.a]      # 软底 / warn = 实心墨色
+    return b, i, o
+
+
+def _row_key(r):
+    return (r.kind, r.mode, r.a, r.b)
+
+
+def _covered_tokens(rows):
+    """判据表真正引用到的每一个 (dict 名, 模式, 键)。"""
+    seen = set()
+    for r in rows:
+        if r.kind in ('text', 'line'):
+            seen.add(('INK', r.mode, r.a))
+            seen.add(('BASE', r.mode, r.b))
+        elif r.kind == 'fill':
+            seen.add(('ON', r.mode, r.a))
+            seen.add(('INK', r.mode, r.b))
+        else:
+            seen.add(('INK', r.mode, r.a))
+            seen.add(('INK', r.mode, r.b))
+    return seen
+
+
+# ── 判据表的清单锚点 ───────────────────────────────────────────────
+# 覆盖度检查能抓「某个色值没有任何判据在量」，但**抓不到「删掉一行判据、
+# 而那个色值在别处还被量着」** —— 覆盖度纹丝不动，闸门照样绿。
+# 换句话说：判据表能自我删减而不留痕迹。
+#
+# 这是刻意设计的摩擦：**增删任何一条判据都必须同时改这一行**，
+# 于是删判据在 diff 里永远看得见。按 AGENTS.md「放宽判据要双向证伪」，
+# 放宽本来就应该是一件需要被看见的事。
+# 换判据表的合法理由：新增 / 删除一条判据、改门槛。
+CRITERIA_DIGEST = 'a8abdc61d8f3'
+
+
+def self_falsify(rows, bad):
+    """把判据表逐条打坏一遍，并检查没有令牌是「改了也不会让任何判据翻红」的。
+
+    为什么这道关是新的：原来只有两个**聚合**信号 ——
+    「负控复现数 ≥ 7」和「非文字负控全红」。它们量的是总数，
+    也就是说：**悄悄删掉一条判据，这个数一点都不会动。**
+    判据表能自我删减而不留痕迹 —— 这是比「某条判据写错了」更隐蔽的失效。
+
+    逐判据映射回答的正是「改一处色值会不会让它失去证明力」：
+    每一个令牌都至少参与一条判据，而每一条判据都至少被一个针对性突变打红。
+    """
+    ok = True
+    n_cascaded = 0
+
+    # ── (0) 判据表清单：表被动过没有？ ────────────────────────
+    import hashlib
+    canon = repr((TEXT_PAIRS, FILL_PAIRS, LINE_PAIRS))
+    digest = hashlib.sha256(canon.encode('utf-8')).hexdigest()[:12]
+    if digest != CRITERIA_DIGEST:
+        # ⚠️ 这里刻意**没有**「首次运行自动记下」那条路。
+        #    自动记 = 每次都绿 = 锚点不存在。锚点必须是文件里的一行字面量，
+        #    改它要过 review，那正是它存在的理由。
+        ok = False
+        bad.append(f'判据表变了但 CRITERIA_DIGEST 没同步：{CRITERIA_DIGEST} -> {digest}。'
+                   f'这是有意的摩擦 —— 请确认你确实要增删判据或改门槛，'
+                   f'然后把 tools/contrast_gate.py 里的 CRITERIA_DIGEST 一起改掉。')
+        print(f'  False 判据表指纹变了：{CRITERIA_DIGEST} -> {digest}')
+    else:
+        print('\n[criteria manifest] 判据表指纹未变（%s，%d 条判据）' % (digest, len(rows)))
+
+    # ── (A) 覆盖度：没有「改了也没用」的令牌 ──────────────────
+    covered = _covered_tokens(rows)
+    orphans = []
+    for dict_name, palette in (('INK', INK), ('BASE', BASE), ('ON', ON)):
+        for mode, values in palette.items():
+            for key in values:
+                if (dict_name, mode, key) not in covered:
+                    orphans.append(f'{dict_name}[{mode}][{key}]')
+    print('\n[self-falsification] 每个令牌都参与至少一条判据')
+    if orphans:
+        ok = False
+        bad.append(f'这些色值没有任何判据在量：{orphans} —— 改掉它们，闸门照样绿')
+        print('  False  全部令牌都被判据覆盖')
+    else:
+        print(f'  True  {len(covered)} 个 (dict, 模式, 键) 全被覆盖')
+
+    # ── (B) 逐判据可证伪 ────────────────────────────────────
+    print('\n[self-falsification] 每条判据都能被自己的突变打红')
+    for row in rows:
+        b2, i2, o2 = _mutate_row(row, BASE, INK, ON)
+        after_rows = evaluate(b2, i2, o2)
+        after = {_row_key(r): r for r in after_rows}
+        target = after.get(_row_key(row))
+        caught = target is not None and not target.ok
+        # 连带：改一个令牌常会连带打红别的判据（例如 warn 同时在 TEXT 与徽章里）。
+        # 这不是缺陷 —— 一条判据用到的令牌就该一起动。记下来是为了看得见。
+        cascaded = sum(1 for r in after.values()
+                       if r.ok is False and r.value < r.need
+                       and _row_key(r) != _row_key(row))
+        if cascaded:
+            n_cascaded += 1
+        print(f'  {caught!s:5} {row.kind:9} {row.mode:5} {row.a}/{row.b:12}'
+              f'  ({row.value:.2f} -> {target.value if target else float("nan"):.2f})')
+        if not caught:
+            ok = False
+            bad.append(f'判据 {row.kind} {row.mode} {row.a}/{row.b} 抓不住自己的突变 —— '
+                       f'它可能已经不量这一对了')
+    if ok:
+        print(f'  -> {len(rows)} 条判据全部能被自己打坏时抓住'
+              + (f'（{n_cascaded} 条判据的令牌同时喂给同组其它判据，'
+                 f'打坏一个会连带翻红——这正是覆盖度该有的样子）'
+                 if n_cascaded else ''))
+    return ok
+
+
 def show(tag, r, need, note, bad):
     ok = r >= need
     if not ok:
@@ -271,52 +436,30 @@ def main():
           f'  (not equal, but too close to tell apart by hue)\n')
 
     # ── 正控：新值必须全过 ──────────────────────────────────────
-    for mode in ('light', 'dark'):
-        print(f'[positive control] {mode}')
-        base = BASE[mode]
-        for fg, bg, need, note in TEXT_PAIRS:
-            show(mode, ratio(INK[mode][fg], base[bg]), need, note, bad)
-        for on, fill, need, note in FILL_PAIRS:
-            show(mode, ratio(ON[mode][on], INK[mode][fill]), need, note, bad)
-        # 非文字对比度：门槛是 3.0 而不是 4.5（WCAG 1.4.11）。
-        # 少了这一组，「品牌色当文字合格、当线条不合格」这类缺陷整套漏过去。
-        print('  -- non-text (WCAG 1.4.11, need 3.0)')
-        for fg, bg_name, note in LINE_PAIRS:
-            show(mode, ratio(INK[mode][fg], base[bg_name]), 3.0, note, bad)
+    # 置信度徽章那两级也在这里：高=实心 accent-ink / 中=软底 accent-ink /
+    # 低=软底 warn。⚠️ 量的是**两个不同通道** ——
+    #    填充明度承载「实心 vs 软底」，墨色色相承载「中 vs 低」。
+    #    一开始量错了（拿墨色去比明度比），而这套设计本来就不靠明度分级。
+    rows = evaluate(BASE, INK, ON)
+    for kind, head in (('text', 'WCAG 1.4.3  4.5:1'),
+                       ('fill', 'WCAG 1.4.3  4.5:1'),
+                       ('line', 'WCAG 1.4.11 3.0:1  (non-text)'),
+                       ('badge-lum', 'badge fill separation 3.0:1'),
+                       ('badge-de', 'badge hue separation ΔE>=20')):
+        print(f'[positive control] {head}')
+        for r in rows:
+            if r.kind != kind:
+                continue
+            flag = 'OK ' if r.ok else 'NG '
+            unit = '' if kind != 'badge-de' else ' dE'
+            print(f'  {r.mode:5} {flag} {r.value:5.2f}{unit} (need {r.need:g})  {r.note}')
+            if not r.ok:
+                bad.append(f'{r.mode} {r.kind} {r.a}/{r.b} = {r.value:.2f} (need {r.need:g})')
         print()
 
-    # ── 置信度徽章必须彼此可分 ───────────────────────────────────
-    # 高=实心 accent-ink / 中=软底 accent-ink / 低=软底 warn。
-    #
-    # ⚠️ 这里量的是**两个不同的通道**，一开始量错了：拿墨色去比 WCAG 明度比，
-    #    而这套设计本来就不是靠明度分级的。真正的分工是：
-    #      填充明度  承载「实心 vs 软底」这一级（用 WCAG 明度比量）
-    #      墨色色相  承载「中 vs 低」这一级（用 CIE ΔE 量，明度比在这里无意义，
-    #                因为两者的深浅本来就该接近，区别在色相）
-    # 两级都得分得开，徽章才在灰度和色觉障碍下都还读得出。
-    print('[badge separation] solid-vs-soft by luminance, mid-vs-low by hue')
-    for mode in ('light', 'dark'):
-        base = BASE[mode]
-        soft = INK[mode]['accent-soft']
-
-        # 通道一：实心填充 vs 软底填充，必须一眼看出「填没填」
-        for bg_name, bg_val, label in (
-            ('accent-soft', soft, 'solid vs medium-soft'),
-            ('warn-soft', INK[mode]['warn-soft'], 'solid vs low-soft'),
-        ):
-            r = ratio(INK[mode]['accent-ink'], bg_val)
-            flag = 'OK ' if r >= 3.0 else 'NG '
-            if r < 3.0:
-                bad.append(f'{mode} {label} fill not distinct enough ({r:.2f})')
-            print(f'  {mode:5} {flag} lum {r:5.2f} (need 3.0)  {label}')
-
-        # 通道二：中 vs 低的墨色色相。ΔE 20 是「一眼可辨」的保守门槛。
-        d = delta_e(INK[mode]['accent-ink'], INK[mode]['warn'])
-        flag = 'OK ' if d >= 20 else 'NG '
-        if d < 20:
-            bad.append(f'{mode} medium-vs-low ink hue too close (dE {d:.1f})')
-        print(f'  {mode:5} {flag} dE  {d:5.1f} (need 20)  medium-ink vs low-ink')
-        print()
+    # ── 自证伪：每条判据都必须能被自己打坏 ──────────────────────
+    if not self_falsify(rows, bad):
+        return 1
 
     if bad:
         print('FAIL:')
