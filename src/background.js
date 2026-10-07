@@ -128,6 +128,31 @@ const HANDLERS = {
     const idx = await r.buildIndex(st.ids || []);
     return { state: st, index: idx, unfinished: await r.hasUnfinished() };
   },
+  /**
+   * 批量读页面元数据（供分类链路复用）。
+   *
+   * ⚠️ 为什么单开一个而不是让面板逐条 send('linkRecord')：
+   *    分类每次预览都会跑，而 linkRecord 是一次消息往返。800 条书签
+   *    就是 800 次往返，且发生在 loadAndClassify 里 —— 那是面板**所有**
+   *    交互的入口，界面会卡住整整一秒以上。
+   *
+   *    这里一次拿回全部记录里真正需要的两个字段。
+   */
+  linkMeta: async () => {
+    const r = await import('./scan/runner.js');
+    const st = await r.getLinkState();
+    const ids = Array.isArray(st.ids) ? st.ids : [];
+    const out = {};
+    for (const id of ids) {
+      const rec = await r.getRecord(id);
+      if (!rec) continue;
+      const description = String(rec.description || '').trim();
+      const pageTitle = String(rec.pageTitle || '').trim();
+      if (!description && !pageTitle) continue; // 没抓到就不占传输
+      out[String(id)] = { description, pageTitle };
+    }
+    return { meta: out };
+  },
   linkResume: async () => {
     const r = await import('./scan/runner.js');
     await r.resumeLinkScan();

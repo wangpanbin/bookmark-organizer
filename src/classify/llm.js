@@ -232,7 +232,23 @@ export function buildPrompt(items, taxonomy, opts = {}) {
   ].join('\n');
 
   const user = items
-    .map((it, i) => `${i + 1}. key=${it.key}\n   url=${it.url}\n   title=${it.title || '(无标题)'}`)
+    .map((it, i) => {
+      const lines = [`${i + 1}. key=${it.key}`, `   url=${it.url}`];
+      lines.push(`   title=${it.title || '(无标题)'}`);
+      // ⚠️ 页面描述只在**真的抓到**时才带。
+      //    链接健康探测（link-scan）早就把 description 存进 storage 了，
+      //    分类链路只是从没读过它 —— 复用它不需要新增任何网络请求。
+      //
+      //    这是准确率提升最大的一处：URL 与标题说不清的东西，
+      //    一句「官方文档，讲 React Hooks 的用法」能说清。
+      //
+      //    空串绝不能传：模型会把「空描述」读成「这个页面没有描述信息」，
+      //    而实际情况是「我们没抓到」。这两者对判读的影响完全不同，
+      //    前者会让模型更没把握，后者至少还有 URL 和标题可依据。
+      const d = String(it.description || '').trim();
+      if (d) lines.push(`   desc=${d}`);
+      return lines.join('\n');
+    })
     .join('\n');
 
   return { system, user };

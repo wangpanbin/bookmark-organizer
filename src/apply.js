@@ -50,6 +50,38 @@ export function currentRunToken() {
 const YIELD_EVERY = 1;
 const YIELD_MS = 0;
 
+/**
+ * 「等用户确认」态：低置信条目在本轮**不动**。
+ *
+ * ⚠️ 为什么低置信默认不执行：面板早就把低置信标黄了，也给了「只看低置信」
+ *    的筛选，但**标黄不拦人** —— 用户不筛就点执行，低置信和高置信会被
+ *    无差别批量搬走。界面给了信号，执行侧却没接，等于没有闸门。
+ *
+ *    「未分类」那一批兜底桶同样是 low，此前被静默搬进「其他/待归类」——
+ *    用户看到的是「整理完成 100%」，而那些条目其实是被硬塞的。
+ *
+ *    精确优先：这条的坏处是「你得自己动手搬」，而误执行的坏处是
+ *    「书签被搬到错的地方、且从界面上看不出来已被搬走」。
+ */
+const AWAITING_CONFIRM = 'awaiting-confirm';
+
+/**
+ * 低置信的判据。改这一处即可调整闸门松紧。
+ *
+ * ⚠️ 导出给测试直接断言它的**行为**，不是它的名字。
+ *    早先只写了一条静态扫描断言 `applySrc.includes('needsConfirm(')` ——
+ *    把函数体改成 `return false`（即闸门完全失效）后，那条断言照样绿。
+ *    名字在、调用在、检查在，唯独判据被掏空了。静态扫描能守顺序与落点，
+ *    守不了语义；语义必须由行为断言守。tests/unit/low-confidence-gate.test.js
+ *    两条都有。
+ *
+ * @param {{confidence?:string}|null|undefined} item
+ * @returns {boolean}
+ */
+export function needsConfirm(item) {
+  return !!item && item.confidence === 'low';
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 任务进度摘要（写进 storage，供 UI 轮询） */
@@ -63,6 +95,17 @@ function summarize(task) {
     skipped: items.filter((i) => i.status === 'skipped').length,
     failed: items.filter((i) => i.status === 'failed').length,
     pending: items.filter((i) => i.status === 'pending').length,
+    /**
+     * 低置信、**这一轮没有被执行**的条目。
+     * ⚠️ 这个数必须露在报告里，不能静默吞掉：它们停在原位是**有意的**
+     *    行为（低置信默认不自动搬），不是失败也不是跳过。若界面上
+     *    不说，用户会以为「整理完成 100%」等于所有条目都被处理过了
+     *    —— 而实际上有 N 条根本没动。
+     */
+    awaitingConfirm: items.filter((i) => i.status === AWAITING_CONFIRM).length,
+    awaitingConfirmList: items.filter((i) => i.status === AWAITING_CONFIRM)
+      .slice(0, 50)
+      .map((i) => ({ id: i.id, title: i.title, url: i.url, to: i.toStr || '', confidence: i.confidence })),
     failedList: (task.failed || []).slice(0, 50),
     /**
      * 这一轮因为「不在清单里」而没有动的条目。
@@ -547,6 +590,23 @@ async function run() {
       // ⚠️ 每一轮都重算：任务可能被暂停后恢复，也可能被别的预览换了 task。
       const allowed = allowedIdSet(task);
       const items = task.plan.items || [];
+
+      // ⚠️⚠️ 低置信闸门。位置在动手之前、在取 next 之前：
+      //    先把这一轮所有仍 pending 的低置信项转成 awaiting-confirm，
+      //    它们就永远不会进入下面的 move() 循环。
+      //
+      //    为什么改状态而不是从 find 里过滤：
+      //    · 状态**落盘**（persistItem → task payload），MV3 SW 被回收后
+      //      续跑是**新进程**从 storage 读回 task 的，只在内存里过滤的话
+      //      「这批要确认」这个决定会在回收时丢。
+      //    · 用户在报告里能看见这些条目确实被挂起了，而不是凭空消失。
+      //
+      //    幂等：已转过态的不是 pending，天然不会被重复处理。
+      const lowPending = items.filter((i) => i.status === 'pending' && needsConfirm(i));
+      for (const it of lowPending) {
+        await persistItem(it.id, { status: AWAITING_CONFIRM, reason: 'awaiting-user-confirm' }, {});
+      }
+
       const next = items.find((i) => i.status === 'pending');
       if (!next) {
         // 计划项跑完 → 接着处理待删的重复项

@@ -306,12 +306,13 @@ test('用户自建类目树也能工作', () => {
 
 // ───────────────────── LLM 选择 ─────────────────────
 
-test('selectForLlm 只挑未命中且未锁定的条目', () => {
+test('selectForLlm 挑出「没人判过」与「多用途站被降级」两类条目', () => {
   const entries = [
-    B('1', 'https://github.com/a'),            // 规则命中 → 不问
+    B('1', 'https://github.com/a'),            // 规则命中但站点多用途 → 要复核
     B('2', 'https://unknown-aa-9911.net/q'),   // 未命中 → 要问
     B('3', 'https://unknown-bb-9922.net/q'),   // 未命中但被锁 → 不问
     B('4', 'chrome://extensions'),             // 排除项 → 不问
+    B('5', 'https://reactjs.org/docs/x'),      // 权威站 → 不问（high，不需复核）
   ];
   const plan = buildPlan({
     entries,
@@ -319,7 +320,31 @@ test('selectForLlm 只挑未命中且未锁定的条目', () => {
     locks: ['https://unknown-bb-9922.net/q'],
   });
   const sel = selectForLlm(plan, entries, ['https://unknown-bb-9922.net/q']);
-  assert.deepEqual(sel.map((s) => s.id), ['2']);
+  // ⚠️ 早先这条断言是 ['2']，那是「只挑未命中」的旧契约。
+  //    现在 github.com 被 authority 降为 medium，必须送 AI 复核 ——
+  //    否则「多用途站点降级」在链路上等于没发生：降了级却没人消费这个 medium，
+  //    条目仍以原来的（猜出来的）类目被直接搬走。
+  assert.deepEqual(sel.map((s) => s.id).sort(), ['1', '2']);
+});
+
+test('⚠️ 权威站不该被反复送问 AI —— 那是一次没有信息增益的外发', () => {
+  const entries = [
+    B('5', 'https://reactjs.org/docs/hooks'),
+    B('6', 'https://developer.mozilla.org/en-US/docs/Web'),
+  ];
+  const plan = buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY });
+  assert.equal(selectForLlm(plan, entries, []).length, 0,
+    '站点性质唯一的官方文档站，词典的 high 是真的，不必复核');
+});
+
+test('⚠️ 多用途站的 reason 仍是 rule:domain，只是 confidence 降了', () => {
+  // 消费方按 reason 筛选，必须确保「降级」不会让这些条目从计划里消失。
+  const entries = [B('1', 'https://github.com/vuejs/core')];
+  const plan = buildPlan({ entries, taxonomy: DEFAULT_TAXONOMY });
+  const item = plan.items.find((i) => i.id === '1');
+  assert.equal(item.reason, 'rule:domain');
+  assert.equal(item.confidence, 'medium');
+  assert.equal(item.toStr, '开发与技术/代码托管', '降级不得改变分类结果');
 });
 
 // ═══════════════════════════════════════════════════════════════

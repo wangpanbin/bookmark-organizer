@@ -22,6 +22,7 @@ import {
   launchWithExtension, openPanel, seedBookmarks, treeSignature,
   makeFixtures, makeDuplicateFixtures, makeVetoFixtures, runPreview, readStats, readReportStatus,
   waitForExecutionDone, waitForPartialProgress, waitForReportStatus, cleanupAll,
+    countExecutableRows, countLowPendingRows,
 } from './harness.js';
 
 process.on('exit', cleanupAll);
@@ -91,17 +92,56 @@ test('幂等：执行后重新预览应产生 0 变更', async () => {
     // 重新预览：应该全部已在位
     await runPreview(page);
     const s2 = await readStats(page);
-    assert.equal(Number(s2.move), 0, `二次预览仍有 ${s2.move} 条待移动 —— 幂等被破坏`);
-    // ⚠️ 「没动」现在有两类，2026-10-07 起必须分开数：
+    // ⚠️⚠️ 2026-10-08：这条断言的**口径变了**，不是夹具漂移。
+    //
+    //    原来的判据是「二次预览 move 必须为 0」，隐含假设是
+    //    「所有待移动条目都会在执行时被搬走」。低置信闸门打破了这个假设：
+    //    confidence=low 的条目**本轮不会被执行**，所以它们执行完仍在原位，
+    //    二次预览当然还显示待移动。
+    //
+    //    那不是幂等被破坏 —— 幂等的真实含义是「再跑一次不会再动一次」。
+    //    低置信条目本来就没动过，自然也不会被重复搬。
+    //
+    //    所以判据改成：**二次预览里那些会被执行的条目必须为 0**，
+    //    即读「只看将要移动的」表里非低置信的条数。
+    const stillExecutable = await countExecutableRows(page);
+    assert.equal(
+      stillExecutable, 0,
+      `二次预览仍有 ${stillExecutable} 条会被执行的条目 —— 幂等被破坏`,
+    );
+    // ⚠️ 必须真的检查 lowKept。
+    //    早先这里写的是 `assert.ok(Number(s2.move) > 0, '夹具里一条低置信都没有…')`，
+    //    而 move 是「所有待移动条目」—— 它为 0 才能证明上一条 assert 成立。
+    //    于是这条注释声称的「确认闸门确实拦下了东西」根本没被验证：
+    //    一个把所有条目都标成 high 的实现，这道用例照样全绿
+    //    （那样 lowKept=0，闸门形同虚设，却没有任何判据抓住）。
+    const lowKept = await countLowPendingRows(page);
+    assert.ok(
+      lowKept > 0,
+      `夹具里一条低置信都没有（实际 ${lowKept} 条），这道闸门就没被测到 —— `
+      + '可能所有条目都被标成了 high',
+    );
+    // ⚠️ 「没动」有两类，2026-10-07 起必须分开数：
     //    inPlace = 规则判它该在那个位置；
     //    unclassified = 还躺在「其他/待归类」里、压根没被判过。
     //    早先只有 inPlace 一个口径，于是未归类的条目被算进「已在位」，
     //    而它们恰恰是**还没整理好**的那批 —— 这是完整性契约要消灭的东西。
-    assert.equal(Number(s2.move), 0, '待移动必须为 0');
+    //
+    // ⚠️⚠️ 低置信**不能**再加进这个等式（2026-10-08）：
+    //    「未归类」与「低置信挂起」是**同一批**条目的两个视角，不是两批。
+    //    早先把它当第三类加进去，等式变成 19+21+21=61 ≠ 40 —— 超计。
+    //    「未分类」是**位置**（还在不在待归类桶里），
+    //    「低置信」是**置信度**（判得够不够格自动执行），两者正交。
     assert.equal(
       Number(s2.inPlace) + Number(s2.unclassified),
       Number(s2.total),
       `不是全部条目都有结论：inPlace=${s2.inPlace} + unclassified=${s2.unclassified} ≠ total=${s2.total}`,
+    );
+    // 低置信数必须是「未分类」的真子集：它们都还在待归类桶里，
+    // 不可能出现「一条低置信不在未分类里」—— 那说明口径串了。
+    assert.ok(
+      lowKept <= Number(s2.unclassified),
+      `低置信挂起 ${lowKept} 条不该多于未分类 ${s2.unclassified} 条`,
     );
   } finally {
     await ctx.close();

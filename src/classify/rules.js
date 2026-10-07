@@ -13,6 +13,8 @@
  */
 
 import { hostOf, pathQueryOf, isExcludedUrl } from '../normalize.js';
+import { matchLearned } from './learned.js';
+import { confidenceForDomain } from './authority.js';
 
 /**
  * @typedef {Object} Rule
@@ -118,16 +120,34 @@ export function matchRule(entry, compiled, learned = []) {
   };
   if (facts.host === '') return null;
 
-  // 0. learned —— 人工反馈优先级最高。数量少（只来自用户改判），线性扫描代价可忽略。
-  for (const rule of learned) {
-    if (hitLevel(rule, facts)) {
-      return { to: rule.to, reason: 'learned', confidence: 'high' };
-    }
-  }
+  // 0. learned —— 人工反馈优先级最高。
+  //
+  // ⚠️⚠️ 这里**必须**走 learned.js 的 matchLearned，**不得**改用下面的 hitLevel。
+  //
+  //    两种语义是相反的，而且是各自必需：
+  //      · 预置词典（hitLevel）：一条规则内各条件是**或**。dict.js 里
+  //        「github.com + 中文品牌名」写在同一条规则里是常态，改成「且」
+  //        会让命中率从 90.3% 塌到接近 0。
+  //      · learned 规则：必须是**精确**语义。历史上这里误用了或语义，
+  //        而 buildLearnedRule 产出的 `{domains:[host], pathWords:[path]}`
+  //        里 pathWords 从来没被检查过 —— 改判一条 github.com 书签，
+  //        整站 github.com 书签全被改道且标成 high。详见 learned.js 顶部。
+  //
+  //    两套语义不合并、不互相「统一」。tests/unit/learned.test.js 钉住这条线。
+  const learnedHit = matchLearned({ url: entry.url, title: entry.title }, learned);
+  if (learnedHit) return learnedHit;
 
   // 1. domain 精确
+  //
+  // ⚠️ 置信度不再一律 high —— 「我确信这是 github.com」和「我确信它该进
+  //    代码托管」是两件事。同一域名下可能是别人的教程、issue、数据集、
+  //    公司主页。而多用途站点标 high 会让低置信闸门（apply.js 的
+  //    needsConfirm）形同虚设：这些条目全标 high，直接被批量搬走。
+  //    见 authority.js 的文件头。
   const exact = compiled.domainMap.get(facts.host);
-  if (exact) return { to: exact.to, reason: 'rule:domain', confidence: 'high' };
+  if (exact) {
+    return { to: exact.to, reason: 'rule:domain', confidence: confidenceForDomain(facts.host) };
+  }
 
   // 2. domain 后缀（按点边界）
   for (const rule of compiled.suffixRules) {

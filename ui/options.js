@@ -14,6 +14,8 @@ import { listRoots, pickRootKey, resolveRoot } from '../src/roots.js';
 import { findDuplicates, toRemovalList, dedupeStats } from '../src/dedupe.js';
 import { buildPlan, setRules, selectForLlm, REASON, RESOLUTION_ACCEPT_UNCLASSIFIED } from '../src/plan.js';
 import { DEFAULT_RULES } from '../src/classify/dict.js';
+import { buildUrlRule, promoteToDomain, scopeOf } from '../src/classify/learned.js';
+import { buildSnapshot, evaluate, trend } from '../src/classify/metrics.js';
 import {
   getTaxonomy, isKnownPath, fallbackPath, allPaths, pathString, DEFAULT_TAXONOMY,
 } from '../src/classify/taxonomy.js';
@@ -71,6 +73,7 @@ const state = {
   snapshotTs: null,
   llmErrors: [],
   picked: null, // 当前正在改判的条目
+  bulk: false, // 同一个分类选择器被「批量改判」打开时为 true
   seq: 0,       // 渲染完成计数，供 E2E 判断「这一轮真的跑完了」
 
   // ── 手动范围（F4）──
@@ -345,12 +348,29 @@ async function loadAndClassify(opts) {
   //    用户接着点「执行整理」——执行器忠实地把书签搬到**旧分类**里去，
   //    看起来就是「分类没按我改的来」。
   //    LLM 是兜底，兜底坏了应该降级成「纯规则分类」，而不是拖垮主流程。
+  // 页面元数据：link-scan 早就落盘了，这里只读复用一次。
+  // ⚠️ 走 refreshLinkMeta（带 try/catch）而不是直接 await send()：
+  //    这一段在 loadAndClassify 里，它抛错会把整个分类流程带崩，
+  //    界面停在旧数据上还不报错，而用户接着点执行就会把书签搬到旧分类里。
+  if (settings.llmEnabled && !linkMetaCache) await refreshLinkMeta();
+
   state.llmErrors = [];
   if (settings.llmEnabled) {
     try {
-      const todo = selectForLlm(plan, planEntries, locks);
+      // 页面元数据（description）是 link-scan 早就落盘的东西，这里**只读复用**。
+      // ⚠️ 不新增网络请求：拿不到就静默降级成「只有 URL 和标题」。
+      //    linkScanEnabled 默认关闭，多数用户第一轮拿不到 —— 那不是错误。
+      const metaById = readLinkMeta();
+      const todo = selectForLlm(plan, planEntries, locks, { metaById });
+      // ⚠️ 如实记录有多少条真的带上了描述（AGENTS.md 约束 8：
+      //    界面不许承诺做不到的事）。覆盖率低时用户会知道
+      //    「精度提升有限是因为没跑过链接健康检测」，而不是一头雾水。
+      const withDesc = todo.filter((t) => t.description).length;
+      state.llmMetaCoverage = { total: todo.length, withDesc };
       if (todo.length) {
-        busy(`LLM 兜底分类中（${todo.length} 条待判）…`);
+        busy(withDesc
+          ? `LLM 兜底分类中（${todo.length} 条待判，${withDesc} 条带页面描述）…`
+          : `LLM 兜底分类中（${todo.length} 条待判）…`);
         const res = await classifyBatch(todo, {
           taxonomy: state.taxonomy,
           settings,
@@ -425,6 +445,10 @@ async function loadAndClassify(opts) {
   state.dupPayload = scoped ? [] : dupPayload;
 
   state.plan = plan;
+  // 每轮预览写一份准确率快照。
+  // ⚠️ 只在**真正重新分类**时写，不在每次 UI 重渲染时写 ——
+  //    否则同一轮会被记成几十轮，改判率的分母被稀释成一个漂亮的假数字。
+  await recordSnapshot(plan);
   // ⚠️ count 用的是「本轮真会动的条数」，不是清单总数。
   //    清单里还躺着 done / stale 的条目，拿总数当范围报出去会虚高，
   //    用户核对「清单外 N 条」时两个数字对不上，整颗芯片就失去意义了。
@@ -1393,6 +1417,27 @@ function renderPlan() {
       : '';
   }
 
+  // 低置信闸门的如实告知（AGENTS.md 约束 8：界面不许承诺做不到的事）。
+  // 这些条目本轮**不会被执行**，停在原地。
+  //
+  // ⚠️⚠️ 这里**不能写「需逐条确认」** ——
+  //    早先那版文案就是这么写的，而全仓库**没有任何代码**把
+  //    `awaiting-confirm` 放回执行队列。写着「需逐条确认」而用户根本点不了，
+  //    是约束 8 明令禁止的那种「界面承诺一件永远不会发生的事」。
+  //
+  //    真正的出口是**改判**：把它选对分类 → 置信变 high → 下轮直接执行。
+  //    所以这里只陈述既成事实，把出路指向一个真能走的动作。
+  const gateNote = $('awaitingConfirmNote');
+  if (gateNote) {
+    const items = state.plan.items || [];
+    const lowTotal = items.filter((i) => i.status === 'pending' && i.confidence === 'low').length;
+    const heldTotal = items.filter((i) => i.status === 'awaiting-confirm').length;
+    const n = Math.max(lowTotal, heldTotal);
+    gateNote.textContent = n
+      ? `${n} 条低置信不会自动移动；改判后会按新分类执行`
+      : '';
+  }
+
   // 筛选后一条不剩时不能只剩一张空表头。此前这里直接往下走，
   // 结果是一张有表头、零行的表 —— 用户看不出是筛没了还是没数据。
   if (!rows.length) {
@@ -1495,7 +1540,25 @@ function renderPlan() {
     fb.append(ok, bad);
     tdFb.append(fb);
 
-    tr.append(tdLock, tdItem, tdFrom, tdArrow, tdTo, tdWhy, tdFb);
+    // 批量改判的选择列。
+    // ⚠️ 必须放在**最后一列**：E2E 有多处按 `tr.querySelectorAll('td')`
+    //    的下标取单元格（td[1] 是书签列）。插在最前面会把所有下标移位，
+    //    症状是「E2E 全绿但断言读到了错位的列」——比直接报错更难查。
+    const tdPick = document.createElement('td');
+    tdPick.className = 'c-pick';
+    const pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.checked = bulkPicked.has(String(it.id));
+    pick.title = '选中后可批量改判';
+    pick.setAttribute('aria-label', `选中以便批量改判：${it.title || it.url || ''}`);
+    pick.addEventListener('change', () => {
+      if (pick.checked) bulkPicked.add(String(it.id));
+      else bulkPicked.delete(String(it.id));
+      renderBulkBar();
+    });
+    tdPick.append(pick);
+
+    tr.append(tdLock, tdItem, tdFrom, tdArrow, tdTo, tdWhy, tdFb, tdPick);
     frag.append(tr);
   }
   body.append(frag);
@@ -1751,32 +1814,52 @@ async function renderReport() {
 /**
  * 从一次改判沉淀出一条 learned rule。
  *
- * ⚠️ 粒度必须收窄：不能因为用户纠正了一条 github.com 书签，
- *    就把所有 github.com 书签都改道。所以：
- *      有具体路径 → domains + pathWords（只命中那一个页面）
- *      根路径但有标题 → domains + titleWords
- *      都没有 → 才退到纯域名（此时用户是明确在指正这个站点）
+ * ⚠️⚠️ 这里必须产出 **URL 精确** 规则（`scope:'url'`）。
+ *
+ *    本函数早先产出的是 `{ to, domains:[host], pathWords:[pathname] }`，
+ *    并注释「有具体路径 → domains + pathWords（只命中那一个页面）」。
+ *    **那句承诺从未成立**：rules.js 的 hitLevel 对一条规则内各条件是**或**关系，
+ *    `domains` 命中即 return，`pathWords` 从来没被检查过。实测改判
+ *    github.com/ruanyf/blog 之后，vuejs/core、tailwindcss、explore/trending
+ *    全部被判成同一类且标 confidence: high（learned 优先级最高，压过词典）。
+ *    用户越纠正，整站错得越整齐。
+ *
+ *    现在改为直接存归一化后的 URL 全串，由 learned.js 的精确语义匹配。
+ *    升到域级需要同域同 `to` 攒够 PROMOTE_AFTER 次一致改判 —— 精确那一侧
+ *    是安全侧（判错的最坏后果只是这条走回词典，域级误判则整站被改道）。
+ *
+ * @param {{url:string, title?:string}} entry
+ * @param {string[]} toPath
  */
 function buildLearnedRule(entry, toPath) {
-  const to = pathString(toPath);
-  const host = hostOf(entry.url);
-  const u = parseUrl(entry.url);
-  const pathname = u ? (u.pathname || '/') : '/';
-  if (host && pathname && pathname !== '/') {
-    return { to, domains: [host], pathWords: [pathname] };
-  }
-  if (host && entry.title && String(entry.title).trim()) {
-    return { to, domains: [host], titleWords: [String(entry.title).trim()] };
-  }
-  return { to, domains: host ? [host] : [], titleWords: entry.title ? [String(entry.title).trim()] : [] };
+  return buildUrlRule(entry.url, pathString(toPath));
 }
 
 function sameRuleShape(a, b) {
   const eq = (x, y) => JSON.stringify(x || []) === JSON.stringify(y || []);
-  return eq(a.domains, b.domains) && eq(a.pathWords, b.pathWords) && eq(a.titleWords, b.titleWords);
+  return scopeOf(a) === scopeOf(b) && eq(a.urls, b.urls)
+    && eq(a.domains, b.domains) && eq(a.pathWords, b.pathWords) && eq(a.titleWords, b.titleWords);
 }
 
-async function markWrong(itemId, toPath) {
+/**
+ * 改判一条书签。
+ *
+ * @param {string} itemId
+ * @param {string[]} toPath
+ * @param {{quiet?:boolean, noPromote?:boolean}} [opts]
+ *        quiet=true 时不重载、不弹 toast —— 批量改判逐条调用本函数，
+ *        否则 50 条就是 50 次全量重算分类（每次都要重读树、重跑规则，
+ *        可能还会触发 LLM）。重载与提示由 bulkAssign 在循环结束后统一做一次。
+ *
+ *        noPromote=true 时**不**尝试晋升为域级规则。
+ *        ⚠️ 这一条是硬要求：批量改判一次动的是用户**一次性勾选的若干条**，
+ *          而晋升的语义是「用户反复单独确认过这个站属于这一类」。
+ *        两者是不同的证据。让批量勾 3 条同域书签就升域级，
+ *        正是 learned 污染整站那个 bug 的形态 —— 用户一次批量操作，
+ *        整站被改道且从界面上看不出来。
+ *        spec 明确写「批量改判产生的 learned 规则一律 scope:'url'」。
+ */
+async function markWrong(itemId, toPath, opts = {}) {
   const entry = state.byId.get(itemId);
   if (!entry) return;
   const key = dedupeKey(entry.url);
@@ -1787,13 +1870,108 @@ async function markWrong(itemId, toPath) {
   // 1) 本次立即生效
   await mutate(K.MANUAL_ASSIGNMENTS, (m) => ({ ...(m || {}), [key]: to }), {});
   // 2) 沉淀成规则，下次直接命中（learned 优先级高于预置词典）
+  //
+  //    晋升判定在 mutate fn **内部**做：读到的必须是临界区里的当前值，
+  //    跨临界区读一次再写回去会丢更新（AGENTS.md 约束 2）。
+  //    同域同 to 攒够 PROMOTE_AFTER 次一致改判才升级为域级规则。
   await mutate(K.RULES_LEARNED, (rs) => {
     const rule = buildLearnedRule(entry, toPath);
-    return [...(rs || []).filter((r) => !sameRuleShape(r, rule)), rule];
+    const merged = [...(rs || []).filter((r) => !sameRuleShape(r, rule)), rule];
+    // 批量路径不晋升：一次勾选不等于反复确认。
+    if (opts.noPromote) return merged;
+    const host = hostOf(entry.url);
+    // 晋升失败时保持精确语义，不回退已有规则 —— 精确是安全侧。
+    return promoteToDomain(merged, host, to).learned;
   }, []);
 
+  if (opts.quiet) return;
+  await recordReassign(1);
   await safeReload();
   toast(`已改到「${to}」，并记为规则`);
+}
+
+/**
+ * 记录一轮预览的准确率快照。
+ *
+ * ⚠️ 同一份计划**只记一次**：loadAndClassify 会在改判、锁定、切换页签等
+ *    场合被反复调用，每次都写一条的话，改判率的分母会被稀释成
+ *    一个漂亮的假数字（同一轮被记成几十轮）—— 那比没有度量更糟。
+ *    判据是 (total, planned) 与上一条完全一致且期间没有改判。
+ *
+ * 保留最近 20 轮：够看趋势，又不会把 storage 撑大。
+ */
+const STATS_HISTORY_MAX = 20;
+let lastSnapshotKey = '';
+let lastSnapshotHadReassign = false;
+
+async function recordSnapshot(plan) {
+  const stats = (plan && plan.stats) || {};
+  const key = `${stats.total || 0}:${stats.planned || 0}`;
+  if (key === lastSnapshotKey && !lastSnapshotHadReassign) return;
+  lastSnapshotKey = key;
+  lastSnapshotHadReassign = false;
+
+  const byConfidence = {};
+  for (const i of (plan && plan.items) || []) {
+    if (i.status !== 'pending') continue;
+    const c = i.confidence || 'low';
+    byConfidence[c] = (byConfidence[c] || 0) + 1;
+  }
+  const snap = buildSnapshot(stats, 0, Date.now());
+  snap.byConfidence = byConfidence;
+
+  await mutate(K.STATS, (s) => {
+    const list = Array.isArray(s && s.history) ? s.history : [];
+    return { history: [...list, snap].slice(-STATS_HISTORY_MAX) };
+  }, { history: [] });
+  state.metricsSnapshot = snap;
+  renderMetrics();
+}
+
+/**
+ * 准确率面板。
+ *
+ * ⚠️ 样本不足时必须**说清是样本不足**，而不是显示一个「0.0%」，
+ *    也不能因为没数据就不显示 —— 「界面承诺一件永远不会发生的事，
+ *    比功能缺失更伤」（AGENTS.md 约束 8）。这里反过来说：
+ *    界面不许显示一个它无法支撑的准确率。
+ */
+function renderMetrics() {
+  const box = $('metricsNote');
+  if (!box) return;
+  const snap = state.metricsSnapshot;
+  if (!snap) { box.textContent = ''; return; }
+  const ev = evaluate(snap);
+  const pct = (snap.reassignRate * 100).toFixed(1);
+  box.textContent = snap.enough
+    ? `上一轮改判率 ${pct}%（${snap.reassigned}/${snap.planned}）· ${ev.reason}`
+    : `样本不足：上一轮 ${snap.planned} 条待移动，尚不足以评估准确率`;
+}
+
+/**
+ * 记录一次改判，让准确率度量有据可依。
+ *
+ * ⚠️ 这是「下一轮会更准」这个假设**唯一**能被证实或证伪的地方。
+ *    没有它，改判率恒为 0，而一个恒为 0 的指标看起来像「准确率满分」。
+ *
+ *    计数按「本轮预览」分组：改判必然发生在某次预览之后，
+ *    所以把它挂到**最近一次快照**上，而不是新开一轮。
+ *
+ * @param {number} n 本次改判了几条（批量时一次上报 N）
+ */
+async function recordReassign(n) {
+  if (!n) return;
+  // 下一轮即便 (total, planned) 没变也要记账：改判已经发生，
+  // 若这里不标记，去重判据会把这次改判直接吞掉。
+  lastSnapshotHadReassign = true;
+  await mutate(K.STATS, (s) => {
+    const list = Array.isArray(s && s.history) ? s.history : [];
+    if (!list.length) return { history: list }; // 没有快照可挂，不凭空造一轮
+    const last = { ...list[list.length - 1] };
+    last.reassigned = (last.reassigned || 0) + n;
+    last.reassignRate = last.planned > 0 ? last.reassigned / last.planned : 0;
+    return { history: [...list.slice(0, -1), last] };
+  }, { history: [] });
 }
 
 async function markRight(itemId) {
@@ -1805,7 +1983,9 @@ async function markRight(itemId) {
   const rule = buildLearnedRule(entry, it.toPath);
   await mutate(K.RULES_LEARNED, (rs) => {
     if ((rs || []).some((r) => r.to === rule.to && sameRuleShape(r, rule))) return rs || [];
-    return [...(rs || []), rule];
+    const merged = [...(rs || []), rule];
+    // 与 markWrong 走同一套晋升判定，两条路口径必须一致。
+    return promoteToDomain(merged, hostOf(entry.url), rule.to).learned;
   }, []);
   it.confidence = 'high';
   renderPlan();
@@ -1825,11 +2005,14 @@ async function toggleLock(itemId, on) {
   toast(on ? '已锁定，这条不会被移动' : '已解锁');
 }
 
-function openPicker(itemId) {
-  state.picked = itemId;
-  const entry = state.byId.get(itemId);
-  $('pickerTarget').textContent = `${entry?.title || ''}　${entry?.url || ''}`;
-
+/**
+ * 填分类选择器的列。
+ *
+ * ⚠️ 单条改判与批量改判**共用这一份**。
+ *    复制第二份的话，将来类目树的渲染方式一变（比如加第三层），
+ *    只有一条路径会跟着改，另一条悄悄过期 —— 而且测试照样全绿。
+ */
+function renderPickerColumns() {
   const cols = $('pickerCols');
   cols.textContent = '';
   for (const top of state.taxonomy) {
@@ -1849,6 +2032,14 @@ function openPicker(itemId) {
     }
     cols.append(col);
   }
+}
+
+function openPicker(itemId) {
+  state.picked = itemId;
+  state.bulk = false;
+  const entry = state.byId.get(itemId);
+  $('pickerTarget').textContent = `${entry?.title || ''}　${entry?.url || ''}`;
+  renderPickerColumns();
   $('pathPicker').showModal();
 }
 
@@ -2422,6 +2613,116 @@ import { faviconUrlFor } from '../src/scan/extract-meta.js';
 let linkState = null;
 let linkIndex = null;
 let linkRecords = [];
+/**
+ * 读 link-scan 已落盘的页面元数据，供分类时复用。
+ *
+ * ⚠️ 这是**只读复用**：link-scan 早就把 pageTitle / description 存进 storage 了
+ *    （见 src/scan/runner.js 的 rec 构造），分类链路只是从没读过它。
+ *    **不新增任何网络请求**。
+ *
+ * ⚠️ 拿不到就返回空对象，静默降级成「只有 URL 和标题」：
+ *    linkScanEnabled 默认关闭，从没跑过链接健康检测的用户本来就没有描述。
+ *    那不是错误，是正常状态 —— 不该报错，也不该拖垮分类。
+ *
+ * @returns {Object<string,{description?:string,pageTitle?:string}>} 书签 id → 元数据
+ */
+let linkMetaCache = null;
+function readLinkMeta() {
+  return linkMetaCache || {};
+}
+
+async function refreshLinkMeta() {
+  try {
+    const res = await send('linkMeta');
+    linkMetaCache = (res && res.ok && res.result && res.result.meta) || {};
+  } catch {
+    linkMetaCache = {}; // 拿不到就用空，不影响主流程
+  }
+  return linkMetaCache;
+}
+
+/**
+ * 批量改判：被勾选的条目 id（按字符串存，与 plan item 的 id 一致）。
+ *
+ * ⚠️ 用 Set 存字符串而不是数组：行是每次 renderPlan 重建的，
+ *    勾选状态要跨重建保留；而 id 在数值/字符串之间摇摆过，
+ *    统一成 String 才不会「勾上又自己取消了」。
+ */
+const bulkPicked = new Set();
+
+/** 顶部批量操作条的显隐与计数。没选中就整个藏起来，不占视觉重量。 */
+function renderBulkBar() {
+  const bar = $('bulkBar');
+  if (!bar) return;
+  const n = bulkPicked.size;
+  bar.hidden = n === 0;
+  const cnt = $('bulkCount');
+  if (cnt) cnt.textContent = `已选 ${n} 条`;
+  const all = $('pickAll');
+  // 全选的勾选态按「可见行里是否全选」实时回显
+  if (all) {
+    const ids = bulkPickableIds();
+    all.checked = ids.length > 0 && ids.every((id) => bulkPicked.has(id));
+    all.indeterminate = !all.checked && ids.some((id) => bulkPicked.has(id));
+  }
+}
+
+/** 当前**可见**行里可被批量改判的 id（跟着筛选走，不含已跳过/已完成的） */
+function bulkPickableIds() {
+  const items = (state.plan && state.plan.items) || [];
+  return items.filter((i) => i.status === 'pending' && i.url).map((i) => String(i.id));
+}
+
+/**
+ * 批量改判：把选中的条目一次性改到指定类目。
+ *
+ * ⚠️ 每一条**各自**走一遍 markWrong 的双写路径（MANUAL_ASSIGNMENTS +
+ *   RULES_LEARNED），而不是自己另写一套批量写入：
+ *   · 逐条更新让度量能收到 N 次改判信号（不是 1 次）；
+ *   · 批量路径上写错一条，其余 N-1 条照样成功。
+ *
+ * ⚠️ 产生的 learned 规则一律 scope:'url'（buildLearnedRule 的默认），
+ *   并且**不触发域级晋升**（对 markWrong 传 noPromote:true）。
+ *   **绝不能因为「一次改了一堆」就升级成域级** —— 那正是 learned
+ *   污染整站那个 bug 的形态：一次批量勾选就让整站被改道，且界面上看不出来。
+ *   晋升只认用户**逐条单独**改判攒出来的证据，那是 learned.js 的
+ *   PROMOTE_AFTER 阈值负责的事。
+ */
+async function bulkAssign(toPath) {
+  const ids = [...bulkPicked];
+  if (!ids.length || !toPath) return;
+  let ok = 0;
+  for (const id of ids) {
+    // quiet：循环内不重载。50 条 = 50 次全量重算分类，且每次都可能触发
+    // LLM 请求 —— 那不是「慢一点」，是把一次批量操作变成几十次外发。
+    //
+    // noPromote：⚠️ 绝不能在这里让批量改判触发域级晋升。
+    //   一次勾选不是「用户反复确认过这个站属于这一类」，
+    //   勾 3 条同域书签就升域级会让整站被改道 —— 正是 learned
+    //   污染整站那个 bug 的形态。晋升只认用户**逐条单独**改判攒出来的证据。
+    await markWrong(id, toPath, { quiet: true, noPromote: true });
+    ok += 1;
+  }
+  bulkPicked.clear();
+  await recordReassign(ok);
+  await safeReload();
+  renderPlan();
+  renderBulkBar();
+  toast(`已把 ${ok} 条改到「${pathString(toPath)}」`);
+}
+
+function openBulkPicker() {
+  const ids = [...bulkPicked];
+  if (!ids.length) return;
+  // 复用单条改判的 picker：它在 close 时读 returnValue + state.picked，
+  // 所以这里改用一个独立的标志位告诉它「这次是批量的」。
+  state.picked = ids[0];
+  state.bulk = true;
+  $('pickerTarget').textContent = `已选 ${ids.length} 条，统一改判`;
+  renderPickerColumns();
+  $('pathPicker').showModal();
+}
+
 /** 被标成「重要」的 URL。面板渲染时同步查表，不逐行 await storage。 */
 let importantUrls = [];
 /** 链接健康页的监听器是否已挂过。见 initLinkHealth 里的说明。 */
@@ -2433,6 +2734,9 @@ async function refreshLinkHealth() {
   const data = res.result || {};
   linkState = data.state;
   linkIndex = data.index;
+  // ⚠️ 元数据缓存必须失效重取：link-scan 刚跑完或刚清空，分类链路手里的
+  // description 已经不是当前的了。置 null（不是 {}），下次分类会重新拉。
+  linkMetaCache = null;
   // 星标与探测记录是两份独立数据，都要从 storage 恢复（不是内存态）
   importantUrls = await getImportantUrls();
   renderImportantCount();
@@ -3505,9 +3809,32 @@ async function init() {
     const chosen = $('pathPicker').querySelector('input[name="pick"]:checked');
     if (!chosen) { toast('没有选择分类', true); return; }
     const id = state.picked;
+    const isBulk = !!state.bulk;
     state.picked = null;
-    await markWrong(id, chosen.value.split('/'));
+    state.bulk = false;
+    // 批量与单条共用这一个弹窗：这里按来源分派，避免两条路径各写一遍
+    // 「读选中值 → 改判 → 重载」，将来一边改了另一边过期。
+    if (isBulk) await bulkAssign(chosen.value.split('/'));
+    else await markWrong(id, chosen.value.split('/'));
   });
+
+  // ── 批量改判 ──
+  // ⚠️ 这三个 id 必须同时登记在 tools/ui_contract_gate.py 的 GATED 与
+  //    tests/unit/reachability.test.js 的 NEW。漏登记的症状不是报错，
+  //    而是「点按钮没反应」——契约闸门会把没登记的 id 判成孤儿。
+  $('pickAll')?.addEventListener('change', (e) => {
+    const ids = bulkPickableIds();
+    if (e.target.checked) for (const id of ids) bulkPicked.add(id);
+    else for (const id of ids) bulkPicked.delete(id);
+    renderPlan();
+    renderBulkBar();
+  });
+  $('btnBulkClear')?.addEventListener('click', () => {
+    bulkPicked.clear();
+    renderPlan();
+    renderBulkBar();
+  });
+  $('btnBulkAssign')?.addEventListener('click', () => openBulkPicker());
 
   await loadSettingsUi();
   renderTaxonomyEditor();

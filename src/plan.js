@@ -297,29 +297,50 @@ export function setRules(rules) {
  * @param {ReturnType<typeof buildPlan>} plan
  * @param {Array} entries
  * @param {string[]} [locks]
- * @returns {Array<{id:string,url:string,title:string,key:string}>}
+ * @param {Object<string,{description?:string,pageTitle?:string}>} [opts.metaById]
+ *        书签 id → link-scan 已落盘的页面元数据。
+ *        ⚠️ 这是**只读复用**：runner.js 早就把 pageTitle/description 存进
+ *        storage 了，分类链路只是从来没读过。不新增任何网络请求。
+ *        缺失（没跑过 link-scan，linkScanEnabled 默认关闭）时静默降级。
+ * @returns {Array<{id:string,url:string,title:string,key:string,description?:string}>}
  */
-export function selectForLlm(plan, entries, locks = []) {
+export function selectForLlm(plan, entries, locks = [], opts = {}) {
+  const metaById = (opts && opts.metaById) || {};
   const lockKeys = new Set();
   for (const l of locks) {
     const k = dedupeKey(l);
     if (k) lockKeys.add(k);
   }
-  // 只挑「规则未命中、且已落进兜底桶」的条目。
-  // 注意不能按「不在 plan.items 里」筛 —— 兜底条目同样在 plan.items 里，
-  // 否则规则全没命中的那一批永远不会被送去问 LLM。
-  const unclassified = new Map(
-    plan.items.filter((i) => i.reason === REASON.UNCLASSIFIED).map((i) => [i.id, true]),
+  // 候选池有两类，第二类是本次改造新增的：
+  //  ① UNCLASSIFIED —— 压根没人判过它（原有行为）
+  //  ② rule:domain 且 confidence === 'medium' —— 多用途站点被词典降级
+  //     的那些。它们**已经分好类了**，但那个类是猜的（github.com 上的东西
+  //     未必属于代码托管），必须让 AI 复核一次。
+  //
+  // ⚠️ 不能只按 reason 筛：② 这批的 reason 是 rule:domain，早先的筛选
+  //    完全看不见它们，于是「多用途站点降级」在链路上等于没发生 ——
+  //    降级只是把 high 变成 medium，没有任何东西去消费这个 medium。
+  const want = new Map(
+    plan.items
+      .filter((i) => i.reason === REASON.UNCLASSIFIED
+        || (i.reason === REASON.RULE_DOMAIN && i.confidence === 'medium'))
+      .map((i) => [i.id, true]),
   );
   const out = [];
   for (const e of entries) {
     if (!e || e.type !== 'url') continue;
     if (isExcludedUrl(e.url)) continue;
     if (e.readOnly) continue;
-    if (!unclassified.has(e.id)) continue;
+    if (!want.has(e.id)) continue;
     const key = dedupeKey(e.url);
     if (!key || lockKeys.has(key)) continue;
-    out.push({ id: e.id, url: e.url, title: e.title || '', key, pathQuery: pathQueryOf(e.url) });
+    const meta = metaById[e.id] || {};
+    const description = String(meta.description || '').trim();
+    const row = { id: e.id, url: e.url, title: e.title || '', key, pathQuery: pathQueryOf(e.url) };
+    // 只在真的拿到时才带。空串会让模型以为「这个页面没有描述」，
+    // 而实际是「我们没抓到」—— 这两者对判读的影响完全不同。
+    if (description) row.description = description;
+    out.push(row);
   }
   return out;
 }

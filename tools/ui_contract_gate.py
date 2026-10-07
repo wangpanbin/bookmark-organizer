@@ -299,6 +299,10 @@ GATED = [
     'tab-help', 'panel-help', 'helpBody', 'helpError', 'helpEmpty', 'btnHelpReload',
     # 亮/暗切换
     'btnTheme', 'themeIcon',
+    # 2026-10-08 分类精度改造：批量改判 + 低置信闸门的如实告知。
+    # 漏登记的后果与其它 id 完全一样：勾了选不中、点按钮没反应，且不报错。
+    'pickAll', 'bulkBar', 'bulkCount', 'btnBulkClear', 'btnBulkAssign',
+    'awaitingConfirmNote', 'metricsNote',
 ]
 miss = [i for i in GATED if i not in ids]
 print(f'\n  gated ids present: {"ALL OK" if not miss else miss}')
@@ -587,14 +591,25 @@ for tid, host in (('planBody', 'planSkeleton'), ('healthRows', 'healthSkeleton')
     if re.search(r"\$\('" + tid + r"'\)\.appendChild", js):
         fails.append(f'JS appendChild into {tid}')
 
-# 2) 计划表 7 个 td 的顺序不能动（repro-organize / repro-real / diagnose 按下标读）
+# 2) 计划表前 7 个 td 的顺序不能动（repro-organize / repro-real / diagnose 按下标读）
+#
+# ⚠️ 2026-10-08：批量改判新增了一列「选择」，判据从「全等」改成
+#    「前 7 列全等 + 其余只允许追加」。
+#
+#    为什么不是简单放宽成「只要包含这 7 个就行」：
+#    E2E 是按**下标**读的（tds[1] 是书签、tds[5] 是依据）。把新列插到
+#    任何中间位置都会整体移位，而症状不是「E2E 红了」而是
+#    「E2E 读到了错位的列却仍然全绿」—— 那比直接报错更难查。
+#    所以契约必须继续钉死前缀，只把「末尾」变成可扩展区。
 m = re.search(r'tr\.append\((.*?)\);', js, re.S)
 order = [x.strip() for x in m.group(1).split(',')] if m else []
 expected = ['tdLock', 'tdItem', 'tdFrom', 'tdArrow', 'tdTo', 'tdWhy', 'tdFb']
-ok = order == expected
-print(f'  {ok!s:5} plan row td order: {order}')
-if not ok:
-    fails.append(f'td order changed: {order} != {expected}')
+prefix_ok = order[:len(expected)] == expected
+print(f'  {prefix_ok!s:5} plan row td order (prefix fixed): {order}')
+if not prefix_ok:
+    fails.append(f'td order changed: {order} != {expected} (+ 允许末尾追加)')
+elif order == expected:
+    fails.append('新增的选择列 tdPick 未出现在行末 —— 勾选框会错位')
 
 # 3) .title 必须仍在标题元素上（不能为了加 <a> 而换掉宿主结构）
 ok = "title.className = 'title'" in js and "document.createElement('a')" in js

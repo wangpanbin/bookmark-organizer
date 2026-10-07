@@ -134,6 +134,48 @@ test('buildPrompt 容忍空 taxonomy（至少能发请求）', () => {
   assert.match(user, /k/);
 });
 
+// ───────────────── 页面描述入 prompt ─────────────────
+
+test('⚠️ 抓到的页面描述必须进 prompt —— 这是准确率提升最大的一处', () => {
+  // link-scan 早就把 description 落盘了（src/scan/runner.js），
+  // 分类链路复用它不产生任何新请求。URL 与标题说不清的东西，
+  // 一句描述能说清。
+  const { user } = L.buildPrompt(
+    [{ key: 'k', url: 'https://x.com/a', title: 'T', description: '官方文档，讲 React Hooks 的用法' }],
+    [{ name: '其他', children: ['待归类'] }],
+  );
+  assert.match(user, /desc=官方文档，讲 React Hooks 的用法/);
+});
+
+test('⚠️ 空描述绝不进 prompt —— 「没抓到」与「页面没有描述」对模型影响完全不同', () => {
+  // 把空串传过去等于告诉模型「这个页面没有描述信息」，
+  // 而实际是「我们没抓到」。前者会让模型更没把握。
+  for (const d of [undefined, null, '', '   ']) {
+    const { user } = L.buildPrompt(
+      [{ key: 'k', url: 'https://x.com/a', title: 'T', description: d }],
+      [{ name: '其他', children: ['待归类'] }],
+    );
+    assert.doesNotMatch(user, /desc=/, `description=${JSON.stringify(d)} 不该产生 desc 行`);
+  }
+});
+
+test('⚠️ 描述按条目一一对应，不得串行（否则模型会拿到别的页面的描述）', () => {
+  const { user } = L.buildPrompt([
+    { key: 'k1', url: 'https://a.com', title: 'A', description: '第一个的描述' },
+    { key: 'k2', url: 'https://b.com', title: 'B' },
+    { key: 'k3', url: 'https://c.com', title: 'C', description: '第三个的描述' },
+  ], [{ name: '其他', children: ['待归类'] }]);
+
+  // 按「N. key=」把 user 切成每条一块，而不是靠行号猜边界
+  const blocks = user.split(/(?=\d+\. key=)/).filter((b) => /^\d+\. key=/.test(b));
+  assert.equal(blocks.length, 3, '应切出三块');
+  assert.match(blocks[0], /desc=第一个的描述/);
+  assert.doesNotMatch(blocks[1], /desc=/, '没有描述的条目不得沾到别人的');
+  assert.doesNotMatch(blocks[1], /描述/);
+  assert.match(blocks[2], /desc=第三个的描述/);
+  assert.doesNotMatch(blocks[2], /第一个的描述/, '描述不得串到下一条');
+});
+
 test('validateAssignments 丢掉模型自造的类目', () => {
   const taxonomy = [{ name: '其他', children: ['待归类'] }];
   const known = (t, p) => {

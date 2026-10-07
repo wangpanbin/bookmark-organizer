@@ -106,6 +106,21 @@
           <label class="chk"><input type="checkbox" id="onlyLow"> 只看低置信</label>
           <label class="chk"><input type="checkbox" id="onlyUnclassified"> 只看未归类</label>
           <span class="plan-filter-note" id="unclassifiedNote"></span>
+          <!-- 准确率：样本不足时如实说「样本不足」，不显示一个撑不住的百分比 -->
+          <span class="plan-filter-note" id="metricsNote"></span>
+          <!-- 低置信闸门：这些条目本轮不会被执行。
+               必须写在计划页上，否则用户看到「整理完成 100%」，会以为每一条都被处理过了，
+               而实际上有 N 条根本没动。措辞只陈述「不会自动移动」，
+               不承诺一个并不存在的「逐条确认」按钮。真正的出口是改判。 -->
+          <span class="plan-filter-note" id="awaitingConfirmNote"></span>
+          <!-- 批量改判：让「大量落进待归类」不再是死胡同。
+               逐条改判是唯一出口时，待归类几十条就等于放弃整理。
+               选中 → 批量改判 → 选一个类目 → 一次应用。 -->
+          <span class="bulk-actions" id="bulkBar" hidden>
+            <span class="bulk-count" id="bulkCount">已选 0 条</span>
+            <button type="button" id="btnBulkClear">清空选择</button>
+            <button type="button" id="btnBulkAssign" class="primary">批量改判</button>
+          </span>
         </div>
     <div class="table-wrap">
       <!-- 骨架屏是表格的兄弟节点，不在 #planBody 里。
@@ -122,6 +137,10 @@
             <th class="c-to">目标位置</th>
             <th class="c-why">依据</th>
             <th class="c-fb">反馈</th>
+            <!-- 选择列放最后：E2E 按 td 下标取列（td[1]=书签），插前面会移位 -->
+            <th class="c-pick" title="选中后可批量改判">
+              <input type="checkbox" id="pickAll" aria-label="全选当前筛选下的条目">
+            </th>
           </tr>
         </thead>
         <tbody id="planBody"></tbody>

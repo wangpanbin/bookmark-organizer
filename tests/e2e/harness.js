@@ -412,6 +412,31 @@ export async function readStats(page) {
 }
 
 /**
+ * 数计划表里**会被执行**的条目（排除低置信挂起的那些）。
+ *
+ * ⚠️ 2026-10-08：低置信条目本轮不会被执行（apply.js 的 needsConfirm 闸门），
+ *    它们执行完仍在原位，二次预览当然还显示「待移动」。
+ *    所以幂等判据必须数「再跑一次真会再动一次」的那些，而不是「显示为待移动」的那些。
+ *
+ * 判据直接读 DOM 的 `tr.is-low` 标记（options.js 渲染低置信时加的），
+ * 不用统计卡的间接数字 —— 统计卡按 reason 分类，不按置信度。
+ */
+export async function countExecutableRows(page) {
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll('#planBody tr')];
+    return rows.filter((tr) => {
+      if (tr.classList.contains('is-skipped')) return false; // 已经在位/未归类，不会被搬
+      return !tr.classList.contains('is-low');              // 低置信本轮不执行
+    }).length;
+  });
+}
+
+/** 数计划表里低置信挂起的条目（闸门拦下的那些） */
+export async function countLowPendingRows(page) {
+  return page.evaluate(() => document.querySelectorAll('#planBody tr.is-low:not(.is-skipped)').length);
+}
+
+/**
  * 等执行结束。
  *
  * ⚠️ 判据必须是 #reportStatus 单元格的**值**，不能对报告全文做子串匹配 ——

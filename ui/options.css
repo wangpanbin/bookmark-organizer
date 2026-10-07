@@ -1079,6 +1079,15 @@ table.grid .hint { display: inline-block; }
 
 .plan-filter-note { font-size: 12px; color: var(--warn); }
 
+/* 批量改判条：只在有选中时才出现，不占常驻视觉重量 */
+.bulk-actions {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  margin-left: auto;
+}
+.bulk-count { font-size: 12px; color: var(--ink-2); }
+/* 选择列：窄，只放一个 checkbox */
+th.c-pick, td.c-pick { width: 32px; padding-left: var(--sp-1); padding-right: var(--sp-1); }
+
 .scope-picker {
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--surface); padding: var(--sp-3);

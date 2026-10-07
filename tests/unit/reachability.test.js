@@ -176,6 +176,10 @@ test('⚠️ 面板上引用的每个 DOM id 都必须真实存在', () => {
     'hero', 'planSpine', 'spineVal', 'btnDupPreview',
     'tab-help', 'panel-help', 'helpBody', 'helpError', 'helpEmpty', 'btnHelpReload',
     'btnTheme', 'themeIcon',
+    // 2026-10-08 分类精度改造：批量改判 + 低置信闸门提示。
+    // 漏登记的症状是「勾了选不中 / 点批量改判没反应」，且不报错。
+    'pickAll', 'bulkBar', 'bulkCount', 'btnBulkClear', 'btnBulkAssign',
+    'awaitingConfirmNote', 'metricsNote',
   ];
   const missing = NEW.filter((id) => !ids.has(id));
   assert.deepEqual(missing, [],
