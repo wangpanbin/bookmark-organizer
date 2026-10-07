@@ -724,3 +724,143 @@ table.grid .hint { display: inline-block; }
 @media (max-width: 420px) {
   .stats, .stat-row { grid-template-columns: 1fr; }
 }
+
+/* ═══════════ 手动整理（F4）═══════════
+   ⚠️ 配色一律走既有 token（--accent-ink / --warn / --danger / --muted）。
+      tools/contrast_gate.py 会按 WCAG AA 核明暗两套，配新色必须两套都过。 */
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* 贴着「执行整理」的范围提示。⚠️ 不做成按钮样式：
+   它是**状态说明**，用户点它不会有任何事，做成可点样子反而误导。 */
+.scope-chip {
+  margin: var(--sp-2) 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.scope-chip::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--border); flex: none;
+}
+.scope-chip[data-mode="all"] { color: var(--muted); }
+.scope-chip[data-mode="scope"] { color: var(--accent-ink); font-weight: 600; }
+.scope-chip[data-mode="scope"]::before { background: var(--accent-ink); }
+
+.scope-stats {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-3) 0;
+  margin-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--muted);
+}
+.scope-stat b { color: var(--text); font-weight: 600; margin-left: 4px; }
+.scope-stat[data-k="failed"] b { color: var(--danger); }
+.scope-stat[data-k="stale"] b { color: var(--muted); }
+.scope-stat[data-zero="1"] b { color: var(--muted); }
+.scope-stat-note { flex: 1 1 100%; font-size: 12px; }
+
+.scope-h { font-size: 13px; color: var(--text); margin: 0 0 var(--sp-2); }
+.scope-h-sub { color: var(--muted); font-weight: 400; margin-left: 6px; }
+
+/* 清单与勾选区左右分栏，窄屏自动堆叠 */
+.scope-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-4);
+}
+@media (min-width: 1100px) {
+  .scope-body:has(.scope-picker:not([hidden])) { grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); }
+}
+
+.scope-list, .scope-tree { list-style: none; margin: 0; padding: 0; }
+
+.scope-item {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 7px var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.scope-item:last-child { border-bottom: 0; }
+.scope-item .scope-name {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scope-item .scope-path { color: var(--muted); font-size: 12px; flex: none; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-item .scope-err { color: var(--danger); font-size: 12px; flex: none; }
+
+.scope-badge {
+  flex: none; font-size: 11.5px; padding: 1px 7px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border); color: var(--muted);
+}
+.scope-item[data-status="pending"] .scope-badge { color: var(--accent-ink); border-color: var(--accent-ink); }
+.scope-item[data-status="done"] .scope-badge { color: var(--muted); }
+.scope-item[data-status="failed"] .scope-badge { color: var(--danger); border-color: var(--danger); }
+.scope-item[data-status="stale"] .scope-badge { color: var(--muted); }
+.scope-item[data-status="done"] .scope-name, .scope-item[data-status="stale"] .scope-name { color: var(--muted); }
+.scope-item[data-status="stale"] .scope-path { text-decoration: line-through; }
+
+.scope-item .scope-drop {
+  flex: none; background: none; border: 0; color: var(--muted);
+  cursor: pointer; font-size: 12px; padding: 2px 4px;
+}
+.scope-item .scope-drop:hover { color: var(--danger); }
+
+.scope-picker {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); padding: var(--sp-3);
+}
+.scope-picker-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.scope-picker-head .field { flex: 1 1 180px; }
+.scope-picker-head .scope-h { margin: 0; }
+.scope-tree { max-height: 460px; overflow: auto; }
+
+/* 树里的行：文件夹与书签共用，靠 .scope-node 的 data-type 区分 */
+.scope-node { border-top: 1px solid var(--border); }
+.scope-node:first-child { border-top: 0; }
+.scope-node > .scope-row {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 5px 4px; font-size: 13px;
+}
+.scope-node > .scope-row:hover { background: var(--sunken); }
+.scope-node .scope-twist {
+  flex: none; width: 16px; text-align: center; color: var(--muted);
+  background: none; border: 0; cursor: pointer; font-size: 11px; padding: 0;
+}
+.scope-node .scope-row input[type="checkbox"] {
+  flex: none; accent-color: var(--accent-ink); width: 14px; height: 14px; cursor: pointer;
+}
+.scope-node .scope-label {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scope-node .scope-host { color: var(--muted); font-size: 11.5px; flex: none; }
+.scope-node .scope-why { color: var(--warn); font-size: 11.5px; flex: none; }
+
+/* 已锁定行上的就地「解锁」。刻意做小做轻：它是一个补救入口，
+   不是主操作 —— 不该和「选择书签」抢注意力。 */
+.scope-node .scope-unlock {
+  flex: none; background: none; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--accent-ink);
+  font-size: 11.5px; padding: 1px 6px; cursor: pointer;
+}
+.scope-node .scope-unlock:hover { border-color: var(--accent-ink); }
+
+/* ⚠️ 不可动项：灰掉 + 禁用复选框 + 行内写明原因（决策 10）。
+   放在源头而不是等预览时再说，是为了让用户不会「勾了一堆发现白勾」。 */
+.scope-node[data-blocked="1"] > .scope-row { color: var(--muted); cursor: not-allowed; }
+.scope-node[data-blocked="1"] > .scope-row input[type="checkbox"] { cursor: not-allowed; }
+.scope-node .scope-kids { padding-left: 20px; }
+.scope-node .scope-n { color: var(--muted); font-size: 11.5px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .scope-node > .scope-row { transition: background-color .12s ease; }
+}

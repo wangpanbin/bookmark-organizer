@@ -69,8 +69,16 @@ const MUST_BE_REACHABLE = [
   // ⚠️ 这个导出的价值全在**被调用**上：它是一道「别给 anthropic 协议发 response_format」
   //    的闸门。留着一个没人调用的纯函数，等于这道闸门不存在。
   ['ai/provider-registry.js', 'resolveJsonMode', 'runtime 用它决定要不要注入 response_format'],
-  // 刻意**不列**同文件内部 helper（archiveOne、verifyCandidates）：
-  // 它们被本文件的上层导出调用，可达性是传递的。
+  // F4 手动指定书签范围
+  // ⚠️ 登记理由不是「写完了」，而是「不接上就静默失效」：
+  //    expandFolderSelection 没人调 → 勾文件夹只能勾到空，清单里什么都没有，
+  //    而界面上看不出任何异常（勾选框照常亮、点「预览选中」也只是说没东西可整理）。
+  ['scope-list.js', 'expandFolderSelection', '勾文件夹时展开成可动书签；不接上则勾文件夹等于没勾'],
+  ['scope-list.js', 'prepareScope', '对账 + 裁子集，面板预览的唯一入口'],
+  ['scope-list.js', 'annotateSelectable', '勾选区标出哪些不可动，以及为什么'],
+  ['scope-list.js', 'applyRunResult', '一轮执行结束后把结果写回清单（状态机的写侧）'],
+  // 刻意**不列**同文件内部 helper（reconcileList / buildScopeEntries / blockedReason）：
+  // 它们被 prepareScope / annotateSelectable 调用，可达性是传递的。
   // 列进来只会让这道闸门天天为正确的代码报红 —— 而误报的闸门等于没有闸门。
 ];
 
@@ -138,12 +146,33 @@ test('⚠️ 面板上引用的每个 DOM id 都必须真实存在', () => {
     'btnArchiveReset', 'importantCount', 'btnImportantClear',
     'semanticEnabled', 'semanticThreshold', 'btnSemanticRun', 'btnSemanticClear',
     'semanticState', 'semanticTable', 'semanticRows',
+    // F4 手动整理：勾选区的每个控件少一个就是「点了没反应」
+    'tabScopeCount', 'btnScopePick', 'btnScopePreview', 'btnScopeRetry',
+    'btnScopeClearDone', 'btnScopeClearAll', 'btnScopePickToggle',
+    'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
+    'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
+    'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
+    'scopeListCount', 'planScopeChip',
   ];
   const missing = NEW.filter((id) => !ids.has(id));
   assert.deepEqual(missing, [],
     `options.html 里没有这些 id（而 options.js 在用它们）：${missing.join(', ')}`);
   // 反向：js 里新面板引用了 html 中不存在的 id
   const referenced = [...js.matchAll(/\$\('([A-Za-z][A-Za-z0-9_]*)'\)/g)].map((m) => m[1]);
-  const ghosts = [...new Set(referenced.filter((id) => !ids.has(id) && /^(health|link|btnLink|archive|semantic|tabHealth)/.test(id)))];
+  const ghosts = [...new Set(referenced.filter((id) => !ids.has(id)
+    && /^(health|link|btnLink|archive|semantic|tabHealth|scope|btnScope|planScope)/.test(id)))];
   assert.deepEqual(ghosts, [], `options.js 引用了 html 里不存在的 id：${ghosts.join(', ')}`);
+});
+
+test('⚠️ 勾选区与计划表是两套独立 DOM —— 别让它们共用一个 tbody', () => {
+  // 计划表的 7 列顺序被 ui_contract_gate.py 用正则锁死。
+  // 若有人图省事把勾选区也渲染进 #planBody，闸门会以「E2E 契约」的名义报红，
+  // 而真实原因是两个用途完全不同的表格被塞进了同一个容器。
+  const html = readFileSync(join(UI, 'options.html'), 'utf8');
+  const m = html.match(/<tbody[^>]*id="planBody"[^>]*>([\s\S]*?)<\/tbody>/);
+  assert.ok(m, '<tbody id="planBody"> 不见了');
+  assert.ok(!/scope/i.test(m[1]),
+    '勾选区的节点被塞进了 #planBody —— 它会被 E2E 的数行判定算成计划条目');
+  assert.ok(/id="scopeTree"/.test(html) && /id="scopeList"/.test(html),
+    '勾选区与清单各自需要一个独立容器');
 });

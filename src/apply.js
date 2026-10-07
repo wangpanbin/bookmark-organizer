@@ -18,7 +18,6 @@ import {
   get, set, mutate, mutateMany, setVerified, K, TASK_STATUS, getTask, getSettings,
   getDedupeVeto, isDedupeVetoed,
 } from './storage.js';
-import { toRemovalList } from './dedupe.js';
 import { recordFailure, flushPending } from './fail-log.js';
 import { resolveRoot } from './roots.js';
 
@@ -56,6 +55,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 任务进度摘要（写进 storage，供 UI 轮询） */
 function summarize(task) {
   const items = task.plan?.items || [];
+  const stale = Array.isArray(task.stale) ? task.stale : [];
   return {
     status: task.status,
     total: items.length,
@@ -64,6 +64,17 @@ function summarize(task) {
     failed: items.filter((i) => i.status === 'failed').length,
     pending: items.filter((i) => i.status === 'pending').length,
     failedList: (task.failed || []).slice(0, 50),
+    /**
+     * 这一轮因为「不在清单里」而没有动的条目。
+     * ⚠️ 子集运行正常情况下这个数应该是 0。它不为 0 说明上游裁剪漏了，
+     *    是范围校验**真的挡住了一次越界**的证据 —— 报告里必须露出来，
+     *    静默吞掉等于让用户以为「它照我的范围整理了」。
+     */
+    outOfScope: stale.filter((s) => s && s.outOfScope).length,
+    missing: stale.filter((s) => s && !s.outOfScope).length,
+    /** 本次是不是子集运行（界面据此显示范围承诺） */
+    scoped: task.scopeIds !== null && task.scopeIds !== undefined,
+    scopeCount: Array.isArray(task.scopeIds) ? task.scopeIds.length : null,
     snapshotTs: task.snapshotTs ?? null,
     updatedAt: task.updatedAt || 0,
   };
@@ -171,6 +182,7 @@ async function persistItem(id, patch, extra) {
       t.plan = { ...(t.plan || {}), items };
       if (extra?.lastDoneIndex !== undefined) t.lastDoneIndex = extra.lastDoneIndex;
       if (extra?.failed) t.failed = extra.failed;
+      if (extra?.stale) t.stale = extra.stale;
       if (extra?.createdFolders) t.createdFolders = extra.createdFolders;
       if (extra?.folderCache) t.folderCache = extra.folderCache;
       if (extra?.removedDuplicates) t.removedDuplicates = extra.removedDuplicates;
@@ -182,9 +194,55 @@ async function persistItem(id, patch, extra) {
 }
 
 /**
+ * 本次任务允许动的书签 id 集合。
+ *
+ * ⚠️⚠️ `null` 与 `[]` 是**两件完全不同的事**，别混：
+ *    - null  = 全量运行，沿用整理前的语义，不做任何范围限制
+ *    - []    = 子集运行，而清单是空的 —— 什么都不该动
+ *    所以判断必须写 `task.scopeIds === null` 而不是 `!task.scopeIds.length`。
+ *
+ * @param {object} task
+ * @returns {Set<string>|null}
+ */
+function allowedIdSet(task) {
+  if (task.scopeIds === null || task.scopeIds === undefined) return null;
+  if (!Array.isArray(task.scopeIds)) return null;
+  return new Set(task.scopeIds.map(String));
+}
+
+/**
+ * 范围校验：这条书签在不在本次任务的允许集合里。
+ *
+ * ═══ 为什么执行器要自己再认一遍清单 ═══
+ * 面板已经用清单裁出了计划，理论上 plan.items ⊆ 清单。
+ * 那为什么还要执行侧复核？
+ *
+ * 因为这条链路上「计划载荷」与「用户当时勾的东西」之间隔着好几层
+ * —— storage 里的残留计划、面板的旧内存状态、中途被别的预览覆盖。
+ * 而这个功能存在的**全部理由**就是「我圈定范围之外的东西一条都不能动」。
+ * 把这条保证只押在上游裁剪上，等于让承诺建立在一个纯逻辑的正确性上；
+ * 一旦哪一层的裁剪漏了，后果是**静默搬动用户没选的书签**，
+ * 而且报告上显示 100% 成功 —— 用户无从察觉。
+ *
+ * 这与 processDuplicates 里复核 dedupe:veto 是同一个道理：
+ * 「用户明确说了不动的条目被执行器动了」是不可逆损失，
+ * 所以执行侧必须自己认名单，不能只信上游。
+ *
+ * @param {Set<string>|null} allowed null = 全量运行，不限制
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isInScope(allowed, id) {
+  if (allowed === null) return true;
+  return allowed.has(String(id));
+}
+
+/**
  * 开始执行（或继续）。把 plan 写进 task 后进入主循环。
  *
- * @param {{plan: object, duplicates?: Array, snapshotTs?: number}} payload
+ * @param {{plan: object, duplicates?: Array, snapshotTs?: number, scopeIds?: string[]|null}} payload
+ *        scopeIds 缺省 / null = 全量运行（现有语义不变）；
+ *        数组 = 只允许动这些 id，执行循环逐条复核。
  * @returns {Promise<{started:boolean, reason?:string}>}
  */
 export async function startExecution(payload) {
@@ -194,6 +252,23 @@ export async function startExecution(payload) {
   // 抛 `Assignment to constant variable`，整批任务直接启动失败。
   let { plan, duplicates = [], snapshotTs = null } = payload || {};
   if (!plan || !Array.isArray(plan.items)) return { started: false, reason: '计划为空' };
+
+  // ⚠️ 范围校验要用**执行时**的 id 集合，而不是裁剪时的那份。
+  //    reconcilePlanIds 会把失效 id 按 URL 重新定位，改掉的是 item.id；
+  //    若拿旧 id 去比对，一个被重新定位的条目会因为「不在旧集合里」被误杀。
+  //    所以逐条校验推迟到执行循环里做，那里的 id 已经是定位后的。
+  //
+  //    这里只做一件更早的事：**载荷自洽性**。子集运行时若一个 id 都没给，
+  //    说明清单是空的 —— 此时应该一条都不动，而不是「没限制所以全放行」。
+  const rawScopeIds = payload?.scopeIds;
+  const scopeIds = Array.isArray(rawScopeIds) ? rawScopeIds.map(String) : null;
+  if (scopeIds !== null && !scopeIds.length && plan.items.length) {
+    return {
+      started: false,
+      reason: '这是一次「只整理清单里书签」的任务，但清单是空的 —— 不会有任何书签被移动。'
+        + '请到「手动整理」页勾选书签后重新预览。',
+    };
+  }
 
   // ⚠️ 预检：动手之前先确认「归入位置」真的能解析成一个活着的根。
   //
@@ -259,6 +334,12 @@ export async function startExecution(payload) {
     startedAt: Date.now(),
     updatedAt: Date.now(),
     snapshotTs: snapTs,
+    // ⚠️ 必须落盘，不能只留在载荷里。
+    //    MV3 service worker 空闲 30 秒即被回收，resumeExecution 是**新进程**
+    //    从 storage 读回这个 task 继续跑的。若范围只存在于内存，
+    //    一旦回收后续跑就完全没有范围校验了 —— 而用户看到的界面一模一样，
+    //    他仍然以为「只动我勾的那些」。
+    scopeIds,
   };
   await set(K.TASK_CURRENT, task);
 
@@ -463,6 +544,8 @@ async function run() {
       if (!task.plan) return;
       if (task.status !== TASK_STATUS.RUNNING) return;
 
+      // ⚠️ 每一轮都重算：任务可能被暂停后恢复，也可能被别的预览换了 task。
+      const allowed = allowedIdSet(task);
       const items = task.plan.items || [];
       const next = items.find((i) => i.status === 'pending');
       if (!next) {
@@ -479,6 +562,25 @@ async function run() {
         // 这里统一再试一次，缓冲上限 200 条，正常情况下是空转。
         await flushPending();
         return;
+      }
+
+      // ⚠️⚠️ 子集运行的范围闸门。位置在**动手之前**、在 try 之外：
+      //    不在清单里的条目根本不该走到 move()，更不该占用失败日志与重试位。
+      //    记成 skipped 而不是 failed —— 它不是「搬失败」，是「本轮不属于我」。
+      if (!isInScope(allowed, next.id)) {
+        const skippedOutOfScope = [...(task.stale || []), {
+          title: next.title, url: next.url, oldId: String(next.id), outOfScope: true,
+        }];
+        await persistItem(next.id, { status: 'skipped', reason: 'out-of-scope' }, {
+          stale: skippedOutOfScope,
+          lastDoneIndex: items.indexOf(next),
+        });
+        sinceYield += 1;
+        if (sinceYield >= YIELD_EVERY) {
+          await sleep(YIELD_MS);
+          sinceYield = 0;
+        }
+        continue;
       }
 
       // parentId 提到 try 外面：catch 要靠它核实「目标文件夹到底还在不在」，
@@ -586,15 +688,9 @@ export async function processDuplicates(task) {
   return removed;
 }
 
-/** 把去重结果转成执行器要的形状 */
-export function toDuplicatePayload(groups, entriesById) {
-  return toRemovalList(groups).map((d) => {
-    const src = entriesById.get(d.id);
-    return { id: d.id, url: d.url, title: d.title, path: src?.path || ['2'], keepId: d.keepId };
-  });
-}
-
-/** 清空当前任务（执行完成后 UI 用） */
+/**
+ * 清空当前任务（执行完成后 UI 用）
+ */
 export async function clearTask() {
   await set(K.TASK_CURRENT, null);
 }

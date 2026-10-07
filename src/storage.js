@@ -213,6 +213,28 @@ export const K = {
    * 归档 800 条要很久，SW 必然被回收好几次，所以进度必须落盘。
    */
   ARCHIVE_STATE: 'archive:state',
+  /**
+   * 手动指定书签范围的清单（F4）。
+   *
+   * ⚠️ 语义是「**这次动这些**」，刻意不复用上面任何一套键：
+   *    LOCKS 是「永不动」、DEDUPE_VETO 是「别删」、ARCHIVE_IMPORTANT 是
+   *    「归档时多渲染一份」。三个语义域分别是移动 / 删除 / 归档，
+   *    复用任何一个都会产生「用户以为锁了、结果只影响归档」这类静默失效
+   *    —— 那正是 archive:important 曾经踩过的坑。
+   *
+   * ⚠️ 存书签 **id**（与 LOCKS 存 URL 相反）。
+   *    id 会因书签被删后重建、恢复备份而失效，所以清单同时留一份 url
+   *    和当时的 path 快照 —— 但 url **只用于失效时给人看，绝不用于认领**，
+   *    同一 URL 存过多条是常事，按 URL 顶替会整理到用户没选的那条上。
+   *
+   * ⚠️ 这是**数据**不是设置项，所以不在 DEFAULT_SETTINGS 里。
+   *    约束 9 只针对「开关」：一个没进 DEFAULT_SETTINGS 的设置项配上
+   *    `x !== false` 判据会恒真、开关关不掉。清单没有开关，不适用这条。
+   *
+   * 形状：{ v, updatedAt, items: [{ id, url, title, path, status, addedAt, updatedAt, lastReason, lastError }] }
+   * 解析与派生一律走 src/scope-list.js，不要在这里复述它的规则。
+   */
+  SCOPE_LIST: 'scope:list',
   get snapshot() {
     return (ts) => `snapshot:${ts}`;
   },
@@ -368,4 +390,46 @@ export function toggleDedupeVeto(id, on) {
 /** 清空所有否决 */
 export function clearDedupeVeto() {
   return set(K.DEDUPE_VETO, []);
+}
+
+// ───────────────────────── 手动指定书签范围（F4）─────────────────────────
+//
+// 访问器放在 storage.js 而不是 scope-list.js，是为了保住后者的纯函数性：
+// scope-list.js 不 import 任何写操作模块，是它能在 Node 下直接单测的前提。
+// 这里只做「读出来先收敛成合法清单」和「改写走同一个串行临界区」两件事。
+
+/**
+ * 读清单。返回的一定是合法结构（见 scope-list.js 的 normalizeList）。
+ *
+ * ⚠️ 读接口一律**读 storage**，不缓存到内存。
+ *    MV3 service worker 空闲 30 秒即被回收，任何「内存累积 + 落盘」的形态
+ *    在被回收后都会读回空 —— 而清单读空的表现是「用户勾的东西全没了」，
+ *    比一般的数据丢失更让人不敢用。
+ */
+export async function getScopeList() {
+  const { normalizeList } = await import('./scope-list.js');
+  return normalizeList(await get(K.SCOPE_LIST, null));
+}
+
+/**
+ * 读-改-写清单，全程在**一个串行临界区**内。
+ *
+ * ⚠️ 必须走 mutate 而不是 get→算→set 三次独立进出：
+ *    分开做会丢更新。清单是用户反复增删的东西，丢更新的后果是
+ *    「刚勾上的两条凭空消失」，而且不报错。
+ *
+ * @param {(list: {v:number, updatedAt:number, items:Array}) => object} fn
+ *        收到合法清单，返回新的清单
+ */
+export async function updateScopeList(fn) {
+  const { normalizeList, EMPTY_LIST } = await import('./scope-list.js');
+  return mutate(K.SCOPE_LIST, (cur) => {
+    const next = fn(normalizeList(cur));
+    return { ...normalizeList(next), v: 1, updatedAt: Date.now() };
+  }, { ...EMPTY_LIST, items: [] });
+}
+
+/** 清空整份清单 */
+export function clearScopeList() {
+  return set(K.SCOPE_LIST, { v: 1, updatedAt: Date.now(), items: [] });
 }

@@ -18,6 +18,7 @@
     </div>
     <nav class="tabs" id="tabs" role="tablist" aria-label="面板切换">
       <button role="tab" type="button" id="tab-plan" data-tab="plan" aria-controls="panel-plan" aria-selected="true" class="active">计划明细 <em id="tabPlanCount">0</em></button>
+      <button role="tab" type="button" id="tab-scope" data-tab="scope" aria-controls="panel-scope" aria-selected="false">手动整理 <em id="tabScopeCount">0</em></button>
       <button role="tab" type="button" id="tab-dup" data-tab="dup" aria-controls="panel-dup" aria-selected="false">重复项 <em id="tabDupCount">0</em></button>
       <button role="tab" type="button" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false">链接健康 <em id="tabHealthCount">0</em></button>
       <button role="tab" type="button" id="tab-snap" data-tab="snap" aria-controls="panel-snap" aria-selected="false">备份快照 <em id="tabSnapCount">0</em></button>
@@ -70,6 +71,13 @@
           <button id="btnRestore" class="danger-ghost">恢复备份</button>
           <span id="busy" class="busy" role="status" aria-live="polite" hidden></span>
         </div>
+        <!--
+          当前这份计划是「全量」还是「只整理清单里的那些」。
+          ⚠️ 刻意贴着「执行整理」放：两个入口写的是同一个 state.plan，
+             界面上若不区分，用户在「手动整理」勾了但没预览、
+             切过来点执行，动的就是上一次的全量计划。
+        -->
+        <p class="scope-chip" id="planScopeChip" data-mode="all" hidden></p>
       </div>
     </div>
 
@@ -117,6 +125,62 @@
       <p class="empty" id="planEmpty" hidden></p>
     </div>
     <p class="more" id="planMore" hidden></p>
+  </section>
+
+  <!-- ── 手动整理（只整理清单里的书签）── -->
+  <section class="panel" data-panel="scope" id="panel-scope" role="tabpanel" aria-labelledby="tab-scope" tabindex="-1">
+    <div class="panel-head">
+      <p class="hint">
+        先勾选要整理的书签，再点「预览选中」。<b>清单之外的书签一条都不会被移动，也不会被删除。</b>
+        勾选一个文件夹时，它里面的书签会在这一刻展开成一张快照，之后文件夹变不变都不影响这张清单。
+        移不动的条目（移动设备书签、已锁定、浏览器内部页）会灰掉并写明原因。
+      </p>
+      <div class="panel-actions">
+        <button class="primary" id="btnScopePreview" type="button">预览选中</button>
+        <button class="ghost" id="btnScopePick" type="button">选择书签</button>
+        <button class="ghost" id="btnScopeRetry" type="button" hidden>重试失败项</button>
+        <button class="ghost" id="btnScopeClearDone" type="button" hidden>清空已整理</button>
+        <button class="ghost" id="btnScopeClearAll" type="button" hidden>清空清单</button>
+      </div>
+    </div>
+
+    <div class="scope-stats" id="scopeStats">
+      <span class="scope-stat" data-k="pending">待整理 <b id="scopePending">0</b></span>
+      <span class="scope-stat" data-k="done">已整理 <b id="scopeDone">0</b></span>
+      <span class="scope-stat" data-k="failed">失败 <b id="scopeFailed">0</b></span>
+      <span class="scope-stat" data-k="stale">已失效 <b id="scopeStale">0</b></span>
+      <span class="scope-stat-note" id="scopeNote"></span>
+    </div>
+
+    <!-- 清单本体 -->
+    <div class="scope-body">
+      <div class="scope-list-wrap">
+        <h2 class="scope-h">清单 <span class="scope-h-sub" id="scopeListCount"></span></h2>
+        <ul class="scope-list" id="scopeList"></ul>
+        <p class="empty" id="scopeEmpty" hidden></p>
+      </div>
+
+      <!-- 勾选区：点「选择书签」才展开。
+           ⚠️ 刻意用**懒渲染**：只渲染展开的文件夹。
+              书签上千条时一次性全铺开会让面板卡住，而这里最忌讳的就是卡住，
+              用户会觉得「勾个书签把扩展整死了」。
+              （多行 HTML 注释的续行不要写破折号：ui_contract_gate.py 是逐行判的，
+              续行既不以 <!-- 开头也不含 -->，会被当成正文散文报红。） -->
+      <div class="scope-picker" id="scopePicker" hidden>
+        <div class="scope-picker-head">
+          <h2 class="scope-h">选择书签</h2>
+          <label class="field compact">
+            <span class="sr-only">搜索书签</span>
+            <input type="search" id="scopeSearch" placeholder="搜标题、网址或文件夹名" autocomplete="off">
+          </label>
+          <button class="ghost" id="btnScopePickToggle" type="button">展开全部</button>
+          <button class="ghost" id="btnScopeAddPicked" type="button">加入清单</button>
+          <button class="ghost" id="btnScopeCancelPick" type="button">收起</button>
+        </div>
+        <ul class="scope-tree" id="scopeTree"></ul>
+        <p class="empty" id="scopeTreeEmpty" hidden></p>
+      </div>
+    </div>
   </section>
 
   <!-- ── 重复项 ── -->

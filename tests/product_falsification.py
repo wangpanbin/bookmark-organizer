@@ -260,6 +260,38 @@ CASES = [
         ["默认设置里 link-scan", "读设置项", "恒为真"],
         None,
     ),
+    (
+        "F4：执行侧范围校验形同虚设（勾选范围之外的书签也会被移动）",
+        os.path.join("src", "apply.js"),
+        "export function isInScope(allowed, id) {\n"
+        "  if (allowed === null) return true;\n"
+        "  return allowed.has(String(id));\n"
+        "}",
+        "export function isInScope(allowed, id) {\n"
+        "  return true;   // ← 证伪补丁：范围校验被短路，谁都能动\n"
+        "}",
+        ["拦住", "清单外", "空数组"],
+        None,
+    ),
+    (
+        "F4：手动模式没收窄去重清单（勾 2 条会连带删掉全树重复项）",
+        os.path.join("ui", "options.js"),
+        "  state.dupPayload = scoped ? [] : dupPayload;",
+        "  state.dupPayload = dupPayload;   // ← 证伪补丁：手动模式也带上全量删除清单",
+        ["删除清单恒为空"],
+        None,
+    ),
+    (
+        "F4：scopeIds 只留在载荷里、不落进 task（worker 被回收后续跑就没有范围限制）",
+        os.path.join("src", "apply.js"),
+        "    scopeIds,\n"
+        "  };\n"
+        "  await set(K.TASK_CURRENT, task);",
+        "  };\n"
+        "  await set(K.TASK_CURRENT, task);   // ← 证伪补丁：scopeIds 不落盘",
+        ["落进 task", "回收"],
+        None,
+    ),
 ]
 
 

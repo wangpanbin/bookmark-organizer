@@ -72,6 +72,13 @@ GATED = [
     'btnArchiveReset', 'importantCount', 'btnImportantClear',
     'planEmpty', 'dupEmpty', 'snapEmpty', 'execBar', 'report', 'tabs',
     'btnExecute', 'btnPreview', 'targetRoot',
+    # F4 手动整理
+    'tabScopeCount', 'btnScopePick', 'btnScopePreview', 'btnScopeRetry',
+    'btnScopeClearDone', 'btnScopeClearAll', 'btnScopePickToggle',
+    'btnScopeAddPicked', 'btnScopeCancelPick', 'scopeSearch',
+    'scopePicker', 'scopeTree', 'scopeTreeEmpty', 'scopeList', 'scopeEmpty',
+    'scopePending', 'scopeDone', 'scopeFailed', 'scopeStale', 'scopeNote',
+    'scopeListCount', 'planScopeChip',
 ]
 miss = [i for i in GATED if i not in ids]
 print(f'\n  gated ids present: {"ALL OK" if not miss else miss}')
@@ -83,6 +90,12 @@ for t in ['plan', 'dup', 'health', 'snap', 'settings']:
     print(f'  data-tab={t:9} present: {ok}')
     if not ok:
         fails.append(f'data-tab={t} missing')
+
+# F4 的页签同样要点得到（E2E 按 data-tab 点）。
+ok = 'data-tab="scope"' in html
+print(f'  data-tab={"scope":9} present: {ok}')
+if not ok:
+    fails.append('data-tab=scope missing')
 
 # E2E clicks the tab by data-tab; confirm role attributes did not break that
 print(f'\n  role="tablist": {"role=\"tablist\"" in html}')

@@ -21,6 +21,7 @@ import { dedupeKey, hostOf, parseUrl, isExcludedUrl } from '../src/normalize.js'
 import {
   get, set, mutate, K, getSettings, updateSettings, getTask, TASK_STATUS,
   getDedupeVeto, isDedupeVetoed, toggleDedupeVeto, clearDedupeVeto,
+  getScopeList, updateScopeList, clearScopeList,
 } from '../src/storage.js';
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot } from '../src/backup.js';
 import {
@@ -34,8 +35,22 @@ import {
 import {
   getImportantUrls, isMarkedImportant, toggleImportant, clearImportant,
 } from '../src/archive/important.js';
+import {
+  SCOPE_STATUS, EMPTY_LIST, normalizeList, isEmptyList, runnableIds, annotateSelectable,
+  expandFolderSelection, addEntries, removeEntries, clearDone,
+  prepareScope, summarize, applyRunResult,
+} from '../src/scope-list.js';
 
 const MAX_ROWS = 300;
+
+/**
+ * 勾选区一次最多铺多少行。
+ * ⚠️ **刻意不用 MAX_ROWS**：那是计划表的截断上限，作用是「别让预览卡住」。
+ *    勾选区套同一个上限的话，用户会看不到也勾不到第 301 条书签，
+ *    而界面上没有任何「还有更多」的提示 —— 那不是性能优化，是丢数据。
+ *    这里的做法是**懒渲染**：只铺展开的文件夹，搜索时只铺命中的。
+ */
+const SCOPE_TREE_CHUNK = 200;
 
 const $ = (id) => document.getElementById(id);
 
@@ -57,6 +72,26 @@ const state = {
   llmErrors: [],
   picked: null, // 当前正在改判的条目
   seq: 0,       // 渲染完成计数，供 E2E 判断「这一轮真的跑完了」
+
+  // ── 手动范围（F4）──
+  /** 持久化的勾选清单。唯一写方是本页面（走 storage.js 的串行临界区） */
+  scopeList: EMPTY_LIST,
+  /**
+   * 当前这份 plan 是全量还是子集。
+   * ⚠️ 必须显式记着：两个入口写的是同一个 state.plan，界面上若不区分，
+   *    用户在「手动整理」勾了但没预览、切过来点执行，动的是上一次的全量计划。
+   */
+  planScope: { mode: 'all', count: 0 },
+  /** 勾选区是否展开 */
+  scopePicking: false,
+  /** 搜索词，空串 = 浏览模式 */
+  scopeQuery: '',
+  /** 展开着的文件夹 id 集合 */
+  scopeOpen: new Set(),
+  /** 勾选区里被勾上的 id。只在勾选区打开期间有效，「加入清单」时才落盘 */
+  scopeChecked: new Set(),
+  /** 本轮勾选区的锁集合，供 blocked 判定用 */
+  scopeLocks: [],
 };
 
 // ───────────────────────── 工具 ─────────────────────────
@@ -140,9 +175,23 @@ let execBusy = false;
 
 function setExecBusy(on) {
   execBusy = !!on;
-  for (const id of ['btnPreview', 'btnRestore', 'btnSnapshot']) {
+  // ⚠️ 手动整理的按钮也要按住。执行期间清单若被改动，用户会以为
+  //    「我刚移除的那条不会被动了」，而执行器跑的是**启动时**那份快照。
+  for (const id of ['btnPreview', 'btnRestore', 'btnSnapshot',
+    'btnScopeRetry', 'btnScopeClearDone', 'btnScopeClearAll',
+    'btnScopeAddPicked', 'btnScopePick', 'btnScopePreview']) {
     const el = $(id);
-    if (el) el.disabled = !!on;
+    if (!el) continue;
+    if (id === 'btnScopePreview') {
+      // 这个按钮的可用性由「清单里有没有待整理」决定，
+      // 执行期间要额外按住：预览会重写 K.LAST_PLAN，
+      // 而那正是执行器断点续跑要读的东西 —— 边跑边改它，
+      // 恢复出来的计划就不是用户点执行时确认过的那一份了。
+      const runnable = scopeIdsOf(state.scopeList).length;
+      el.disabled = !!on || !runnable;
+      continue;
+    }
+    el.disabled = !!on;
   }
   for (const el of document.querySelectorAll('#snapList button')) {
     el.disabled = !!on;
@@ -180,9 +229,23 @@ const REASON_LABEL = {
 
 /**
  * 读取 → 备份 → 分类 → 计划。
- * @param {{backup:boolean}} opts backup=false 时只重算，不再存新快照（改判/锁定后用）
+ * @param {{backup:boolean, mode?:'all'|'scope'}} opts
+ *        backup=false 时只重算，不再存新快照（改判/锁定后用）
+ *        mode='scope' 时只把**清单里**的条目送进分类（默认 'all'）
+ *
+ * ⚠️ mode 是「同一条管线换一组输入」，不是另一条管线。
+ *    收窄的只有喂给 buildPlan / selectForLlm 的那个 entries 数组，
+ *    读树、快照、分类规则、幂等判定、渲染全部走同一条路。
+ *    这样做的收益是：分类行为与全量整理**逐条一致**，
+ *    不存在「同一条书签在全量模式下分对、在手动模式下分错」这种分叉。
+ *
+ * ⚠️ 全量路径（mode='all'）逐行保持原样。判据很简单：
+ *    对这条路径的任何改动都要能解释「它为什么不会影响整理前的行为」，
+ *    解释不出来就不该改。
  */
 async function loadAndClassify(opts) {
+  const { mode = 'all' } = opts || {};
+  const scoped = mode === 'scope';
   // 这一步要读整棵书签树、可能还带一次 LLM 兜底，实测能到十几秒。
   // 表的形状是已知的（7 列），所以摆骨架；不放进 #planBody，
   // 因为 E2E 靠数它的行数判断这一轮渲染完了没有。
@@ -211,10 +274,37 @@ async function loadAndClassify(opts) {
   ]);
   state.taxonomy = getTaxonomy(taxOverride);
   state.veto = veto;
+  state.scopeLocks = locks;
+
+  /**
+   * 本轮要喂给分类器的 entries。
+   *
+   * ⚠️ scope 模式先对账：清单里 id 已失效的条目在这里标「已失效」并排除，
+   *    压根不进计划 —— 所以执行器那条「按 URL 重新定位 id」的自愈逻辑
+   *    永远碰不到它们（它取 search 结果的第一条，同 URL 存过多条时会认错人，
+   *    而认错就等于整理了一条用户没勾的书签）。
+   *
+   * ⚠️ 用 planEntries 而不是 state.entries 喂 buildPlan / selectForLlm：
+   *    这两处是**唯一**决定「哪些书签会被分类」的地方，
+   *    其余环节（读树、去重、渲染、勾选区）都要看到全树。
+   */
+  let planEntries = state.entries;
+  if (scoped) {
+    const prep = prepareScope(state.scopeList, state.entries, locks);
+    state.scopeList = prep.list;
+    planEntries = prep.entries;
+    // ⚠️ 对账结果必须走 updateScopeList（mutate 的串行临界区），
+    //    不能 `get` 之后 `set` 整份写回 —— 那是经典的读-改-写丢更新：
+    //    用户在另一个窗口正通过 updateScopeList 加书签，两条序列化的写方
+    //    后写的覆盖先写的，症状是「刚勾上的两条凭空消失」且不报错。
+    //    （这条闸门 findStorageRmw 只 walk src/，扫不到 ui/，
+    //    所以它在这里必须靠注释守住，而不是指望门禁。）
+    await updateScopeList(() => state.scopeList);
+  }
 
   setRules(DEFAULT_RULES);
   let plan = buildPlan({
-    entries: state.entries,
+    entries: planEntries,
     taxonomy: state.taxonomy,
     learnedRules: learned,
     locks,
@@ -233,7 +323,7 @@ async function loadAndClassify(opts) {
   state.llmErrors = [];
   if (settings.llmEnabled) {
     try {
-      const todo = selectForLlm(plan, state.entries, locks);
+      const todo = selectForLlm(plan, planEntries, locks);
       if (todo.length) {
         busy(`LLM 兜底分类中（${todo.length} 条待判）…`);
         const res = await classifyBatch(todo, {
@@ -244,7 +334,7 @@ async function loadAndClassify(opts) {
         state.llmErrors = res.errors || [];
         const { valid } = validateAssignments(res.assignments, state.taxonomy, isKnownPath);
         plan = buildPlan({
-          entries: state.entries,
+          entries: planEntries,
           taxonomy: state.taxonomy,
           learnedRules: learned,
           locks,
@@ -262,15 +352,47 @@ async function loadAndClassify(opts) {
   state.groups = settings.dedupeEnabled ? findDuplicates(state.entries) : [];
   // 被否决的条目不进执行载荷 —— README 承诺「待删条目逐条可否决」，
   // 过滤放在这里才能让确认弹窗的删除数和真正会删的数一致。
-  state.dupPayload = toRemovalList(state.groups)
+  const dupPayload = toRemovalList(state.groups)
     .filter((d) => !isDedupeVetoed(d.id, state.veto))
     .map((d) => {
       const src = state.byId.get(d.id);
-      return { id: d.id, url: d.url, title: d.title, path: src?.path || ['2'], keepId: d.keepId };
+      // ⚠️ path 退化时给 []，不给根 id 字面量。
+      //    早先这里是 `|| ['2']`，而 '2' 是经典书签模型下的固定 id；
+      //    账号书签模型下它是 280，回滚重建重复项时 ensurePath 拿它当根名
+      //    匹配不到、再回落到书签栏 —— 恢复出来的条目静默落错地方，不报错。
+      //    现在 backup.js 把「没有路径」当成独立分支：直接放回「其他书签」根。
+      return { id: d.id, url: d.url, title: d.title, path: src?.path || [], keepId: d.keepId };
     });
 
+  /**
+   * ⚠️⚠️ 手动模式下删除清单恒为空，这是这个功能的硬边界。
+   *
+   * 上面那份 dupPayload 是从**整棵树**独立算出来的，与计划无关。
+   * 若只把计划收窄、放过这份清单，那么「勾 5 条」会连带删掉全树的重复项，
+   * 而用户从头到尾只看见一个写着「只整理勾中的」的入口，
+   * 报告上还会显示「整理完成 100%」。删除不可逆，这是最不能出错的地方。
+   *
+   * 重复项在手动模式下仍然会算、仍然在「重复项」页逐条可见，
+   * 只是**不进入执行载荷**。真想删的人去那边单独执行全量整理。
+   */
+  state.dupPayload = scoped ? [] : dupPayload;
+
   state.plan = plan;
-  await set(K.LAST_PLAN, { plan, duplicates: state.dupPayload, snapshotTs: state.snapshotTs });
+  // ⚠️ count 用的是「本轮真会动的条数」，不是清单总数。
+  //    清单里还躺着 done / stale 的条目，拿总数当范围报出去会虚高，
+  //    用户核对「清单外 N 条」时两个数字对不上，整颗芯片就失去意义了。
+  state.planScope = scoped
+    ? { mode: 'scope', count: scopeIdsOf(state.scopeList).length }
+    : { mode: 'all', count: 0 };
+  await set(K.LAST_PLAN, {
+    plan,
+    duplicates: state.dupPayload,
+    snapshotTs: state.snapshotTs,
+    // ⚠️ 落进 LAST_PLAN 的是**本次真正允许动的 id**（pending + failed）。
+    //    执行器不读 storage 的清单，只认启动时这份快照 —— 所以它必须跟着走，
+    //    否则 service worker 被回收后续跑就会失去范围限制。
+    scopeIds: scoped ? scopeIdsOf(state.scopeList) : null,
+  });
 
   busy('');
   await render();
@@ -296,9 +418,28 @@ async function loadAndClassify(opts) {
  *      ① 失败一定有可见提示（红 toast），不再无声无息
  *      ② 无论成败都重新渲染，面板不会卡在不一致的中间态
  */
-async function safeReload(opts = { backup: false }) {
+/**
+ * 重算当前这份计划。
+ *
+ * ⚠️⚠️ **mode 必须跟着当前计划走，不能默认 'all'。**
+ *
+ *    早先的写法是 `safeReload(opts = { backup: false })`，mode 取不到就落回 'all'。
+ *    而 pollProgress 在**每次执行完之后**都会调它 —— 包括子集运行。
+ *    于是子集整理跑完的那一刻，界面上的计划悄悄变回了**整棵树**的计划，
+ *    删除清单也变回了全量的。用户刚谨慎地整理完一批，
+ *    顺手再点一次「执行整理」，就把整棵树重排了 ——
+ *    而这个功能存在的**全部理由**就是不让这件事发生。
+ *
+ *    芯片只是「告知」用户现在是哪种模式，不等于「拦住」。后果最坏的那条路
+ *    （子集跑完 → 计划变全量 → 用户再点一次执行）恰恰是最自然的操作序列。
+ *
+ *    所以这里显式继承 `state.planScope.mode`：重算的是「当前这份计划」，
+ *    它是子集，重算出来还是子集。
+ */
+async function safeReload(opts = {}) {
+  const mode = opts.mode || state.planScope.mode || 'all';
   try {
-    await loadAndClassify(opts);
+    await loadAndClassify({ ...opts, mode });
     return true;
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
@@ -332,6 +473,8 @@ async function render() {
   await renderSnapshots();
   await renderCounts();
   await renderReport();
+  renderScope();
+  renderPlanScopeChip();
   syncExecuteButton();
 }
 
@@ -369,6 +512,434 @@ function renderStats() {
 function syncExecuteButton() {
   const has = state.plan && (state.plan.items.length > 0 || state.dupPayload.length > 0);
   $('btnExecute').disabled = !has;
+}
+
+/**
+ * 贴在「执行整理」旁边的范围说明。
+ *
+ * ⚠️ 这个芯片存在的唯一理由：两个入口写的是**同一个** state.plan。
+ *    手动模式下用户在「手动整理」勾了书签但还没点预览，此时计划表里
+ *    仍是上一次的全量计划 —— 他切过去点「执行整理」，动的是全量。
+ *    没有这颗芯片，他完全看不出自己正要执行的是哪一种。
+ *
+ * 这与 2026-10-05 那次事故是同一个教训：执行路径的文案必须写明范围，
+ * 漏写一次就是 45 条书签在用户不知情的情况下被搬走。
+ */
+function renderPlanScopeChip() {
+  const el = $('planScopeChip');
+  if (!el) return;
+  const s = state.planScope;
+  if (!state.plan) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.dataset.mode = s.mode === 'scope' ? 'scope' : 'all';
+  el.textContent = s.mode === 'scope'
+    ? `本次只整理清单里的书签（清单 ${s.count} 条），清单之外的一条都不会动`
+    : '本次是全量整理：整棵书签树里能动的书签都会被分类';
+}
+
+// ═════════════════ 手动整理（F4）════════════════
+
+/** 清单里「本轮允许动的那些」的 id。这份快照会一路传到执行器。
+ *  ⚠️ 判据本身在 scope-list.js 的 runnableIds 里，这里**不重新定义** ——
+ *    预览裁子集、芯片显示条数、执行器拿范围必须用同一份，
+ *    否则三者会漂移，而漂移的症状是「多余条目被记成不在清单里」。 */
+const scopeIdsOf = (list) => runnableIds(list);
+
+/** 清单列表本身的渲染上限。只影响显示，不影响清单内容。 */
+const SCOPE_LIST_CAP = 500;
+
+const SCOPE_STATUS_LABEL = {
+  [SCOPE_STATUS.PENDING]: '待整理',
+  [SCOPE_STATUS.DONE]: '已整理',
+  [SCOPE_STATUS.FAILED]: '失败',
+  [SCOPE_STATUS.STALE]: '已失效',
+};
+
+/** 清单本体 + 四个计数 + 按钮的显隐 */
+function renderScope() {
+  const list = normalizeList(state.scopeList);
+  state.scopeList = list;
+  const stats = summarize(list);
+
+  $('scopePending').textContent = stats.pending;
+  $('scopeDone').textContent = stats.done;
+  $('scopeFailed').textContent = stats.failed;
+  $('scopeStale').textContent = stats.stale;
+  for (const k of ['pending', 'done', 'failed', 'stale']) {
+    const el = document.querySelector(`.scope-stat[data-k="${k}"]`);
+    if (el) el.dataset.zero = stats[k] ? '0' : '1';
+  }
+  const note = $('scopeNote');
+  if (note) {
+    const bits = [];
+    if (stats.pending) bits.push(`勾了 ${stats.pending} 条待整理`);
+    if (stats.failed) bits.push(`${stats.failed} 条可以重试`);
+    if (stats.stale) bits.push(`${stats.stale} 条书签已不存在，不会被处理`);
+    note.textContent = bits.join('；');
+  }
+
+  setTabCount('tabScopeCount', stats.pending + stats.failed);
+  $('btnScopeRetry').hidden = !stats.failed;
+  $('btnScopeClearDone').hidden = !stats.done;
+  $('btnScopeClearAll').hidden = !stats.total;
+  // 没有待整理的条目时禁用：点了也只会得到一句「清单是空的」
+  $('btnScopePreview').disabled = !(stats.pending + stats.failed);
+
+  const ul = $('scopeList');
+  ul.textContent = '';
+  const items = list.items;
+  const shown = items.slice(0, SCOPE_LIST_CAP);
+
+  if (isEmptyList(list)) {
+    $('scopeEmpty').hidden = false;
+    fillEmpty($('scopeEmpty'), '○', '清单还是空的',
+      '点上面的「选择书签」，勾上想整理的那些。'
+      + '没勾的书签不会移动，也不会被删除。');
+  } else {
+    $('scopeEmpty').hidden = true;
+    for (const it of shown) ul.append(scopeItemNode(it));
+  }
+  $('scopeListCount').textContent = items.length
+    ? `共 ${items.length} 条${items.length > shown.length ? `，下面是前 ${shown.length} 条` : ''}`
+    : '';
+}
+
+function scopeItemNode(it) {
+  const li = document.createElement('li');
+  li.className = 'scope-item';
+  li.dataset.status = it.status;
+  li.dataset.scopeId = it.id;
+
+  const name = document.createElement('span');
+  name.className = 'scope-name';
+  name.textContent = it.title || it.url || it.id;
+
+  const path = document.createElement('span');
+  path.className = 'scope-path';
+  path.textContent = displayPath(it.path);
+
+  const badge = document.createElement('span');
+  badge.className = 'scope-badge';
+  badge.textContent = SCOPE_STATUS_LABEL[it.status] || it.status;
+
+  li.append(name, path, badge);
+
+  // 失效条目写明「它原来在哪」，用户才能判断是自己删的还是被同步清的
+  if (it.status === SCOPE_STATUS.STALE && it.path.length) {
+    const why = document.createElement('span');
+    why.className = 'scope-err';
+    why.textContent = '书签已不存在';
+    why.title = `勾选时它在「${displayPath(it.path)}」`;
+    li.append(why);
+  }
+  if (it.status === SCOPE_STATUS.FAILED && it.lastError) {
+    const why = document.createElement('span');
+    why.className = 'scope-err';
+    why.textContent = it.lastError.length > 40 ? `${it.lastError.slice(0, 40)}…` : it.lastError;
+    why.title = it.lastError;
+    li.append(why);
+  }
+
+  const drop = document.createElement('button');
+  drop.type = 'button';
+  drop.className = 'scope-drop';
+  drop.textContent = '移出';
+  drop.title = '从清单里移出（不动你的书签）';
+  drop.dataset.scopeRemove = it.id;
+  li.append(drop);
+
+  return li;
+}
+
+/** parentId → 子条目。勾选区靠它把树铺出来。 */
+function scopeIndex() {
+  const byParent = new Map();
+  for (const e of state.entries) {
+    const k = String(e.parentId);
+    if (!byParent.has(k)) byParent.set(k, []);
+    byParent.get(k).push(e);
+  }
+  return byParent;
+}
+
+/** 搜索命中：返回这批 id 及其全部祖先 id。 */
+function scopeSearchHit(q) {
+  const needle = q.trim().toLowerCase();
+  if (!needle) return null;
+  const byId = new Map(state.entries.map((e) => [e.id, e]));
+  const hits = new Set();
+  for (const e of state.entries) {
+    if (e.type !== 'url') continue;
+    const hay = `${e.title || ''} ${e.url || ''}`.toLowerCase();
+    if (!hay.includes(needle)) continue;
+    hits.add(e.id);
+    // 把祖先也点亮，否则命中的条目会挂在一个看不见的折叠层里
+    let p = byId.get(String(e.parentId));
+    while (p && !hits.has(p.id)) {
+      hits.add(p.id);
+      p = byId.get(String(p.parentId));
+    }
+  }
+  return hits;
+}
+
+function renderScopePicker() {
+  const ul = $('scopeTree');
+  ul.textContent = '';
+  const hits = scopeSearchHit(state.scopeQuery);
+  const kids = scopeIndex();
+  const rows = annotateSelectable(state.entries, state.scopeLocks);
+  const blockedById = new Map(rows.map((r) => [r.entry.id, r.blocked]));
+  const lockedKeys = new Set((state.scopeLocks || []).map(dedupeKey).filter(Boolean));
+
+  let rendered = 0;
+  let truncated = false;
+
+  const walk = (entry, depth, host) => {
+    if (rendered >= SCOPE_TREE_CHUNK) { truncated = true; return; }
+    rendered += 1;
+
+    const isFolder = entry.type === 'folder';
+    const open = state.scopeOpen.has(entry.id) || !!hits;
+    const li = document.createElement('li');
+    li.className = 'scope-node';
+    li.dataset.scopeNode = entry.id;
+    li.dataset.blocked = blockedById.get(entry.id) ? '1' : '0';
+
+    const row = document.createElement('div');
+    row.className = 'scope-row';
+
+    // 折叠钮
+    const twist = document.createElement('button');
+    twist.type = 'button';
+    twist.className = 'scope-twist';
+    twist.textContent = isFolder ? (open ? '▾' : '▸') : '';
+    twist.dataset.scopeTwist = entry.id;
+    twist.setAttribute('aria-label', isFolder ? (open ? '收起' : '展开') : '');
+    row.append(twist);
+
+    // 勾选框
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = state.scopeChecked.has(entry.id);
+    const blocked = blockedById.get(entry.id);
+    cb.disabled = !!blocked;
+    cb.dataset.scopeCheck = entry.id;
+    cb.setAttribute('aria-label', `选择 ${entry.title || entry.id}`);
+    row.append(cb);
+
+    const label = document.createElement('span');
+    label.className = 'scope-label';
+    label.textContent = entry.title || (entry.url || entry.id);
+    row.append(label);
+
+    if (isFolder) {
+      // ⚠️ 这里必须统计**递归**后代，不能只看直接子项。
+      //    勾一个文件夹会展开它整棵子树（expandFolderSelection 是递归的），
+      //    若复选框只按直接子项算，就会出现「勾了文件夹，下面还有框没亮」，
+      //    用户会以为漏勾了、于是再去手动勾一遍 —— 结果是重复劳动，
+      //    或者更糟：他把没亮的那些取消掉，真正该整理的反而没进去。
+      const movable = expandFolderSelection(state.entries, entry.id, state.scopeLocks);
+      const on = movable.reduce((n, c) => n + (state.scopeChecked.has(c.id) ? 1 : 0), 0);
+      const cnt = document.createElement('span');
+      cnt.className = 'scope-n';
+      cnt.textContent = movable.length ? `${on} / ${movable.length}` : '';
+      row.append(cnt);
+      // 三态：全选 / 部分 / 全不选
+      cb.checked = movable.length > 0 && on === movable.length;
+      cb.indeterminate = on > 0 && on < movable.length;
+    } else {
+      const hostEl = document.createElement('span');
+      hostEl.className = 'scope-host';
+      hostEl.textContent = hostOf(entry.url) || '';
+      row.append(hostEl);
+    }
+
+    // ⚠️ 不可动项在**源头**就说清原因，而不是等预览时才发现勾了白勾
+    if (blocked) {
+      const why = document.createElement('span');
+      why.className = 'scope-why';
+      why.textContent = blocked;
+      row.append(why);
+      // 已锁定的额外给一个就地「解锁」入口：锁是用户自己随时能解的，
+      // 让他为了解一条锁跑去计划表那边找不方便，也不该被这条锁永远挡住。
+      if (entry.url && lockedKeys.has(dedupeKey(entry.url))) {
+        const un = document.createElement('button');
+        un.type = 'button';
+        un.className = 'scope-unlock';
+        un.textContent = '解锁';
+        un.dataset.scopeUnlock = entry.url;
+        row.append(un);
+      }
+    }
+
+    li.append(row);
+
+    host.append(li);
+
+    // 子层
+    const children = (kids.get(entry.id) || []).filter((c) => !hits || hits.has(c.id));
+    if (isFolder && children.length && open) {
+      const box = document.createElement('ul');
+      box.className = 'scope-kids';
+      for (const c of children) walk(c, depth + 1, box);
+      li.append(box);
+    }
+  };
+
+  // 顶层根：flattenTree 给它们的 parentId 是 '0'（同步根）或 '-1'
+  const roots = state.entries.filter((e) => e.parentId === '0' || e.parentId === '-1');
+  for (const r of roots) {
+    if (hits && !hits.has(r.id)) continue;
+    walk(r, 0, ul);
+  }
+
+  $('scopeTreeEmpty').hidden = roots.length > 0;
+  if (!roots.length) {
+    fillEmpty($('scopeTreeEmpty'), '○', '读不到书签', '点「重试」或到 chrome://extensions 重新加载扩展。');
+  }
+
+  // 折叠时一条都数不出来，用户会以为「这棵树是空的」。明确说被截断了。
+  if (truncated) {
+    const more = document.createElement('p');
+    more.className = 'more';
+    more.textContent = `已显示前 ${SCOPE_TREE_CHUNK} 项。收窄搜索词，或点「展开全部」按文件夹逐层找。`;
+    ul.parentElement.append(more);
+  }
+  $('btnScopePickToggle').textContent = state.scopeOpen.size ? '收起全部' : '展开全部';
+}
+
+/** 勾选区里勾上一个文件夹 = 把它里面能动的书签全勾上 */
+function toggleScopeFolder(folderId, on) {
+  const entries = expandFolderSelection(state.entries, folderId, state.scopeLocks);
+  for (const e of entries) {
+    if (on) state.scopeChecked.add(e.id);
+    else state.scopeChecked.delete(e.id);
+  }
+}
+
+async function openScopePicker() {
+  state.scopePicking = true;
+  $('scopePicker').hidden = false;
+  if (!state.entries.length) {
+    busy('正在读取书签树…');
+    try {
+      state.entries = await readFlatTree();
+      state.byId = new Map(state.entries.map((e) => [e.id, e]));
+    } finally {
+      busy('');
+    }
+  }
+  state.scopeLocks = await get(K.LOCKS, []);
+  renderScopePicker();
+}
+
+function closeScopePicker() {
+  state.scopePicking = false;
+  state.scopeChecked.clear();
+  state.scopeQuery = '';
+  const s = $('scopeSearch');
+  if (s) s.value = '';
+  $('scopePicker').hidden = true;
+  $('scopeTree').textContent = '';
+}
+
+/** 「加入清单」：勾选区里勾上的落盘 */
+async function addPickedToList() {
+  if (!state.scopeChecked.size) {
+    toast('还没有勾选任何书签');
+    return;
+  }
+  const picked = state.entries.filter((e) => state.scopeChecked.has(e.id) && e.type === 'url');
+  const before = normalizeList(state.scopeList).items.length;
+  await updateScopeList((cur) => addEntries(cur, picked));
+  state.scopeList = await getScopeList();
+  const added = state.scopeList.items.length - before;
+  state.scopeChecked.clear();
+  renderScope();
+  renderScopePicker();
+  toast(added > 0 ? `已加入 ${added} 条，清单共 ${state.scopeList.items.length} 条` : '这些书签已经在清单里了');
+}
+
+/** 把选中项移出清单（不动真实书签） */
+async function removeFromList(ids) {
+  await updateScopeList((cur) => removeEntries(cur, ids));
+  state.scopeList = await getScopeList();
+  renderScope();
+}
+
+async function doScopePreview({ retryFailed = false } = {}) {
+  // ⚠️ 「重试失败项」必须**只**重跑失败的那些。
+  //    早先的实现是把 failed 翻回 pending、再按「全部 pending+failed」预览，
+  //    于是清单里那些还没整理过的条目也被一起带上 ——
+  //    按钮上写着「重试失败」，实际却连带处理了别的，用户完全看不出来。
+  //    只留 failed 这一批：pending 的那些本来就还没轮到，不该被「重试」捎上。
+  if (retryFailed) {
+    const failedIds = state.scopeList.items
+      .filter((it) => it.status === SCOPE_STATUS.FAILED)
+      .map((it) => it.id);
+    if (!failedIds.length) { toast('没有失败项可重试'); return; }
+    // 把本轮范围收窄到「只有失败的那些」：先把 pending 挪出本轮，
+    // 预览与执行都只认这个临时范围，跑完再恢复。
+    const keep = new Set(failedIds);
+    const savedList = state.scopeList;
+    state.scopeList = {
+      ...state.scopeList,
+      items: state.scopeList.items.filter((it) => keep.has(it.id)),
+    };
+    try {
+      await runScopePreview();
+    } finally {
+      state.scopeList = savedList;   // 预览失败也不留下一个残缺的清单
+    }
+    return;
+  }
+  await runScopePreview();
+}
+
+async function runScopePreview() {
+  const runnable = scopeIdsOf(state.scopeList).length;
+  if (!runnable) {
+    toast('清单里没有待整理的书签。先勾选几条再试。', true);
+    return;
+  }
+  execBarReset = true;
+  $('btnScopePreview').disabled = true;
+  try {
+    await loadAndClassify({ backup: true, mode: 'scope' });
+    if (state.llmErrors.length) toast(state.llmErrors[0], true);
+    // ⚠️ 计划表只有一张，且在「计划明细」页。
+    //    这里自动切过去，用户点预览后的第一眼就该是结果，
+    //    而不是停在勾选区以为「点了没反应」。
+    const tab = document.querySelector('#tabs button[data-tab="plan"]');
+    if (tab) selectTab(tab);
+    toast(`预览完成：清单里的 ${state.plan.items.length} 条待移动，清单之外的书签不会被动`);
+  } catch (e) {
+    busy('');
+    showSkeleton('planSkeleton', 6, false);
+    $('planTable').hidden = true;
+    $('planEmpty').hidden = false;
+    fillEmpty($('planEmpty'), '○', '预览没跑起来',
+      '读书签树时出错了。点「重试」，或到 chrome://extensions 重新加载扩展。');
+    toast(`预览失败：${e.message || e}`, true);
+  } finally {
+    $('btnScopePreview').disabled = false;
+  }
+}
+
+/**
+ * 一轮执行结束后把结果写回清单。
+ * ⚠️ 必须在**面板侧**写，而不是让执行器写：清单的唯一写方是本页面
+ *    （service worker 不碰它，避免与面板的读写抢同一个键）。
+ */
+async function writeBackScopeResult(task) {
+  if (!task || !Array.isArray(task.scopeIds)) return;   // 全量运行，清单无关
+  await updateScopeList((cur) => applyRunResult(cur, task.plan?.items || [], task.failed || []));
+  state.scopeList = await getScopeList();
+  renderScope();
 }
 
 function renderPlan() {
@@ -879,6 +1450,8 @@ async function doExecute() {
   if (!plan) return;
   const dups = state.dupPayload;
   const root = await resolveTargetRoot();
+  const scoped = state.planScope.mode === 'scope';
+  const scopeIds = scoped ? scopeIdsOf(state.scopeList) : null;
 
   // ⚠️ 归入位置解析不出来就地拦下，别让用户点完确认才看结果。
   //    这一条是 2026-10-05 那次全军覆没的直接补丁：根 id 写死成 '1'，
@@ -890,21 +1463,40 @@ async function doExecute() {
     return;
   }
 
+  // 子集模式下清单为空说明上下游状态不一致（清单在预览后被清空了）。
+  // 这里再拦一次：执行器也有同样的检查，但那时用户已经点过确认了。
+  if (scoped && !scopeIds.length) {
+    toast('这是一次只整理清单里书签的任务，但清单已经空了，没有任何书签会被移动。', true);
+    return;
+  }
+
   // 将要新建的**顶层**文件夹名 —— 用户靠它就能预判整理后的书签栏长什么样
   const newTops = [...new Set(plan.newFolders
     .filter((p) => Array.isArray(p) && p.length)
     .map((p) => p[0]))];
 
+  // 未勾选的 URL 条数。「其余 N 条一条都不动」这句话必须能被用户自己核对，
+  // 否则它只是一句承诺。而删除数在子集模式下恒为 0 —— 手动模式不删任何书签。
+  const totalUrls = state.entries.filter((e) => e.type === 'url').length;
+  const untouched = Math.max(0, totalUrls - (scopeIds ? scopeIds.length : totalUrls));
+
   const msg = [
-    '即将整理你的书签：',
+    // ⚠️ confirm() 是原生弹窗，**不渲染 markdown**。
+    //    写成 '**只整理你勾选的书签**' 的话用户会看到字面的两个星号。
+    scoped ? '即将只整理你勾选的书签：' : '即将整理你的书签：',
     '',
     `　移动　　${plan.items.length} 条`,
     `　新建　　${plan.newFolders.length} 个文件夹`,
     `　删除　　${dups.length} 条重复项`,
-    // 把否决条数摆出来：用户勾了「不删」却看不到任何变化，
-    // 就只能靠猜这份清单到底准不准 —— 那等于没给否决权。
     ...(state.veto.length ? [`　　　　　（其中 ${state.veto.length} 条已被你标记为不删）`] : []),
     '',
+    // ⚠️ 范围承诺写在这里，且在**移动数**的旁边。用户读第一屏就能核对。
+    ...(scoped
+      ? [
+        `　清单内　${scopeIds.length} 条（本次只动这些）`,
+        `　清单外　${untouched} 条（一条都不会移动，也不会删除）`,
+      ]
+      : ['　本次是全量整理：整棵树里能动的书签都会被分类']),
     // ⚠️ 这一行是本次修复的重点：整理到**哪个根**是设置决定的，
     //    而计划清单里不含根名，界面上看不出来。不写清楚的话，
     //    「归入位置」不是书签栏的用户会看到「整理完成」却找不到书。
@@ -914,6 +1506,7 @@ async function doExecute() {
     `快照：${state.snapshotTs ? new Date(Number(state.snapshotTs)).toLocaleString() : '（将自动创建）'}`,
     '',
     '这些操作可以点「恢复备份」回滚。',
+    ...(scoped ? ['回滚会恢复整棵书签树到快照时的样子，不只清单里的这几条。'] : []),
     '',
     '确定继续？',
   ].join('\n');
@@ -926,6 +1519,11 @@ async function doExecute() {
     plan,
     duplicates: dups,
     snapshotTs: state.snapshotTs,
+    // ⚠️ scopeIds 是一份**快照**，执行器全程只认它。
+    //    这么设计的理由：service worker 不读清单，浏览器把它回收后
+    //    续跑也拿得到同一份范围，用户在执行期间改清单不会影响正在跑的任务，
+    //    也不需要任何锁来协调两个执行环境。
+    scopeIds: scoped ? scopeIdsOf(state.scopeList) : null,
   });
   if (!res.ok) {
     toast(`启动失败：${res.error}`, true);
@@ -973,6 +1571,9 @@ async function pollProgress() {
   // 跑完重新读树，刷新计划视图
   await safeReload();
   const task = await getTask();
+  // ⚠️ 先把结果写回清单，再判成功失败。
+  //    顺序反了的话，用户会先看到「整理完成」，再发现清单还全标着「待整理」。
+  await writeBackScopeResult(task);
   if (task.status !== TASK_STATUS.DONE) {
     if (task.status === TASK_STATUS.FAILED) toast('整理中断了，点「继续」可以接着跑', true);
     return;
@@ -986,8 +1587,14 @@ async function pollProgress() {
   const doneN = items.filter((i) => i.status === 'done').length;
   const failN = items.filter((i) => i.status === 'failed').length;
   const movedN = items.filter((i) => i.idRelocated).length;
-  const goneN = (task.stale || []).length;
   const root = await resolveTargetRoot();
+  const scoped = Array.isArray(task.scopeIds);
+  // ⚠️ stale 里现在混着两类东西，必须分开数：
+  //    「书签真的不存在」和「不在清单里、被范围校验挡下」。
+  //    混在一起会把范围拦截报成「N 条书签已不存在」，而书签其实好好地在树上。
+  const staleAll = Array.isArray(task.stale) ? task.stale : [];
+  const goneN = staleAll.filter((s) => s && !s.outOfScope).length;
+  const guarded = staleAll.filter((s) => s && s.outOfScope).length;
 
   // 计划被修正过这件事，必须留在**最后**这条提示里。
   // 早先只在开始时提示「已按 URL 重新定位 N 条」，几秒后被「整理完成」覆盖 ——
@@ -996,6 +1603,12 @@ async function pollProgress() {
   if (movedN) notes.push(`其中 ${movedN} 条的 id 已失效、按 URL 重新定位后才搬动`);
   if (goneN) notes.push(`${goneN} 条书签确实已不存在，已跳过`);
 
+  // ⚠️ 范围闸门真的挡下过东西时必须说出来。
+  //    正常情况下子集运行的这个数恒为 0；不为 0 说明上游裁剪漏了，
+  //    而这一次拦截就是「清单之外零改动」这条承诺没有失守的唯一证据。
+  //    静默吞掉的话，用户永远不知道自己其实差点动到了清单外的书签。
+  if (guarded) notes.push(`${guarded} 条不在清单里，已被范围校验挡住、没有移动`);
+
   if (failN > 0) {
     toast(`整理结束：成功 ${doneN} 条，失败 ${failN} 条`
       + (notes.length ? `（${notes.join('；')}）` : '')
@@ -1003,7 +1616,8 @@ async function pollProgress() {
     renderFailures(items, task);
     return;
   }
-  toast(`整理完成：${doneN} 条已归入「${root.name}」`
+  const prefix = scoped ? '清单内整理完成' : '整理完成';
+  toast(`${prefix}：${doneN} 条已归入「${root.name}」`
     + (notes.length ? `（${notes.join('；')}）` : ''));
 }
 
@@ -2019,6 +2633,14 @@ function selectTab(btn, { focus = false } = {}) {
     initSemantic().catch(() => {});
     initArchive().catch(() => {});
   }
+  // 手动整理同理：勾选区要读整棵书签树，只在用户真的要看它时才读清单。
+  // selectTab 是同步的（E2E 点完页签要立刻能断言 active），所以这里发火不等待。
+  if (btn.dataset.tab === 'scope') {
+    getScopeList().then((list) => {
+      state.scopeList = list;
+      renderScope();
+    }).catch(() => {});
+  }
 }
 
 async function init() {
@@ -2070,6 +2692,96 @@ async function init() {
   $('btnExecute').addEventListener('click', doExecute);
   $('btnPause').addEventListener('click', () => send('pauseExecution').then(() => renderReport()));
   $('btnResume').addEventListener('click', () => send('resumeExecution').then(() => pollProgress()));
+
+  // ── 手动整理（F4）──
+  $('btnScopePick').addEventListener('click', () => openScopePicker().catch((e) => {
+    toast(`读不到书签树：${e.message || e}`, true);
+  }));
+  $('btnScopePreview').addEventListener('click', () => doScopePreview());
+  $('btnScopeRetry').addEventListener('click', () => doScopePreview({ retryFailed: true }));
+  $('btnScopeClearDone').addEventListener('click', async () => {
+    const n = summarize(state.scopeList).done;
+    if (!confirm(`从清单里移除 ${n} 条「已整理」的？\n\n只是从清单里划掉，不会动你的书签。`)) return;
+    await updateScopeList((cur) => clearDone(cur));
+    state.scopeList = await getScopeList();
+    renderScope();
+    toast(`已从清单里移除 ${n} 条，书签没有被动`);
+  });
+  $('btnScopeClearAll').addEventListener('click', async () => {
+    const n = summarize(state.scopeList).total;
+    if (!confirm(`清空整份清单（${n} 条）？\n\n只是清掉这张清单，不会动你的书签。清完勾选记录就没了。`)) return;
+    await clearScopeList();
+    state.scopeList = normalizeList(await getScopeList());
+    renderScope();
+    toast('清单已清空');
+  });
+
+  // 勾选区
+  $('btnScopePickToggle').addEventListener('click', async () => {
+    if (state.scopeOpen.size) {
+      state.scopeOpen.clear();
+    } else {
+      busy('正在展开全部…');
+      try {
+        // 懒渲染有 SCOPE_TREE_CHUNK 的上限，全展开会截断并提示，
+        // 这里的全展开只是把所有文件夹塞进 open 集合，实际铺多少仍由渲染层裁。
+        for (const e of state.entries) if (e.type === 'folder') state.scopeOpen.add(e.id);
+        if (!state.entries.length) {
+          state.entries = await readFlatTree();
+          state.byId = new Map(state.entries.map((e) => [e.id, e]));
+        }
+      } finally {
+        busy('');
+      }
+    }
+    renderScopePicker();
+  });
+  $('btnScopeCancelPick').addEventListener('click', closeScopePicker);
+  $('btnScopeAddPicked').addEventListener('click', addPickedToList);
+  $('scopeSearch').addEventListener('input', (e) => {
+    state.scopeQuery = e.target.value || '';
+    renderScopePicker();
+  });
+
+  // 勾选区与清单都用事件委托：DOM 每次渲染都重建，
+  // 逐个绑监听会在重渲染后指向已废弃的节点（症状是「点第一下有用，再点就没反应」）。
+  $('scopeTree').addEventListener('click', async (e) => {
+    const un = e.target.closest('[data-scope-unlock]');
+    if (un) {
+      const url = un.dataset.scopeUnlock;
+      await mutate(K.LOCKS, (ls) => (ls || []).filter((u) => dedupeKey(u) !== dedupeKey(url)), []);
+      state.scopeLocks = await get(K.LOCKS, []);
+      renderScopePicker();
+      toast('已解锁，这条现在可以勾选了');
+      return;
+    }
+    const tw = e.target.closest('[data-scope-twist]');
+    if (tw) {
+      const id = tw.dataset.scopeTwist;
+      if (state.scopeOpen.has(id)) state.scopeOpen.delete(id);
+      else state.scopeOpen.add(id);
+      renderScopePicker();
+    }
+  });
+  $('scopeTree').addEventListener('change', (e) => {
+    const cb = e.target.closest('[data-scope-check]');
+    if (!cb) return;
+    const id = cb.dataset.scopeCheck;
+    const entry = state.byId.get(id);
+    if (!entry) return;
+    if (entry.type === 'folder') {
+      toggleScopeFolder(id, cb.checked);
+      // 文件夹勾选会带动后代，重画一次才能把子层的框也点亮
+      renderScopePicker();
+      return;
+    }
+    if (cb.checked) state.scopeChecked.add(id);
+    else state.scopeChecked.delete(id);
+  });
+  $('scopeList').addEventListener('click', (e) => {
+    const drop = e.target.closest('[data-scope-remove]');
+    if (drop) removeFromList([drop.dataset.scopeRemove]);
+  });
   $('btnRestore').addEventListener('click', async () => {
     const snaps = await listSnapshots();
     if (!snaps.length) { toast('还没有快照可恢复', true); return; }
