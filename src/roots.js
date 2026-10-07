@@ -101,6 +101,46 @@ export async function listRoots() {
 }
 
 /**
+ * 从顶层根数组里按**语义键**取真实 id。
+ *
+ * 为什么要有它：调用方（backup.js）手里往往只有 `getTree()[0].children` 这段 tops，
+ * 而不是完整的 trees。而「第 0 个是书签栏、第 1 个是其他书签」这条**位置**契约
+ * 必须只有一份定义 —— 在 backup.js 里再抄一遍 KEY_BY_INDEX，就等于又开了一处
+ * 会漂移的地方，而根 id 写错的后果是 45 条 move 报同一句零信息量的报错。
+ *
+ * 纯函数：Node 下可单测。
+ *
+ * @param {Array} tops getTree()[0].children
+ * @param {string} key ROOT_BAR / ROOT_OTHER
+ * @returns {string|null} 真实 id；位置越界或节点缺失则 null
+ */
+export function rootIdByKeyFromTops(tops, key) {
+  const idx = KEY_BY_INDEX.indexOf(key);
+  if (idx < 0) return null;
+  const t = (Array.isArray(tops) ? tops : [])[idx];
+  if (!t || t.url) return null;
+  return String(t.id ?? '') || null;
+}
+
+/**
+ * 这个 id 是不是**活着的**顶层根之一。
+ *
+ * ⚠️ 判据必须是对着真实节点比，不能对着 '1'/'2'/'3' 这组字面量比：
+ *    账号书签模型下真实 id 是 279/280/281，拿字面量比永远判假，
+ *    于是「路径第 0 段本来就是根 id」这一路永远走不到。
+ *
+ * 纯函数：Node 下可单测。
+ *
+ * @param {Array} tops getTree()[0].children
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isLiveRootId(tops, id) {
+  if (id === null || id === undefined || id === '') return false;
+  return (Array.isArray(tops) ? tops : []).some((t) => t && !t.url && String(t.id ?? '') === String(id));
+}
+
+/**
  * 解析出真正可写的目标根，并**实测它存在**。
  *
  * ⚠️ 为什么要多这一次 get()：getTree() 是快照，用户可能在读之后

@@ -12,43 +12,52 @@
 import { get, mutate, mutateMany, remove, K, getSettings } from './storage.js';
 import { flattenTree, readTree } from './tree.js';
 import { dedupeKey } from './normalize.js';
+import { isLiveRootId, rootIdByKeyFromTops, ROOT_BAR, ROOT_OTHER } from './roots.js';
 
 const snapKey = (ts) => `snapshot:${ts}`;
 
 /**
- * Chrome 三个根的 **id** 是固定契约：1=书签栏 2=其他书签 3=移动设备书签。
- * 随界面语言变的只是它们的**标题**。
+ * ⚠️⚠️ 本文件**不再有任何根 id 字面量**（'1' / '2' / '3' 一律不许出现）。
  *
- * 所以规矩是：找根必须「标题 → id」反查（标题本地化，不能写死），
- * 而「指向某个根」可以用固定 id —— 但必须走常量，不写裸字面量。
+ * 早先这里写死过 `const ROOT_ID = { BAR:'1', OTHER:'2', MOBILE:'3' }`，
+ * 注释还言之凿凿「根 id 是固定契约，只有标题随语言变」。那是错的：
+ * Chrome 154 的账号书签模型实测是 书签栏=279 / 其他书签=280 / 移动设备=281。
+ * 于是 `ROOT_ID.OTHER` 那条 move 在 154 上必然打到不存在的 id，
+ * chrome.bookmarks.move 抛错，被 restoreSnapshot 的 catch 收进 failures ——
+ * **不报错、清单上还看不出来**，症状是「恢复出来的重复项静默没归位」。
+ *
+ * 正确口径统一由 roots.js 提供（按位置解析，那条契约在两种模型下实测一致），
+ * 详见 roots.js 顶部那次 45 条书签全军覆没的事故记录。
  */
-const ROOT_ID = Object.freeze({ BAR: '1', OTHER: '2', MOBILE: '3' });
 
-/** 路径第 0 段是不是已经是一个根 id（而不是根名） */
-function isRootId(seg) {
-  return Object.values(ROOT_ID).includes(String(seg));
+/** 路径第 0 段是不是一个**活着的**顶层根 id（而不是根名） */
+function isRootId(seg, tops) {
+  return isLiveRootId(tops, seg);
 }
 
 /**
  * 把根文件夹**名**换成根文件夹 **id**。
  *
  * ⚠️ 踩过的坑：这里曾经直接 `return pathArr[0]`，把「书签栏」这个**名字**
- *    当成 parentId 传给了 chrome.bookmarks.move()，而 API 只认 id（'1'/'2'/'3'）。
+ *    当成 parentId 传给了 chrome.bookmarks.move()，而 API 只认 id。
  *    根名随界面语言变，不能硬编码，所以从 getTree() 里反查。
  *    症状是「回滚对根级书签全部静默失败」—— 不报错，只是没归位。
  *
+ * ⚠️ 兜底也不再是字面量 '1'：取 tops 的第 0 个（书签栏）。
+ *    匹配不上根名时回落到书签栏，而不是回落到一个可能根本不存在的 id ——
+ *    前者最坏结果是「放错地方」，后者是「静默什么都不发生」。
+ *
  * @param {string} rootName
  * @param {Array} tops getTree()[0].children
- * @returns {string} 根 id
+ * @returns {string|null} 根 id；连书签栏都取不到时返回 null
  */
 function rootIdFromName(rootName, tops) {
   const hit = (tops || []).find((t) => !t.url && t.title === rootName);
   if (hit) return String(hit.id);
   // 兜底：路径里的根名在树上找不到（根被删或被改名）。
-  // 这里只按 id 契约回落，**不再比对中文字面量** —— 根标题是本地化的，
-  // 拿「其他书签」四个字去比，在非中文 Chrome 上必然匹配不上，
-  // 而匹配不上时静默回落到书签栏，正是上面那个「不报错只是没归位」的坑。
-  return ROOT_ID.BAR;
+  // 只按位置回落，**不再比对中文字面量** —— 根标题是本地化的，
+  // 拿「其他书签」四个字去比，在非中文 Chrome 上必然匹配不上。
+  return rootIdByKeyFromTops(tops, ROOT_BAR);
 }
 
 /** 某段路径相对根之下的层级，用于建目录时逐级下降 */
@@ -72,10 +81,11 @@ async function ensureFolder(parentId, title) {
  * 按路径逐级确保文件夹存在。
  *
  * ⚠️ 路径第 0 段允许是根**名**（正常情况），也允许直接是根 **id**。
- *    去重清单里的 path 在取不到源条目时会退化成 ['2']（见 ui/options.js 的 dupPayload），
- *    把它当根名丢给 rootIdFromName 会一路回落到书签栏，
- *    症状是**恢复出来的重复项静默落进书签栏**，不报错、清单上还看不出来。
- *    所以这里先判一次是不是根 id，是就直接拿它当起点。
+ *    两者都要认，因为 `ensurePath` 有两类调用方：
+ *      - restoreSnapshot 第 2 步：路径来自快照，根是根**名**
+ *      - restoreSnapshot 第 5 步：路径来自去重清单，根可能是 id
+ *    判「是不是 id」必须对着**活着的**根比（isRootId），不能对着字面量比 ——
+ *    账号书签模型下真实 id 是 279，字面量比对永远判假。
  *
  * @param {string[]} pathArr 完整路径，第 0 段是根名（或根 id）
  * @param {Array} tops getTree()[0].children，用于把根名换成根 id
@@ -84,7 +94,8 @@ async function ensureFolder(parentId, title) {
  */
 async function ensurePath(pathArr, tops, createdOut) {
   const head = pathArr[0];
-  const rootId = isRootId(head) ? String(head) : rootIdFromName(head, tops);
+  const rootId = isRootId(head, tops) ? String(head) : rootIdFromName(head, tops);
+  if (!rootId) throw new Error(`路径「${pathArr.join('/')}」找不到可用的顶层根 id`);
   const segs = segmentsBelowRoot(pathArr);
   let parentId = String(rootId);
   const acc = [];
@@ -263,11 +274,18 @@ export async function restoreSnapshot(ts) {
         }
       } else {
         // 快照之后新增的：放回「其他书签」根。
-        // 走 ROOT_ID.OTHER 而不是裸写 '2' —— 同文件里就有 rootIdFromName
-        // 这套「根名↔根 id」的解析，绕开它等于把规则又破一次。
+        // ⚠️ 这里曾经是 ROOT_ID.OTHER，而那是个硬编码字面量 '2'。
+        //    账号书签模型下真实 id 是 280，于是这条 move 必然抛错、
+        //    被下面的 catch 收进 failures —— 不报错、清单上也看不出来，
+        //    症状是「恢复完快照，新出现的那几条书签不知道去哪了」。
+        //    现在按位置解析（roots.js 那条两种模型都成立的契约）。
         if (e.path.length <= 1) continue;
         try {
-          await chrome.bookmarks.move(e.id, { parentId: ROOT_ID.OTHER });
+          // 「其他书签」缺失时回落书签栏，与 roots.js resolveRoot 同一口径：
+          // 放错地方是可见的，move 到不存在的 id 则是什么都不发生。
+          const otherId = rootIdByKeyFromTops(tops, ROOT_OTHER) || rootIdByKeyFromTops(tops, ROOT_BAR);
+          if (!otherId) throw new Error('书签树里没有可用的顶层根');
+          await chrome.bookmarks.move(e.id, { parentId: otherId });
           report.movedNew += 1;
         } catch (err) {
           report.failures.push({ step: 'moveNew', detail: e.url, error: String(err) });
@@ -297,7 +315,16 @@ export async function restoreSnapshot(ts) {
     const removedDups = Array.isArray(task.removedDuplicates) ? task.removedDuplicates : [];
     for (const d of removedDups) {
       try {
-        const parentId = await ensurePath(d.path || ['2'], tops, createdOut);
+        // ⚠️ 早先这里是 `ensurePath(d.path || ['2'], ...)`，那个 '2' 是根 id 字面量，
+        //    账号书签模型下查无此节点。而 path 为空时 ensurePath 会拿 undefined
+        //    去匹配根名、再回落到书签栏 —— 症状是「恢复出来的重复项静默落进书签栏」，
+        //    不报错、清单上还看不出来。
+        //    现在把「没有路径」当成独立分支显式处理：直接放回「其他书签」根。
+        const path = Array.isArray(d.path) ? d.path : [];
+        const parentId = path.length
+          ? await ensurePath(path, tops, createdOut)
+          : (rootIdByKeyFromTops(tops, ROOT_OTHER) || rootIdByKeyFromTops(tops, ROOT_BAR));
+        if (!parentId) throw new Error('书签树里没有可用的顶层根');
         await chrome.bookmarks.create({ parentId, title: d.title || d.url, url: d.url });
         report.dupRestored += 1;
       } catch (err) {
