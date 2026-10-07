@@ -16,14 +16,25 @@ Edit the right-hand column to match whatever vocabulary you actually use.
 
 ## Where the label physically lives
 
-There are **two** homes for a label, and they must agree:
+The tracker is **GitHub Issues** (see `issue-tracker.md`). All five labels in the table above are
+real label objects already provisioned on `wangpanbin/bookmark-organizer` — `gh label list` shows
+them, so `triage` applies them with `gh issue edit <n> --add-label "<name>"` and never has to
+create one. Do not hand-edit the right-hand column to invent new strings: a name that doesn't
+exist on the remote makes `--add-label` fail.
 
-| Home | Who uses it | Shape |
+Two paths apply a label automatically, and one of them fails silently:
+
+| Path | Applies labels? | Notes |
 | --- | --- | --- |
-| `.scratch/<feature>/issues/NN-*.md` | agent 工作流（`/wayfinder`、MATT 工单流） | 文件顶部一行 `Status: needs-triage` |
-| GitHub repo | 对外 issue / PR | 真实 label 对象，由 `.github/ISSUE_TEMPLATE/*.yml` 的 `labels:` 字段自动带上 |
+| `.github/ISSUE_TEMPLATE/*.yml` via the **web UI** | yes — the `labels: ["needs-triage"]` field | only for humans filing in the browser |
+| `gh issue create --title/--body` | **no** — templates are bypassed entirely | pass `--label "..."` yourself |
 
-Both are real. The GitHub labels are created objects — `gh label list` will show them.
-An issue template that names a label which does not exist **silently drops it**: the issue
-gets filed with no label and nothing errors, so the gap only shows up later as "why is
-nothing triaged?". After changing a label string here, apply it to both homes.
+An issue template that names a label which does not exist **silently drops it**: the issue gets
+filed with no label and nothing errors, so the gap only shows up later as "why is nothing
+triaged?". After changing a label string here, create it on the remote too.
+
+## Legacy: `.scratch/`
+
+Tickets used to live as local markdown with a `Status:` line per file. That tree is a
+**pre-migration snapshot**, not a live tracker — do not read its `Status:` lines as current state.
+
