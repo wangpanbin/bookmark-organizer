@@ -185,20 +185,24 @@ const HANDLERS = {
   semanticRun: async (p) => {
     const R = await import('./dedupe/semantic-runner.js');
     const E = await import('./dedupe/embedding-client.js');
-    const { getFlatTree } = await import('./tree.js');
+    // ⚠️ readFlatTree，不是 getFlatTree —— tree.js 从未导出过后者。
+    //    写成 getFlatTree 会解构出 undefined，`await undefined()` 抛 TypeError，
+    //    而 TypeError 恰好落进下面「semanticDedupeEnabled !== true」的判断之前，
+    //    整条语义去重链路从来没跑起来过、也没报过任何错。
+    const { readFlatTree } = await import('./tree.js');
     const s = await getSettings();
     if (s.semanticDedupeEnabled !== true) {
       return { suggestions: [], embedded: 0, reason: '语义去重未启用（在「设置」里打开）' };
     }
     // 正文摘要来自归档侧车；侧车没开就自动退回「只用标题」
     const texts = new Map();
-    for (const e of (await getFlatTree()) || []) {
+    for (const e of (await readFlatTree()) || []) {
       if (!e || e.type !== 'url' || !e.url) continue;
       const t = await E.fetchArchivedText(e.url);
       if (t) texts.set(String(e.id), t);
     }
     return R.runSemanticDedupe(
-      (await getFlatTree()) || [],
+      (await readFlatTree()) || [],
       {
         apiKey: s.embeddingApiKey || s.apiKey || '',
         baseUrl: s.embeddingBaseUrl || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
