@@ -234,6 +234,36 @@ function displayPath(pathArr) {
   return rest.length ? rest.join(' / ') : pathArr[0];
 }
 
+/**
+ * 目标路径数组 → 展示用。
+ *
+ * ⚠️⚠️ 为什么**不能**复用 displayPath：
+ *    两个字段的根名语义相反 —— fromPath 第 0 段是**根文件夹名**（书签栏/其他书签），
+ *    展示时要剥掉；toPath 则**根本不含根**（就是 taxonomy 里的 '大类/子类'）。
+ *    拿 displayPath 处理 toPath 会把大类名也吃掉，「其他/待归类」显示成「待归类」。
+ *    所以这里是**独立的一份**，不是同一份逻辑的两种调用。
+ *
+ * ⚠️ 为什么必须容忍 toPath 为 null（2026-10-08 修的就是这个）：
+ *    plan.js 对三类条目**故意**不给目标 —— excluded（chrome://、localhost）、
+ *    locked（人工锁定）、readonly（移动设备书签）。它们 status='skipped'，
+ *    本来就没有「要去哪」这回事，于是 toPath 留 null。
+ *    早先这里直接 `it.toPath.join(' / ')`，只要计划里出现一条这类书签
+ *    （几乎必然：谁没存过 chrome:// 页面？），整个计划表渲染就抛
+ *    「Cannot read properties of null (reading 'join')」，
+ *    异常一路冒泡到 runPreview 的 catch，用户看到的是「预览失败」——
+ *    而书签一条都没动过，备份也存了，是**纯读**环节炸的。
+ *
+ *    与 src/scope-list.js:541 是同一个道理，那里的派生视图早就写了
+ *    `Array.isArray(it.toPath) ? ... : ''`。这里曾经是全仓库唯一的漏网处。
+ *
+ * @param {string[]|null|undefined} toPath
+ * @returns {string}
+ */
+function displayToPath(toPath) {
+  if (!Array.isArray(toPath) || !toPath.length) return '';
+  return toPath.join(' / ');
+}
+
 const REASON_LABEL = {
   [REASON.LEARNED]: ['人工规则', 'learned'],
   [REASON.RULE_DOMAIN]: ['域名', 'high'],
@@ -1501,17 +1531,27 @@ function renderPlan() {
     tdArrow.textContent = '→';
 
     // 目标位置
+    // ⚠️ 走 displayToPath 而不是 it.toPath.join(...)：skipped 条目的 toPath
+    //    是 null（excluded/locked/readonly 根本没有目标），直接 join 会炸掉整张表。
     const tdTo = document.createElement('td');
     const pt = document.createElement('span');
     pt.className = 'path';
-    pt.textContent = it.toPath.join(' / ');
+    const toText = displayToPath(it.toPath);
+    pt.textContent = toText || '（不移动）';
     tdTo.append(pt);
 
     // 依据
     const tdWhy = document.createElement('td');
     const why = document.createElement('span');
     why.className = 'why';
-    const [label, cls] = REASON_LABEL[it.reason] || [it.reason, ''];
+    // ⚠️ 兜底走 scope-list 的 reasonLabel，而不是直接显示 it.reason：
+    //    本表只覆盖「分类依据」那几种（域名/路径/AI/…），
+    //    而 excluded / locked / readonly / already-in-place / unclassified-accepted
+    //    全都不在里面 —— 原先的 `[it.reason, '']` 会把英文枚举原样印到面板上
+    //    （"excluded低" 这种中英混排）。这几类以前根本画不出来
+    //    （toPath 为 null，渲染先炸了），修好之后才第一次露到用户眼前，
+    //    所以顺带在这里接上 canonical 的中文表。
+    const [label, cls] = REASON_LABEL[it.reason] || [reasonLabel(it.reason), ''];
     const badge = document.createElement('span');
     badge.className = `badge ${cls}`;
     badge.textContent = label;
@@ -1980,6 +2020,16 @@ async function markRight(itemId) {
   // 判对的条目也固化成规则：点一次「✓」就等于告诉词典这条判得准
   const entry = state.byId.get(itemId);
   if (!entry) return;
+  // ⚠️ skipped 条目没有目标（toPath 为 null，见 displayToPath 的说明）。
+  //    pathString(null) 会得到空串，于是 buildUrlRule 写出一条 to: '' 的规则 ——
+  //    一条「把这条 URL 归到空路径」的假知识，永久落进 RULES_LEARNED。
+  //    它匹配时会把条目送去 coercePath('')，最终落进兜底桶，
+  //    看起来像「规则生效了」，实际是把噪声固化下来。
+  //    这里如实告诉用户「这条没有分类可确认」，而不是默默写一条空规则。
+  if (!Array.isArray(it.toPath) || !it.toPath.length) {
+    toast('这条没有分类目标（已被排除、锁定或只读），确认不了');
+    return;
+  }
   const rule = buildLearnedRule(entry, it.toPath);
   await mutate(K.RULES_LEARNED, (rs) => {
     if ((rs || []).some((r) => r.to === rule.to && sameRuleShape(r, rule))) return rs || [];

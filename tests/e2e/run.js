@@ -556,3 +556,76 @@ test('帮助页签读得到 docs/panel-help.md，且读不到时要说清为什�
     await ctx.close();
   }
 });
+
+// ───────────────────── 12. 计划表能画出「不移动」的条目 ─────────────────────
+// 2026-10-08 新增，事故回归。
+//
+// 用户症状：点「读取并预览」报 `Cannot read properties of null (reading 'join')`，
+// 整张计划表渲染不出来。根因在 ui/options.js 渲染时写了裸的 `it.toPath.join(...)`，
+// 而 plan.js 对 excluded / locked / readonly 三类条目**故意**留 `toPath: null`
+// —— 它们压根没有「要去哪」。谁的书签里没有一条 chrome:// 页面？这条闸门
+// 存在的意义就是让这种「几乎必然触发」的情况**在合成书签里就能复现**。
+//
+// ⚠️ 为什么必须落在 E2E 而不是单测：renderPlan 住在 ui/options.js 里，
+//    import 进来就会跑 init() 并摸 chrome.*，Node 里没有接缝。
+//    tests/unit/plan-render-contract.test.js 只能静态盯那句裸 join ——
+//    真正「表画出来了没有」只有真浏览器说了算。
+test('计划表能画出无目标的条目：含 chrome:// / 已锁定书签时预览不炸', async () => {
+  const { ctx, extensionId } = await launchWithExtension();
+  try {
+    const page = await openPanel(ctx, extensionId);
+    // 收集未捕获异常：预览失败时 toast 只说「预览失败」，
+    // 真正的错只在控制台里，不抓下来就没法区分是哪种失败。
+    const pageErrors = [];
+    page.on('pageerror', (e) => pageErrors.push(String(e.message || e)));
+
+    // 一条正常的（必须真的会被分类）+ 一条 chrome://（excluded，toPath=null）
+    await seedBookmarks(page, [
+      { title: 'GitHub 仓库', url: 'https://github.com/some/repo' },
+      { title: '扩展管理', url: 'chrome://extensions' },
+      { title: '本机开发', url: 'http://localhost:5173/app' },
+    ]);
+
+    const r = await runPreview(page);
+    assert.ok(r.move > 0, `待移动为 ${r.move}，本条断言会因错误原因通过`);
+
+    // 1. 没炸：计划表是可见的，且空状态没有抢在前面说「预览没跑起来」
+    assert.ok(await page.isVisible('#planTable'), '计划表没显示 —— 渲染多半是抛错了');
+    assert.equal(await page.isVisible('#planEmpty'), false,
+      `空状态在抢戏：${(await page.textContent('#planEmpty')).trim()}`);
+    assert.deepEqual(pageErrors, [],
+      `预览过程中抛了未捕获异常：\n${pageErrors.join('\n')}`);
+
+    // 2. 无目标的行确实画出来了，且如实标成「不移动」
+    // ⚠️ 按**标题**而不是 URL 认领：Edge 会把 chrome://extensions 改写成
+    //    edge://extensions/（实测 2026-10-08），按 URL 断言会在 Edge 上假红。
+    const cells = await page.evaluate(() => [...document.querySelectorAll('#planBody tr')]
+      .map((tr) => {
+        const td = tr.querySelectorAll('td');
+        return {
+          title: td[1]?.querySelector('.title')?.textContent || '',
+          url: td[1]?.querySelector('.url')?.textContent || '',
+          to: td[4]?.textContent.trim() || '',
+          why: td[5]?.textContent.trim() || '',
+        };
+      }));
+    assert.ok(cells.length >= 3, `计划表只画出了 ${cells.length} 行，三条书签应当都在`);
+
+    for (const title of ['扩展管理', '本机开发']) {
+      const row = cells.find((c) => c.title === title);
+      assert.ok(row, `${title} 这一行没渲染出来`);
+      assert.equal(row.to, '（不移动）',
+        `${title}（${row.url}）是 excluded 条目、toPath 为 null，`
+        + `目标列应当显示「（不移动）」，实际是「${row.to}」`);
+      // 依据列也不许漏出英文枚举（修复前会显示 "excluded低"）
+      assert.ok(!/^[a-z-]+/.test(row.why), `${title} 的依据列漏出了英文枚举：「${row.why}」`);
+    }
+
+    // 3. 被排除的条目绝不能混进执行队列
+    const movable = cells.filter((c) => c.to && c.to !== '（不移动）').map((c) => c.url);
+    assert.ok(!movable.some((u) => /^(chrome|edge|about|edge-extension):/.test(u)),
+      `浏览器内部页被画成了要移动：${movable.join(', ')}`);
+  } finally {
+    await ctx.close();
+  }
+});
