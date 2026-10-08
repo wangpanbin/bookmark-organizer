@@ -816,6 +816,69 @@ if not _caught_help:
     _bad += 1
     fails.append('禁用词检查抓不住 docs/panel-help.md 里的「一键替换」')
 
+# 5) ⚠️ 界面文案不许承诺一个「用户点了就能走通」的动作出口（AGENTS.md 约束 8）
+#
+# ═══ 真实事故（2026-10-08）═══
+# 低置信闸门落地时，面板写着「N 条低置信，执行时不会自动移动，**需逐条确认**」。
+# 而全仓库**没有任何代码**把 `awaiting-confirm` 放回执行队列 ——
+# 「逐条确认」这个出口根本不存在，用户点不了。
+# 症状不是报错，是面板平静地说着一件假事，比功能缺失更难发现。
+#
+# ═══ 为什么能做成机械判据 ═══
+# 「需/请 + 动作」是一个**出口承诺**：它告诉用户「你还能做点什么」。
+# 只要界面上出现这种形状，就必须能在代码里找到对应的用户入口
+# （一个按钮 id、一个 handler，或把该状态放回队列的赋值）。
+#
+# ⚠️ 刻意**不**判反向陈述。本仓库大量使用「扩展不会替你改书签」
+#    「永远不会自动删除任何书签」这类文案，那是好实践（把边界说清），
+#    且不承诺任何出口。这条判据只抓「承诺了做不到的正向动作」，
+#    那些反向文案一条都不会误报。
+#
+# ⚠️ 这条判据抓的是**形状**，不是语义。它能抓住「凭空多出一个出口」，
+#    抓不住「承诺的动作存在但实现是错的」—— 后者仍需评审。
+ACTION_PROMISE = re.compile(
+    r'(需逐条|请逐条|需手动确认|请手动确认|需你确认|请确认后)'
+)
+# 出口承诺的「兑现凭证」：**点名制** —— 某个承诺字样，必须对应一个真实入口。
+#
+# ⚠️⚠️ 首版这里写成「面板上存在**任何**入口就放行」，实测是漏洞：
+#    注入「需逐条确认」这份坏文案后，它照样 PASS —— 因为面板上确实还有
+#    批量改判按钮（btnBulkAssign），而那**与「逐条确认」毫无关系**。
+#    承诺是**具体**的，兑现也必须具体：一个不相干的入口不能替另一个承诺背书。
+#
+# 形状：{承诺字样: 兑现它的入口标识}。入口标识必须是代码里真实存在的符号
+# （按钮 id / handler / 把该状态放回队列的赋值），不能是文案里出现的词。
+PROMISE_EXITS = {
+    '需逐条': 'btnConfirmLow',      # 逐条确认低置信条目 → 放回 pending 的入口
+    '请逐条': 'btnConfirmLow',
+    '需手动确认': 'btnConfirmLow',
+    '请手动确认': 'btnConfirmLow',
+    '需你确认': 'btnConfirmLow',
+    '请确认后': 'btnConfirmLow',
+}
+# 批量改判是「一次改多条」，与「逐条确认」不是同一件事 —— 不互相背书。
+
+_visible = strip_comments(js) + '\n' + strip_comments(html)
+_promises = sorted(set(ACTION_PROMISE.findall(_visible)))
+# 逐条找出「承诺了但没有对应入口」的那些
+_unbacked = [p for p in _promises if PROMISE_EXITS.get(p, '\x00') not in _visible]
+_promise_ok = not _unbacked
+print(f'  {_promise_ok!s:5} 界面未承诺做不到的动作出口'
+      f'（出口承诺 {len(_promises)} 处 / 无兑现 {len(_unbacked)} 处）')
+if not _promise_ok:
+    fails.append(
+        f'界面文案承诺了动作出口 {_unbacked}，但代码里找不到对应的用户入口 —— '
+        'AGENTS.md 约束 8：界面不许承诺做不到的事'
+    )
+
+# ⚠️ 自证伪：把判据自己的正则打坏一个字符，它必须转而「抓得住」。
+#    一个恒假的判据和一个恒真的判据都是摆设，只有「该红时红」才算数。
+_selftest_txt = _visible + '\n这里写着需逐条确认，但没有任何入口。'
+_selftest_caught = bool(ACTION_PROMISE.search(strip_comments(_selftest_txt)))
+print(f'  {_selftest_caught!s:5} 动作出口判据抓得住「凭空承诺」的坏样本')
+if not _selftest_caught:
+    fails.append('动作出口判据抓不住坏样本 —— 它是恒真的摆设')
+
 if not _bad:
     print('  -> 全部判据都能在自己被打坏时抓住')
 

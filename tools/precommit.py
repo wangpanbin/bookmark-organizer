@@ -51,6 +51,26 @@ TEXT_EXT = (".py", ".md", ".html", ".css", ".yml", ".yaml", ".gitignore", ".gita
 # 编码检查要覆盖的扩展名（collect 与 check_encoding 必须用同一个常量）
 ENCODED_EXT = CHECK_EXT + JSON_EXT + TEXT_EXT
 
+# ═══ 截断检测的阈值（2026-10-08 复盘新增）═══
+# 判据见 check_truncation 的文档串。三条阈值各自的作用：
+#
+# TRUNCATION_MIN_LINES —— 原文件小到一定程度就跳过。
+#   整份重写小文件是常事（一个 117 行的测试文件整个重写），而它天然
+#   「行数变少、几乎不新增」，不跳过就是误报。
+#   🔴 **未校准** —— 200 是拍的：低于它的文件整体重写一律放行。
+#   调高会漏掉小文件被截断，调低会误伤小文件重写。回调只改这一个常量。
+#   真实那次事故是 493 行 → 1 行，远在这个门槛之上。
+TRUNCATION_MIN_LINES = 200
+# TRUNCATION_RATIO —— 当前行数不足原行数的这个比例就进入复核。
+#   0.5 = 掉一半以上。正常增删改很少一次掉这么多。
+TRUNCATION_RATIO = 0.5
+# TRUNCATION_REWRITE_ALLOWANCE —— 若 diff 的**新增**行数超过原行数的这个比例，
+#   就认为「这是边删边写的重写」，不报红；几乎不新增才是整文件被覆写掉的形状。
+#   ⚠️ 不要改回看删除量：截断的 numstat 本来就全是删除行，与「真的要删光」
+#   完全同形，靠删除量区分不了（2026-10-08 实测：493→1 行的截断报删除 492 行）。
+#   0.1 = 允许顺手增补一成。真重构通常改动面更均匀。
+TRUNCATION_REWRITE_ALLOWANCE = 0.1
+
 
 def run(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, env=ENV, **kw)
@@ -168,6 +188,89 @@ def check_encoding(files):
     return bad
 
 
+def check_truncation(files):
+    """抓「整文件被写坏」：行数骤降但 diff 里没有对应的删除意图。
+
+    ═══ 为什么要这道闸门（2026-10-08 复盘）═══
+    本仓库注释几乎全是中文，而中文密度高到让任何「整文件覆写」都成为高风险
+    操作。一次真实的翻车：编辑 ui/options.html 时用了 shell 的整文件写入，
+    前一条语句抛异常、**后面的写入照样执行**，文件被截到 159 字节（473 行丢失）。
+
+    为什么现有闸门全都放过了它：
+      · 语法检查 —— 159 字节的 HTML 片段**仍是合法文件**，语法没问题
+      · 编码检查 —— 截断产生的是合法 UTF-8，没有 U+FFFD
+      · 单测     —— E2E 才看得到，而 E2E 不接进钩子
+    换句话说：**所有既有闸门都只检查「文件是否合法」，没有一个检查
+    「文件是否还是原来那个文件」。** 这一次是靠 `git checkout` 救回来的，
+    那是运气，不是设计。
+
+    判据（机械、可确定性检查）：
+      对每个**已跟踪且被修改**的文件，比较 HEAD 版本与当前版本的行数。
+      当前行数不足原行数的 50%，且本次 diff 里的删除行数不超过删除阈值的
+      0.3 倍 —— 即「行数掉了一半以上，但 diff 不像是有人真的想删」→ 报红。
+
+      两个条件缺一不可：
+        · 只看**行数比例**会误伤「我就是要删掉一半」的重构；
+        · 只看**删除行数**挡不住「截断后又被新内容填满」的情形。
+    """
+    bad = 0
+    checked = 0
+    for rel in files:
+        path = os.path.join(ROOT, rel)
+        if not os.path.isfile(path):
+            continue
+        # 新增文件天然「从 0 行长起来」，HEAD 里没有可比版本 —— 跳过。
+        head = run(["git", "show", f"HEAD:{rel}"])
+        if head.returncode != 0:
+            continue
+        old_lines = head.stdout.decode("utf-8", "replace").count("\n") + 1
+        try:
+            with open(path, encoding="utf-8") as fh:
+                new_lines = fh.read().count("\n") + 1
+        except (OSError, UnicodeDecodeError):
+            continue
+        if old_lines < TRUNCATION_MIN_LINES:
+            continue
+        checked += 1
+        if new_lines >= old_lines * TRUNCATION_RATIO:
+            continue
+        # 行数确实掉了。再看两件事，避免把正当重构误判成写坏：
+        #
+        # ⚠️ 这两个判据是被实测逼出来的，不要想当然：
+        #
+        #  ① numstat 必须用 `--cached`（暂存区 vs HEAD）。省略它时 git 比的是
+        #     「工作区 vs 暂存区」——而我们正在检查的正是暂存区里的内容，
+        #     两者相同，删除数恒为 0，任何截断都会误判成「正当重构」。
+        #
+        #  ② **不能**拿「删除行数多」当作正当重构的证据。2026-10-08 实测：
+        #     把一个 493 行的 HTML 截成 1 行，numstat 报「删除 492 行」——
+        #     删除数**本来就该是全量**，截断与「真的要删光」在 numstat 上
+        #     完全同形，靠删除量区分不了。
+        #
+        #     真正能区分的是**新增量**：一次截断几乎不新增内容，
+        #     而一次有意的重构/重写通常伴随同等量级的新增。
+        numstat = run(["git", "diff", "--cached", "--numstat", "--", rel])
+        added = 0
+        if numstat.returncode == 0:
+            parts = numstat.stdout.decode("utf-8", "replace").split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                added = int(parts[0])
+        # 允许新增的量：原行数的一小部分。超出这个量说明「边删边写」，
+        # 那是有意的重写；几乎不新增才是整文件被覆写掉的形状。
+        allowance = max(1, int(old_lines * TRUNCATION_REWRITE_ALLOWANCE))
+        if added > allowance:
+            continue
+        bad += 1
+        print(f"[precommit] ✗ {rel} 疑似被整文件写坏：{old_lines} 行 → {new_lines} 行，"
+              f"而 diff 只新增了 {added} 行")
+        print(f"           截断后的文件往往仍是合法文件，语法/编码/单测都抓不到它。")
+        print(f"           先 `git diff {rel}` 看清发生了什么；"
+              f"若是误伤，确认内容无误后重新提交即可。")
+    if not bad:
+        print(f"[precommit] ✓ 未发现疑似截断的文件（比对了 {checked} 个）")
+    return bad
+
+
 def run_unit_tests():
     # ⚠️ 不要把 glob 当**单个参数**交给 node，指望它自己展开 ——
     #    `node --test "tests/unit/*.test.js"` 只有 Node 22+ 认，
@@ -247,8 +350,82 @@ def run_static_gates():
     return red
 
 
+def selftest() -> int:
+    """自证伪：这道 precommit 自己会不会红？
+
+    ⚠️ 为什么必须是**双向**的：
+        只验「坏样本会红」，一个 `return 1` 的闸门也能满分。
+        必须同时验「正当改动不红」，否则你只是造了一条永远拦人的门。
+
+    用一个临时目录里的假仓库跑，不碰真实工作区。
+    造真仓库代价太高（要暂存真实文件、还要还原），而这道闸门
+    唯一依赖的是 `git show` / `git diff` 的**输出形状**，不是本仓库的内容。
+
+    跑法：python tools/precommit.py --selftest
+    """
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="precommit_selftest_")
+    results = []
+
+    def scenario(name, body, expect_red):
+        d = os.path.join(tmp, name.replace(" ", "_"))
+        os.makedirs(d, exist_ok=True)
+        sh = lambda *a: subprocess.run(a, cwd=d, capture_output=True)
+        sh("git", "init", "-q")
+        sh("git", "config", "user.email", "selftest@example.invalid")
+        sh("git", "config", "user.name", "selftest")
+        # 造一个「大文件」并提交 —— 200 行，超过 TRUNCATION_MIN_LINES
+        base = "\n".join(f"line {i}" for i in range(TRUNCATION_MIN_LINES + 60))
+        with open(os.path.join(d, "a.js"), "w", encoding="utf-8") as fh:
+            fh.write(base + "\n")
+        sh("git", "add", "a.js")
+        sh("git", "commit", "-q", "-m", "base")
+        # 改动它
+        with open(os.path.join(d, "a.js"), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        sh("git", "add", "a.js")
+
+        p = sh("git", "show", f"HEAD:a.js")
+        old = p.stdout.decode("utf-8", "replace").count("\n") + 1
+        ns = sh("git", "diff", "--cached", "--numstat", "--", "a.js").stdout.decode().split()
+        added = int(ns[0]) if len(ns) >= 2 and ns[0].isdigit() else 0
+        new = len(body.splitlines())
+        ratio_hit = new < old * TRUNCATION_RATIO
+        would_red = ratio_hit and added <= max(1, int(old * TRUNCATION_REWRITE_ALLOWANCE))
+
+        ok = would_red == expect_red
+        results.append(ok)
+        print(f"  {'OK ' if ok else '✗  '}{name}: 期望 "
+              f"{'红' if expect_red else '绿'}，实得 {'红' if would_red else '绿'}"
+              f"（{old} → {new} 行，新增 {added}）")
+
+    print("截断闸门自证伪：")
+    # ① 真截断：整文件被覆写成一行，几乎不新增 → 必须红
+    scenario("真截断", "const x = 1;\n", True)
+    # ② 正当重写：删一半同时增补一半 → 必须绿
+    half = "\n".join(f"line {i}" for i in range(120))
+    fresh = "\n".join(f"// 新增 {i}" for i in range(120))
+    scenario("正当重写", half + "\n" + fresh + "\n", False)
+    # ③ 正当修改：只改几行 → 必须绿
+    scenario("正当修改", "\n".join(f"line {i}" for i in range(TRUNCATION_MIN_LINES + 60)) + "\n", False)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    bad = sum(1 for r in results if not r)
+    print(f"  → {len(results) - bad}/{len(results)} 方向通过")
+    if bad:
+        print("  ✗ 闸门本身有问题：上面的方向与期望不符，它会误报或漏报。")
+    else:
+        print("  ✓ 这道闸门在该红时红、该绿时绿。")
+    return bad
+
+
 def main():
     args = sys.argv[1:]
+    if "--selftest" in args:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        return selftest()
     tests_only = "--tests-only" in args
     # ⚠️ 静态闸门**默认就跑**，`--fast` 才跳过。
     #    原来只有 `--all` 才跑，于是本机 `.git/hooks/pre-commit` 装的是
@@ -268,6 +445,17 @@ def main():
         red += check_encoding(files)
         if red:
             print("[precommit] 编码损坏就不往下跑测试 —— 那不是测试红，是文件本身坏了")
+            return 1
+        # ⚠️ 两种模式都跑。
+        #    原先只在暂存模式跑，理由是「--all 要对未改动文件做无谓的 git 调用」——
+        #    但那个代价是 **CI（走 --all）恰恰绕过了这道闸门**，
+        #    与本文件开头记的那个原样复现（「本地绿、CI 红、没人说得清差在哪」）
+        #    是同一种错。CI 必须守住文件没被写坏。
+        #    check_truncation 内部对「未改动」的文件自然不报警（行数没变），
+        #    真正的浪费只是多一次 git show，可以接受。
+        red += check_truncation(files)
+        if red:
+            print("[precommit] 先确认文件没被写坏，再往下跑测试")
             return 1
         red += run_static_gates()
         if red:
